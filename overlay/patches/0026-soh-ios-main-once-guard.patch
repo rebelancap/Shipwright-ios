@@ -1,0 +1,31 @@
+Overlay patch 0026: the engine boots once per process, period.
+visionOS scene reconnects (window-resize stress) re-invoked the process
+entry and re-ran the game's main() in-process — through MORE than one
+UIKit path: a postFinishLaunch-level guard (0021 rev4) shipped and was
+bypassed (device log: two "Starting Ship of Harkinian" inits 55 s apart
+with the Console singleton alive across them). Guard at the chokepoint
+every path must cross: soh's main(). The shell separately re-attaches
+the existing SDL window to a reconnected scene.
+
+--- a/soh/src/code/main.c
++++ b/soh/src/code/main.c
+@@ -58,6 +58,19 @@
+ #else //_WIN32
+ int main(int argc, char* argv[]) {
+ #endif
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0026): visionOS scene reconnects re-invoke the
++     * process entry through multiple UIKit paths; a second in-process boot
++     * restarts the game from the intro and leaves twin audio threads racing
++     * one device. The engine boots once per process, ever. */
++    {
++        static int sohIosMainRan = 0;
++        if (sohIosMainRan) {
++            return 0;
++        }
++        sohIosMainRan = 1;
++    }
++#endif
+     GameConsole_Init();
+     InitOTR(argc, argv);
+     // TODO: Was moved to below InitOTR because it requires window to be setup. But will be late to catch crashes.

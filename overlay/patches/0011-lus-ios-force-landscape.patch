@@ -1,0 +1,21 @@
+Overlay patch 0011: lock iOS to landscape.
+SoH's drawable is landscape, but the app doesn't force the device orientation,
+so on a portrait device/simulator the game renders sideways in a portrait
+window. Set SDL_HINT_ORIENTATIONS to landscape before SDL_Init so SDL's iOS
+view controller reports landscape-only and iOS rotates the UI to match. The
+Info.plist already restricts to landscape; this makes SDL agree.
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -327,6 +327,11 @@
+     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+ #endif
+ 
++#ifdef __IOS__
++    // Force landscape so iOS rotates the device to match SoH's landscape
++    // drawable (otherwise the game renders sideways in a portrait window).
++    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
++#endif
+     SDL_Init(SDL_INIT_VIDEO);
+ 
+     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);

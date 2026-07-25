@@ -1,0 +1,39 @@
+# Local game data working copy (never commit — large, user-owned)
+/work/
+
+# Vendored upstream working tree — reconstructed by scripts/bootstrap.sh (pinned
+# clone with its own .git). NOT committed: the pin lives in bootstrap.sh; local
+# changes live in overlay/patches/.
+/vendor/Shipwright/
+
+# Build outputs
+/oracle/build-*/
+/app/build-*/
+/build-*/
+/build/
+DerivedData/
+*.xcodeproj/
+*.o
+*.a
+*.dylib
+
+# Captured artifacts — keep the dir, ignore heavy contents
+/artifacts/*.mov
+/artifacts/*.mp4
+/artifacts/*.trace
+/artifacts/*.png
+/artifacts/*.log
+/artifacts/*.otr
+/artifacts/*.o2r
+
+# macOS
+.DS_Store
+xcuserdata/
+*.xcuserstate
+
+# Spike build trees (rebuildable; huge FetchContent checkouts)
+/spikes/*-build/
+/spikes/*.log
+
+# OTA hosting dir (IPAs; rebuildable)
+/ota/

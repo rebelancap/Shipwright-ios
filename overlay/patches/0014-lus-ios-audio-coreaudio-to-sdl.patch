@@ -1,0 +1,26 @@
+Overlay patch 0014: on iOS, a config value of "coreaudio" must not select
+the (compiled-out) CoreAudio player.
+Audio::InitAudioPlayer compiles the COREAUDIO case only on
+`__APPLE__ && !__IOS__`; on iOS a saved backend of "coreaudio" would hit the
+switch `default:` -> NullAudioPlayer = SILENT. Fresh iOS configs resolve to
+SDL fine, but a config synced from a macOS install (Window.AudioBackend =
+"coreaudio") would drop audio with no error. Map "coreaudio" -> SDL on iOS
+in GetSavedAudioBackend. LUS-side; __IOS__ is defined inside libultraship.
+
+--- a/libultraship/src/ship/audio/Audio.cpp
++++ b/libultraship/src/ship/audio/Audio.cpp
+@@ -80,7 +80,14 @@
+     }
+ 
+     if (backendName == "coreaudio") {
++#ifdef __IOS__
++        // CoreAudio player is not built on iOS (HALOutput is macOS-only); a
++        // config synced from macOS would otherwise select the silent Null
++        // player via the switch default. Use SDL (real audio) instead.
++        return AudioBackend::SDL;
++#else
+         return AudioBackend::COREAUDIO;
++#endif
+     }
+ 
+     if (backendName == "sdl") {

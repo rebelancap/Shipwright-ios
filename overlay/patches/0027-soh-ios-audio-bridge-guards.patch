@@ -1,0 +1,84 @@
+Overlay patch 0027: audio bridge null-chain guards.
+Recurring device SEGV (Vision Pro, twice confirmed by crash.txt):
+AudioPlayerBuffered+32 on OTRAudio_Thread. The bridge null-checks the
+PLAYER but not the chain — Context::GetRawInstance()->GetAudio() is null
+during teardown/init windows, and ->GetAudioPlayer() on it faults. Guard
+the chain in every bridge function the audio thread can hit.
+
+--- a/libultraship/src/libultraship/bridge/audiobridge.cpp
++++ b/libultraship/src/libultraship/bridge/audiobridge.cpp
+@@ -5,7 +5,13 @@
+ extern "C" {
+ 
+ int32_t AudioPlayerBuffered() {
+-    auto audio = Ship::Context::GetRawInstance()->GetAudio()->GetAudioPlayer();
++    // SOH_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetAudio() is briefly null and the chained call faulted (device SEGV).
++    auto sohIosCtx = Ship::Context::GetRawInstance();
++    if (sohIosCtx == nullptr || sohIosCtx->GetAudio() == nullptr) {
++        return 0;
++    }
++    auto audio = sohIosCtx->GetAudio()->GetAudioPlayer();
+     if (audio == nullptr) {
+         return 0;
+     }
+@@ -18,7 +24,13 @@
+ }
+ 
+ int32_t AudioPlayerGetDesiredBuffered() {
+-    auto audio = Ship::Context::GetRawInstance()->GetAudio()->GetAudioPlayer();
++    // SOH_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetAudio() is briefly null and the chained call faulted (device SEGV).
++    auto sohIosCtx = Ship::Context::GetRawInstance();
++    if (sohIosCtx == nullptr || sohIosCtx->GetAudio() == nullptr) {
++        return 0;
++    }
++    auto audio = sohIosCtx->GetAudio()->GetAudioPlayer();
+     if (audio == nullptr) {
+         return 0;
+     }
+@@ -31,7 +43,13 @@
+ }
+ 
+ AudioChannelsSetting GetAudioChannels() {
+-    auto audio = Ship::Context::GetRawInstance()->GetAudio()->GetAudioPlayer();
++    // SOH_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetAudio() is briefly null and the chained call faulted (device SEGV).
++    auto sohIosCtx = Ship::Context::GetRawInstance();
++    if (sohIosCtx == nullptr || sohIosCtx->GetAudio() == nullptr) {
++        return audioStereo;
++    }
++    auto audio = sohIosCtx->GetAudio()->GetAudioPlayer();
+ 
+     if (audio == nullptr) {
+         return audioStereo;
+@@ -41,7 +59,13 @@
+ }
+ 
+ int32_t GetNumAudioChannels() {
+-    auto audio = Ship::Context::GetRawInstance()->GetAudio()->GetAudioPlayer();
++    // SOH_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetAudio() is briefly null and the chained call faulted (device SEGV).
++    auto sohIosCtx = Ship::Context::GetRawInstance();
++    if (sohIosCtx == nullptr || sohIosCtx->GetAudio() == nullptr) {
++        return 2;
++    }
++    auto audio = sohIosCtx->GetAudio()->GetAudioPlayer();
+ 
+     if (audio == nullptr) {
+         return 2;
+@@ -51,7 +75,13 @@
+ }
+ 
+ void AudioPlayerPlayFrame(const uint8_t* buf, size_t len) {
+-    auto audio = Ship::Context::GetRawInstance()->GetAudio()->GetAudioPlayer();
++    // SOH_IOS (overlay 0027): the audio thread races Context teardown/init —
++    // GetAudio() is briefly null and the chained call faulted (device SEGV).
++    auto sohIosCtx = Ship::Context::GetRawInstance();
++    if (sohIosCtx == nullptr || sohIosCtx->GetAudio() == nullptr) {
++        return;
++    }
++    auto audio = sohIosCtx->GetAudio()->GetAudioPlayer();
+     if (audio == nullptr) {
+         return;
+     }

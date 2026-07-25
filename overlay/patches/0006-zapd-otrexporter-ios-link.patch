@@ -1,0 +1,45 @@
+Overlay patch 0006: ZAPDLib/OTRExporter iOS build fixes.
+- ZAPD/CMakeLists.txt: iOS gets a Darwin-style ADDITIONAL_LIBRARY_DEPENDENCIES
+  branch (-Wl,-force_load; the generic else() uses GNU --whole-archive which
+  Apple ld rejects) + tinyxml2::tinyxml2 (desktop got the header via brew's
+  include dir riding in on PNG_PNG_INCLUDE_DIR; iOS uses LUS's FetchContent
+  target, which also dedups symbols with LUS's own tinyxml2).
+- OTRExporter/OTRExporter/CMakeLists.txt: link tinyxml2::tinyxml2 on iOS for
+  the same include path (ZResource.h includes tinyxml2.h).
+
+--- a/ZAPDTR/ZAPD/CMakeLists.txt
++++ b/ZAPDTR/ZAPD/CMakeLists.txt
+@@ -414,6 +414,19 @@
+ 		${CMAKE_DL_LIBS}
+ 		Threads::Threads
+ 	)
++elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++	target_compile_definitions(${PROJECT_NAME} PRIVATE __IOS__)
++	set(THREADS_PREFER_PTHREAD_FLAG ON)
++	find_package(Threads REQUIRED)
++	set(ADDITIONAL_LIBRARY_DEPENDENCIES
++		-Wl,-force_load $<TARGET_LINKER_FILE_DIR:OTRExporter>/$<TARGET_LINKER_FILE_NAME:OTRExporter>
++		"libultraship;"
++		PNG::PNG
++		tinyxml2::tinyxml2
++		libzip::zip
++		${CMAKE_DL_LIBS}
++		Threads::Threads
++	)
+ elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+        set(THREADS_PREFER_PTHREAD_FLAG ON)
+        find_package(Threads REQUIRED)
+--- a/OTRExporter/OTRExporter/CMakeLists.txt
++++ b/OTRExporter/OTRExporter/CMakeLists.txt
+@@ -154,6 +154,11 @@
+ find_package(spdlog REQUIRED)
+ target_link_libraries(${PROJECT_NAME} PUBLIC spdlog::spdlog)
+ 
++if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    target_link_libraries(${PROJECT_NAME} PUBLIC tinyxml2::tinyxml2 libzip::zip)
++    target_compile_definitions(${PROJECT_NAME} PRIVATE __IOS__)
++endif()
++
+ FetchContent_Declare(
+     StormLib
+     GIT_REPOSITORY https://github.com/ladislav-zezula/StormLib.git

@@ -1,0 +1,16 @@
+Overlay patch 0007: ZAPD link options — iOS must take the Darwin branch
+(-pthread only); the generic else adds -Wl,-export-dynamic (GNU ld), which
+Apple's linker rejects ("ld: unknown options: -export-dynamic") and which
+propagates PUBLIC into soh's final link.
+
+--- a/ZAPDTR/ZAPD/CMakeLists.txt
++++ b/ZAPDTR/ZAPD/CMakeLists.txt
+@@ -375,7 +375,7 @@
+ 		-pthread
+ 	)
+ 
+-    if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
++    if (CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
+         target_link_options(${PROJECT_NAME} PUBLIC
+             -pthread
+         )

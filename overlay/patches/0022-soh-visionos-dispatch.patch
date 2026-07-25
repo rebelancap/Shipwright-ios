@@ -1,0 +1,87 @@
+Overlay patch 0022: visionOS platform dispatch (Phase 1).
+The leetal toolchain sets CMAKE_SYSTEM_NAME=visionOS for
+PLATFORM=SIMULATOR_VISIONOS/VISIONOS, but the whole tree (upstream LUS +
+our iOS overlay CMake) dispatches on STREQUAL "iOS" at 16+ sites. Rather
+than patching every site, flip CMAKE_SYSTEM_NAME back to "iOS" right
+after project(): by then compilers, sysroot (xrsimulator/xros), and
+Xcode's SDKROOT are locked, so the flip only affects dispatch
+conditionals. The real visionOS-ness continues to come from the SDK
+(TARGET_OS_VISION=1 in TargetConditionals). SOH_VISIONOS stays a cache
+var for genuinely vision-specific deltas (device family, plist).
+Deployment target: CMake then emits IPHONEOS_DEPLOYMENT_TARGET, which
+Xcode ignores for xros — build-vision-sim.sh compensates with
+CMAKE_XCODE_ATTRIBUTE_XROS_DEPLOYMENT_TARGET=2.0. No-op for iOS builds
+(condition never true).
+rev5: language-scope the top-level -fno-fast-math genex — plain
+add_compile_options feeds it to EVERY compiler the Xcode generator
+invokes, and swiftc (the D-030 SwiftUI entry) hard-errors on unknown
+C driver flags.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,17 @@
+ set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum OS X deployment version")
+ 
+ project(Ship VERSION 9.2.3 LANGUAGES C CXX)
++
++# SOH_IOS (overlay 0022): visionOS builds (PLATFORM=SIMULATOR_VISIONOS /
++# VISIONOS) dispatch as iOS throughout the tree. Compilers and SDK are
++# already fixed by the toolchain at this point; only the STREQUAL "iOS"
++# conditionals care. TARGET_OS_VISION (from the xros SDK) remains the
++# source-level discriminator.
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(SOH_VISIONOS 1)
++endif()
+ include(CMake/soh-cvars.cmake)
+ include(CMake/lus-cvars.cmake)
+ set(SPDLOG_LEVEL_TRACE 0)
+@@ -140,8 +151,11 @@
+ # Enforce strict, deterministic IEEE-754 floating-point to match N64 (MIPS) semantics.
+ # Never enable fast-math, and disable FMA contraction: the R4300 CPU and RSP have no
+ # fused multiply-add, so contracting mul+add into an FMA produces extra precision.
+-add_compile_options($<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-fast-math>)
+-add_compile_options($<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>)
++# SOH_IOS (overlay 0022 rev5): scope to C-family languages — the Xcode
++# generator otherwise passes these to swiftc (visionOS SwiftUI entry),
++# which hard-errors on unknown C driver flags.
++add_compile_options($<$<AND:$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-fno-fast-math>)
++add_compile_options($<$<AND:$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-ffp-contract=off>)
+ add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/fp:precise>)
+ add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/fp:except->)
+ 
+--- a/libultraship/CMakeLists.txt
++++ b/libultraship/CMakeLists.txt
+@@ -19,6 +19,15 @@
+ 
+ project(libultraship LANGUAGES C CXX)
+ 
++# SOH_IOS (overlay 0022): this project() re-ran the toolchain, resetting
++# CMAKE_SYSTEM_NAME to visionOS — re-flip so the tree keeps dispatching as
++# iOS (see the top-level CMakeLists hunk).
++if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++    set(CMAKE_SYSTEM_NAME "iOS")
++    set(IOS 1)
++    set(SOH_VISIONOS 1)
++endif()
++
+ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     enable_language(OBJCXX)
+     set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
+@@ -75,6 +84,15 @@
+ # === Platform Specific Configuration ===
+ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     include(cmake/ios-toolchain-populate.cmake)
++    # SOH_IOS (overlay 0022): the toolchain include above re-ran leetal's
++    # platform init IN THIS SCOPE, resetting CMAKE_SYSTEM_NAME to visionOS
++    # again — re-flip a third time so src/ (compile definitions, __IOS__)
++    # dispatches as iOS.
++    if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
++        set(CMAKE_SYSTEM_NAME "iOS")
++        set(IOS 1)
++        set(SOH_VISIONOS 1)
++    endif()
+ endif()
+ 
+ # =========== Sources =============

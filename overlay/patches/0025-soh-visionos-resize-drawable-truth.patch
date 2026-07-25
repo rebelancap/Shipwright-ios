@@ -1,0 +1,29 @@
+Overlay patch 0025: size screen-pass attachments from the ACQUIRED drawable.
+Vision Pro window-resize crash (device feedback #2): SetupScreenFramebuffer
+receives the caller's cached width/height but binds the freshly acquired
+drawable as the color attachment. During a live resize the drawable's real
+size differs, so the depth texture (sized from the stale values) mismatches
+the color attachment -> Metal render-pass validation abort -> process
+restart (user saw repeated reboots to the intro while dragging the window
+corner). The acquired drawable is ground truth — derive width/height from
+its texture. Also benign on iPhone (sizes never change there).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -793,6 +793,16 @@
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+ 
+     tex.texture = mCurrentDrawable->texture();
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0025): during a live window resize (visionOS) the
++    // acquired drawable's size can differ from the caller's cached w/h;
++    // sizing the depth attachment from stale values makes the render pass
++    // attachments mismatch -> Metal validation abort. The drawable is the
++    // ground truth.
++    width = (uint32_t)tex.texture->width();
++    height = (uint32_t)tex.texture->height();
++#endif
+ 
+     MTL::RenderPassDescriptor* render_pass_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
+     render_pass_descriptor->colorAttachments()->object(0)->setTexture(tex.texture);

@@ -1,0 +1,338 @@
+soh/CMakeLists.txt: iOS platform branch — MACOSX_BUNDLE app target with
+Info.plist template (new file soh/ios/Info.plist.in), main=SDL_main on
+src/code/main.c (SDL2main UIKit shim owns the real main), OBJCXX/ARC and
+Darwin warning flags extended to iOS, espeak skipped, deps: SDL2-static
+from LUS FetchContent + prebuilt static ogg/vorbis/opus/opusfile via
+-DSOH_IOS_DEPS_PREFIX, soh.o2r bundled via -DSOH_O2R_PATH, SDL2_net
+omitted on iOS.
+
+--- a/soh/CMakeLists.txt
++++ b/soh/CMakeLists.txt
+@@ -6,7 +6,7 @@
+ set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard to use")
+ set(CMAKE_C_STANDARD 23 CACHE STRING "The C standard to use")
+ 
+-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
++if (CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
+     enable_language(OBJCXX)
+     set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
+     set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc")
+@@ -156,13 +156,15 @@
+ # handle speechsynthesizer removals
+ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+     list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/Darwin")
+-elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
++elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
+     list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/SAPI")
+ else()
+     list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/(Darwin|SAPI)")
+ endif()
+ 
+-find_library(ESPEAK espeak-ng)
++if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    find_library(ESPEAK espeak-ng)
++endif()
+ if (NOT ESPEAK)
+     list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/ESpeak")
+ endif()
+@@ -230,6 +232,76 @@
+ # Target
+ ################################################################################
+ add_executable(${PROJECT_NAME} ${ALL_FILES})
++
++if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    # LUS defines __IOS__ only PRIVATE to itself; soh TUs (and LUS headers
++    # they include) need it too.
++    target_compile_definitions(${PROJECT_NAME} PRIVATE __IOS__)
++    # iOS app shell (touch controls, orientation) lives in the Shipwright-ios
++    # repo, passed as SOH_IOS_SHELL_DIR.
++    if(NOT EXISTS "${SOH_IOS_SHELL_DIR}/SohIosShell.m")
++        message(FATAL_ERROR "iOS build requires -DSOH_IOS_SHELL_DIR=<dir with SohIosShell.m>")
++    endif()
++    target_sources(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}/SohIosShell.m")
++    target_include_directories(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}")
++    # Remote console bridge (D-040): an UNAUTHENTICATED TCP command server that
++    # injects input, writes CVars and reads crash.txt/logs — and soh://console
++    # can switch it on from any tapped link. It is compiled OUT unless asked
++    # for, so public/release builds cannot expose it at all. Dev (simulator)
++    # and the maintainer's own OTA builds opt in with -DSOH_REMOTE_CONSOLE=ON.
++    option(SOH_REMOTE_CONSOLE "Compile in the remote console bridge (dev/OTA builds only)" OFF)
++    if(SOH_REMOTE_CONSOLE)
++        target_compile_definitions(${PROJECT_NAME} PRIVATE SOH_REMOTE_CONSOLE=1)
++        message(STATUS "soh: REMOTE CONSOLE COMPILED IN — do not publish this build")
++    else()
++        message(STATUS "soh: remote console compiled out (public-safe)")
++    endif()
++    # UTType (document-picker ROM onboarding) + GCController (physical
++    # controller detection) used by the shell.
++    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework UniformTypeIdentifiers"
++                                                  "-framework GameController")
++    # App icon asset catalog (compiled by actool via the Xcode generator).
++    target_sources(${PROJECT_NAME} PRIVATE "${SOH_IOS_SHELL_DIR}/Assets.xcassets")
++    set_source_files_properties("${SOH_IOS_SHELL_DIR}/Assets.xcassets" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
++    # soh's main() becomes SDL_main. On iPhone, SDL2main's UIKit shim provides
++    # the real main() -> UIApplicationMain -> SDL_main on the main thread. On
++    # visionOS (D-030) the Swift @main App is the entry instead (SDL2main is
++    # NOT linked); SohHostViewController calls SDL_main once the scene is live.
++    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/code/main.c PROPERTIES COMPILE_DEFINITIONS "main=SDL_main")
++    if(SOH_VISIONOS)
++        # SwiftUI app entry (D-030) in its OWN static lib: the Xcode generator
++        # ignores COMPILE_LANGUAGE genexes when composing OTHER_SWIFT_FLAGS, so
++        # any .swift source on the soh target inherits its C warning flags and
++        # swiftc hard-errors. A separate flag-clean target sidesteps the whole
++        # class. Swift's @main emits main; the linker extracts it from the
++        # archive exactly like SDL2main's (which is NOT linked on visionOS).
++        enable_language(Swift)
++        add_library(sohvisionswift STATIC "${SOH_IOS_SHELL_DIR}/SohVisionApp.swift")
++        set_target_properties(sohvisionswift PROPERTIES
++            XCODE_ATTRIBUTE_SWIFT_VERSION "5.0"
++            XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER "${SOH_IOS_SHELL_DIR}/SohVision-Bridging-Header.h")
++        target_sources(${PROJECT_NAME} PRIVATE
++            "${SOH_IOS_SHELL_DIR}/SohHostViewController.m"
++            "${SOH_IOS_SHELL_DIR}/SohImmersive.m")
++        # -all_load on the archive: main lives there and nothing else
++        # references the Swift objects. SDK swift dir: the app target has no
++        # Swift sources, so Xcode won't add runtime search paths itself.
++        target_link_libraries(${PROJECT_NAME} PRIVATE
++            "-Wl,-force_load,$<TARGET_FILE:sohvisionswift>"
++            "-L$(SDKROOT)/usr/lib/swift"
++            "-framework CompositorServices" "-framework ARKit" "-framework AVFAudio")
++        add_dependencies(${PROJECT_NAME} sohvisionswift)
++    endif()
++    # soh.o2r is a ROM-independent build artifact that must be produced by a
++    # HOST build (GenerateSohOtr) and is bundled as a resource.
++    set(SOH_O2R_PATH "" CACHE FILEPATH "Path to a host-built soh.o2r to bundle")
++    if(NOT EXISTS "${SOH_O2R_PATH}")
++        message(FATAL_ERROR "iOS build requires -DSOH_O2R_PATH=<host-built soh.o2r>")
++    endif()
++    target_sources(${PROJECT_NAME} PRIVATE "${SOH_O2R_PATH}" "${CMAKE_BINARY_DIR}/gamecontrollerdb.txt")
++    set_source_files_properties("${SOH_O2R_PATH}" "${CMAKE_BINARY_DIR}/gamecontrollerdb.txt"
++        PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
++endif()
+ 
+ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+ use_props(${PROJECT_NAME} "${CMAKE_CONFIGURATION_TYPES}" "${DEFAULT_CXX_PROPS}")
+@@ -254,6 +326,47 @@
+     set_target_properties(${PROJECT_NAME} PROPERTIES
+         XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
+         OUTPUT_NAME "soh-macos"
++    )
++elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    set(SOH_IOS_BUNDLE_IDENTIFIER "com.harbourmasters.soh" CACHE STRING "iOS bundle identifier")
++    set(SOH_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
++    # D-030: the SwiftUI entry's ImmersiveSpace (stereo 3D) requires multiple
++    # scenes; visionOS-only (the key changes UIKit scene behavior on iPhone).
++    set(SOH_PLIST_EXTRA "")
++    if(SOH_VISIONOS)
++        set(SOH_PLIST_EXTRA "
++	<key>UIApplicationSceneManifest</key>
++	<dict>
++		<key>UIApplicationSupportsMultipleScenes</key>
++		<true/>
++	</dict>")
++    endif()
++    # PORT versioning (D-039) — deliberately NOT upstream's CMAKE_PROJECT_VERSION.
++    # SOH_IOS_VERSION (CFBundleShortVersionString) is the PUBLIC version and the
++    # string SideStore compares to decide "is there an update": it moves only
++    # when a release is cut, and stays put across OTA test iterations.
++    # SOH_IOS_BUILD (CFBundleVersion) increments every build instead — that is
++    # what distinguishes those iterations, and what makes iOS treat each OTA
++    # install as genuinely new (it was hardcoded 1, so identical rebuilds could
++    # be skipped). Both are passed by the build scripts from the repo's VERSION
++    # file + a UTC timestamp.
++    set(SOH_IOS_VERSION "0.0.0" CACHE STRING "Public (marketing) version of this port")
++    set(SOH_IOS_BUILD "0" CACHE STRING "Build number; must increase every build")
++    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in ${CMAKE_BINARY_DIR}/ios/Info.plist @ONLY)
++    set_target_properties(${PROJECT_NAME} PROPERTIES
++        XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
++        OUTPUT_NAME "soh"
++        MACOSX_BUNDLE TRUE
++        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_BINARY_DIR}/ios/Info.plist"
++        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SOH_IOS_BUNDLE_IDENTIFIER}"
++        XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${SOH_IOS_DEVELOPMENT_TEAM}"
++        XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
++        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
++        XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
++        # Required for xcodebuild archive to produce an app archive (not a
++        # generic one) from a CMake-generated project.
++        XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"
++        XCODE_ATTRIBUTE_SKIP_INSTALL "NO"
+     )
+ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+     set_target_properties(${PROJECT_NAME} PROPERTIES
+@@ -483,18 +596,21 @@
+ endif()
+ 
+ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+-    if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
++    if (CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
+         target_compile_options(${PROJECT_NAME} PRIVATE
+-            -Wall -Wextra -Wno-error
+-            -Wformat-security
+-            -Wno-return-type
+-            -Wno-unused-parameter
+-            -Wno-unused-function
+-            -Wno-unused-variable
+-            -Wno-missing-field-initializers
+-            -Wno-parentheses
+-            -Wno-narrowing
+-            -Wno-missing-braces
++            $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:
++                -Wall -Wextra -Wno-error
++                -Wformat-security
++                -Wno-return-type
++                -Wno-unused-parameter
++                -Wno-unused-function
++                -Wno-unused-variable
++                -Wno-missing-field-initializers
++                -Wno-parentheses
++                -Wno-narrowing
++                -Wno-missing-braces
++                -pthread
++            >
+             $<$<COMPILE_LANGUAGE:C>:
+                 -Werror-implicit-function-declaration
+                 -Wno-incompatible-pointer-types
+@@ -505,7 +621,6 @@
+                 -Wno-c++11-narrowing
+                 -Wno-deprecated-enum-enum-conversion
+             >
+-            -pthread
+         )
+ 
+         target_link_options(${PROJECT_NAME} PRIVATE
+@@ -692,6 +807,67 @@
+     target_include_directories(${PROJECT_NAME} PRIVATE
+         ${DEVKITPRO}/portlibs/wiiu/include/
+     )
++elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    # SDL2 comes statically from libultraship's FetchContent (OVERRIDE_FIND_PACKAGE).
++    find_package(SDL2 REQUIRED)
++    set(THREADS_PREFER_PTHREAD_FLAG ON)
++    find_package(Threads REQUIRED)
++    # SDL2_net is a de-facto hard dep (Network.h includes <SDL2/SDL_net.h>
++    # unconditionally); fetch it static. Its cmake_minimum_required predates
++    # CMake 4, hence the policy floor.
++    include(FetchContent)
++    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
++    FetchContent_Declare(
++        SDL2_net
++        GIT_REPOSITORY https://github.com/libsdl-org/SDL_net.git
++        GIT_TAG release-2.2.0
++    )
++    FetchContent_MakeAvailable(SDL2_net)
++    # The fetched tree exports SDL_net.h at its root; soh includes
++    # <SDL2/SDL_net.h> — shim the expected layout.
++    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/sdl2net-shim/SDL2")
++    file(COPY_FILE "${sdl2_net_SOURCE_DIR}/SDL_net.h" "${CMAKE_BINARY_DIR}/sdl2net-shim/SDL2/SDL_net.h" ONLY_IF_DIFFERENT)
++    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/sdl2net-shim")
++    # Static audio codec libs are prebuilt for iOS and injected by prefix.
++    set(SOH_IOS_DEPS_PREFIX "" CACHE PATH "Prefix containing static ogg/vorbis/opus/opusfile for iOS")
++    foreach(_l ogg vorbis vorbisenc vorbisfile opus opusfile)
++        if(NOT EXISTS "${SOH_IOS_DEPS_PREFIX}/lib/lib${_l}.a")
++            message(FATAL_ERROR "iOS build requires -DSOH_IOS_DEPS_PREFIX with lib/lib${_l}.a (got '${SOH_IOS_DEPS_PREFIX}')")
++        endif()
++    endforeach()
++    add_library(Ogg::ogg STATIC IMPORTED)
++    set_target_properties(Ogg::ogg PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libogg.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++    add_library(Vorbis::vorbis STATIC IMPORTED)
++    set_target_properties(Vorbis::vorbis PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libvorbis.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++    add_library(Vorbis::vorbisenc STATIC IMPORTED)
++    set_target_properties(Vorbis::vorbisenc PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libvorbisenc.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++    add_library(Vorbis::vorbisfile STATIC IMPORTED)
++    set_target_properties(Vorbis::vorbisfile PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libvorbisfile.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include")
++    add_library(Opus::opus STATIC IMPORTED)
++    set_target_properties(Opus::opus PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libopus.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include;${SOH_IOS_DEPS_PREFIX}/include/opus")
++    add_library(Opusfile::Opusfile STATIC IMPORTED)
++    set_target_properties(Opusfile::Opusfile PROPERTIES IMPORTED_LOCATION "${SOH_IOS_DEPS_PREFIX}/lib/libopusfile.a"
++        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include;${SOH_IOS_DEPS_PREFIX}/include/opus")
++    set(ADDITIONAL_LIBRARY_DEPENDENCIES
++        "libultraship;"
++        "ZAPDLib;"
++        SDL2::SDL2-static
++        "$<$<NOT:$<BOOL:${SOH_VISIONOS}>>:SDL2main>"
++        "Ogg::ogg"
++        "Vorbis::vorbis"
++        "Vorbis::vorbisenc"
++        "Vorbis::vorbisfile"
++        "Opus::opus"
++        "Opusfile::Opusfile"
++        SDL2_net
++        ${CMAKE_DL_LIBS}
++        Threads::Threads
++    )
+ else()
+     find_package(SDL2)
+     set(THREADS_PREFER_PTHREAD_FLAG ON)
+--- a/soh/ios/Info.plist.in
++++ b/soh/ios/Info.plist.in
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>CFBundleDevelopmentRegion</key>
++	<string>en</string>
++	<key>CFBundleDisplayName</key>
++	<string>Ship of Harkinian</string>
++	<key>CFBundleExecutable</key>
++	<string>soh</string>
++	<key>CFBundleIdentifier</key>
++	<string>@SOH_IOS_BUNDLE_IDENTIFIER@</string>
++	<key>CFBundleInfoDictionaryVersion</key>
++	<string>6.0</string>
++	<key>CFBundleName</key>
++	<string>soh</string>
++	<key>CFBundlePackageType</key>
++	<string>APPL</string>
++	<key>CFBundleIconName</key>
++	<string>AppIcon</string>
++	<key>CFBundleShortVersionString</key>
++	<string>@SOH_IOS_VERSION@</string>
++	<key>CFBundleVersion</key>
++	<string>@SOH_IOS_BUILD@</string>
++	<key>LSRequiresIPhoneOS</key>
++	<true/>
++	<key>UIFileSharingEnabled</key>
++	<true/>
++	<key>LSSupportsOpeningDocumentsInPlace</key>
++	<true/>
++	<key>UIStatusBarHidden</key>
++	<true/>
++	<key>UIRequiresFullScreen</key>
++	<true/>
++	<key>UILaunchScreen</key>
++	<dict/>
++	<key>UIRequiredDeviceCapabilities</key>
++	<array>
++		<string>arm64</string>
++	</array>
++	<key>UISupportedInterfaceOrientations</key>
++	<array>
++		<string>UIInterfaceOrientationLandscapeRight</string>
++		<string>UIInterfaceOrientationLandscapeLeft</string>
++	</array>
++	<key>CADisableMinimumFrameDurationOnPhone</key>
++	<true/>
++	<key>UIApplicationSupportsIndirectInputEvents</key>
++	<true/>
++	<key>ITSAppUsesNonExemptEncryption</key>
++	<false/>
++	<key>CFBundleURLTypes</key>
++	<array>
++		<dict>
++			<key>CFBundleURLName</key>
++			<string>@SOH_IOS_BUNDLE_IDENTIFIER@</string>
++			<key>CFBundleURLSchemes</key>
++			<array>
++				<string>soh</string>
++			</array>
++		</dict>
++	</array>@SOH_PLIST_EXTRA@
++</dict>
++</plist>

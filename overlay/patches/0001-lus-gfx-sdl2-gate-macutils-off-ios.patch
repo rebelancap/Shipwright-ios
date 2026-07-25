@@ -1,0 +1,25 @@
+Gate the two Cocoa macUtils fullscreen call sites off iOS. macUtils.mm is
+(correctly) not compiled for iOS (src/ship/CMakeLists.txt:66-68), so these
+__APPLE__ blocks are undefined-symbol link errors on device. iOS is
+force-fullscreen anyway (Fast3dWindow.cpp:77); the #else SDL path is fine.
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -235,7 +235,7 @@
+         }
+     }
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(__IOS__)
+     // Implement fullscreening with native macOS APIs
+     if (on != isNativeMacOSFullscreenActive(mWnd)) {
+         toggleNativeMacOSFullscreen(mWnd);
+@@ -674,7 +674,7 @@
+     }
+ 
+     // resync fullscreen state
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+     auto nextFullscreenState = isNativeMacOSFullscreenActive(mWnd);
+     if (mFullScreen != nextFullscreenState) {
+         mFullScreen = nextFullscreenState;

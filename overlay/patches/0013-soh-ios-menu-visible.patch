@@ -1,0 +1,84 @@
+Overlay patch 0013: export menu visibility + pause state to the iOS shell.
+SohIos_IsMenuOpen() lets the touch overlay auto-hide while the SoH menu is
+open, whatever opened it (esc key, deep link, the overlay's own button) —
+Gui::GetMenuOrMenubarVisible() covers both the port menu and the old
+menubar. Appended at EOF of OTRGlobals.cpp so it shares no hunks with
+0008 (D6). __IOS__-only; desktop build unaffected.
+
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -2594,4 +2594,74 @@
+ // Number of interpolated frames
+ extern "C" uint32_t Ship_GetInterpolationFrameCount() {
+     return static_cast<uint32_t>(ceil((float)OTRGlobals::Instance->GetInterpolationFPS() / 20.0f));
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0013): game-state exports for the shell's touch overlay.
++// Polled from the UIKit main thread, which on iOS interleaves with (never
++// runs beside) the SDL game loop.
++extern "C" int SohIos_IsMenuOpen(void) {
++    auto ctx = Ship::Context::GetRawInstance();
++    if (ctx == nullptr) {
++        return 0;
++    }
++    auto wnd = ctx->GetWindow();
++    if (wnd == nullptr) {
++        return 0;
++    }
++    auto gui = wnd->GetGui();
++    if (gui == nullptr) {
++        return 0;
++    }
++    return gui->GetMenuOrMenubarVisible() ? 1 : 0;
++}
++
++// Kaleido (game pause) state: drives the controller-mode policy where the
++// shell's menu button appears only while the game is paused.
++extern "C" int SohIos_IsGamePaused(void) {
++    return (gPlayState != NULL && gPlayState->pauseCtx.state != 0) ? 1 : 0;
++}
++
++// Active BGM sequence ids (players 0-3 packed into 16 bits each of the
++// low/high words is overkill; report player 0 = main BGM and player 3 =
++// sub/fanfare). Diagnostics for the wrong-music-after-extraction bug:
++// the console bridge's `seq` command reads this.
++extern "C" uint32_t SohIos_ActiveSeqIds(void) {
++    return ((uint32_t)gActiveSeqs[0].seqId) | (((uint32_t)gActiveSeqs[3].seqId) << 16);
++}
++
++// Title/intro context: LUS boot, title attract (demo file 0xFF), and file
++// select run with gPlayState NULL or the demo save — the shell keeps the
++// menu button visible there (users tune settings at the start), and hides
++// it during normal gameplay.
++extern "C" int SohIos_IsTitleOrDemo(void) {
++    return (gPlayState == NULL || gSaveContext.fileNum == 0xFF) ? 1 : 0;
+ }
++
++// Touch scrolling for the SoH menu (overlay 0018 applies it): the shell
++// queues finger scroll deltas here; Menu.cpp's scrollable children consume
++// them if the finger is horizontally inside the child. Everything runs on
++// the main thread (the game loop IS the main thread on iOS) — no locking.
++static float sSohIosMenuScrollDy = 0.0f;
++static float sSohIosMenuScrollX = -1.0f;
++extern "C" void SohIos_QueueMenuScroll(float x, float dy) {
++    sSohIosMenuScrollX = x;
++    sSohIosMenuScrollDy += dy;
++}
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW) {
++    if (sSohIosMenuScrollDy == 0.0f || sSohIosMenuScrollX < winX || sSohIosMenuScrollX >= winX + winW) {
++        return 0.0f;
++    }
++    float dy = sSohIosMenuScrollDy;
++    sSohIosMenuScrollDy = 0.0f;
++    return dy;
++}
++
++// Any ImGui popup open (extractor prompts, quit confirm, ...): the touch
++// overlay must yield ALL input so popup buttons are tappable — the v1
++// stick zone ate the extractor's Yes on device, and the v2 floating-stick
++// region is even larger.
++extern "C" int SohIos_IsPopupOpen(void) {
++    return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ? 1 : 0;
++}
++#endif

@@ -1,0 +1,123 @@
+Overlay patch 0030: thread-safe CVar map (LUS ConsoleVariable).
+Two device crashes in one Vision Pro session (2026-07-16), both SIGSEGV at
+CVarGetInteger+36 on OTRAudio_Thread via AudioSynth_DoOneAudioUpdate —
+SoH's synth reads CVAR_ENHANCEMENT("MirroredWorld") every audio update
+(audio_synthesis.c:657, plus two more audio-thread reads in
+audio_playback.c), while the main thread writes CVars (death sequence,
+pause-menu open, any menu interaction). ConsoleVariable::mVariables is a
+bare std::unordered_map: a concurrent insert can rehash while the audio
+thread is inside find() -> freed-bucket deref -> SEGV. The two crash
+moments (death, pause) are exactly the big main-thread CVar-write moments.
+Fix: a recursive mutex over every mVariables access. All value reads
+funnel through Get(); writes are the five Set*, ClearVariable,
+CopyVariable, Save (iteration), Load (clear). recursive_mutex because
+Register*/ClearVariable/Load call Get()/Set*() internally. Uncontended
+lock cost is tens of ns against hundreds of calls/frame — noise.
+Residual (documented, not fixed): GetString returns a char* the map
+doesn't own after a concurrent SetString free — no audio-thread call site
+reads strings today (all three are integers).
+
+--- a/libultraship/include/ship/config/ConsoleVariable.h
++++ b/libultraship/include/ship/config/ConsoleVariable.h
+@@ -4,6 +4,7 @@
+ #include <nlohmann/json.hpp>
+ #include <stdint.h>
+ #include <memory>
++#include <mutex>
+ #include <unordered_map>
+ #include <string>
+ #include <string_view>
+@@ -209,5 +210,10 @@
+         }
+     };
+     std::unordered_map<std::string, std::shared_ptr<CVar>, TransparentStringHash, TransparentStringEqual> mVariables;
++    // SOH_IOS (overlay 0030): guards mVariables — SoH's audio thread reads
++    // CVars every synth update while the main thread writes them (menu,
++    // death sequence); an unguarded rehash SEGVs the concurrent find().
++    // Recursive: Register*/ClearVariable/Load re-enter via Get()/Set*().
++    mutable std::recursive_mutex mVariablesMutex;
+ };
+ } // namespace Ship
+--- a/libultraship/src/ship/config/ConsoleVariable.cpp
++++ b/libultraship/src/ship/config/ConsoleVariable.cpp
+@@ -21,6 +21,8 @@
+ }
+ 
+ std::shared_ptr<CVar> ConsoleVariable::Get(const char* name) {
++    // SOH_IOS (overlay 0030): every read funnels through here — see header.
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto it = mVariables.find(name);
+     return it != mVariables.end() ? it->second : nullptr;
+ }
+@@ -89,6 +91,7 @@
+ }
+ 
+ void ConsoleVariable::SetInteger(const char* name, int32_t value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (variable == nullptr) {
+         variable = std::make_shared<CVar>();
+@@ -99,6 +102,7 @@
+ }
+ 
+ void ConsoleVariable::SetFloat(const char* name, float value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (variable == nullptr) {
+         variable = std::make_shared<CVar>();
+@@ -109,6 +113,7 @@
+ }
+ 
+ void ConsoleVariable::SetString(const char* name, const char* value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (variable == nullptr) {
+         variable = std::make_shared<CVar>();
+@@ -122,6 +127,7 @@
+ }
+ 
+ void ConsoleVariable::SetColor(const char* name, Color_RGBA8 value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (!variable) {
+         variable = std::make_shared<CVar>();
+@@ -132,6 +138,7 @@
+ }
+ 
+ void ConsoleVariable::SetColor24(const char* name, Color_RGB8 value) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variable = mVariables[name];
+     if (!variable) {
+         variable = std::make_shared<CVar>();
+@@ -172,6 +179,7 @@
+ }
+ 
+ void ConsoleVariable::ClearVariable(const char* name) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     std::shared_ptr<Config> conf = Context::GetRawInstance()->GetConfig();
+     auto var = Get(name);
+     if (var != nullptr) {
+@@ -208,6 +216,7 @@
+ }
+ 
+ void ConsoleVariable::CopyVariable(const char* from, const char* to) {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     auto& variableFrom = mVariables[from];
+     if (!variableFrom) {
+         return;
+@@ -241,6 +250,7 @@
+ }
+ 
+ void ConsoleVariable::Save() {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     std::shared_ptr<Config> conf = Context::GetRawInstance()->GetConfig();
+ 
+     for (const auto& variable : mVariables) {
+@@ -277,6 +287,7 @@
+ }
+ 
+ void ConsoleVariable::Load() {
++    std::lock_guard<std::recursive_mutex> sohIosLock(mVariablesMutex);
+     std::shared_ptr<Config> conf = Context::GetRawInstance()->GetConfig();
+     conf->Reload();
+     if (!mVariables.empty()) {

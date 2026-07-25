@@ -1,0 +1,39 @@
+Overlay patch 0024: truthful Internal Resolution display on iOS/visionOS.
+The slider's only consumer (SetResolutionMultiplier -> Fast3dGui's ImGui
+game-window viewport) never runs on iOS/visionOS — these builds always
+render at the native drawable (iPhone A/B verified identical pixels at
+100%/200%; Vision Pro log-verified 3840x2160). A slider stuck at "100%"
+reads as half-res to anyone who knows desktop SoH (user flagged it twice),
+and persisting 2.0 is a landmine: the multiplier scales POINTS, so if a
+future pin ever activates the consumer it would SHRINK the render. Replace
+the dead slider with a static truth line on __IOS__ (covers visionOS —
+same define, overlay 0022).
+
+--- a/soh/soh/SohGui/SohMenuSettings.cpp
++++ b/soh/soh/SohGui/SohMenuSettings.cpp
+@@ -336,6 +336,7 @@
+         .RaceDisable(false)
+         .Callback([](WidgetInfo& info) { Ship::Context::GetRawInstance()->GetWindow()->ToggleFullscreen(); })
+         .Options(ButtonOptions().Tooltip("Toggles Fullscreen On/Off."));
++#ifndef __IOS__
+     AddWidget(path, "Internal Resolution", WIDGET_CVAR_SLIDER_FLOAT)
+         .CVar(CVAR_INTERNAL_RESOLUTION)
+         .RaceDisable(false)
+@@ -360,6 +361,17 @@
+                 .IsPercentage()
+                 .Min(0.5f)
+                 .Max(2.0f));
++#else
++    // SOH_IOS (overlay 0024 rev2): the desktop multiplier stays hidden on
++    // iOS/visionOS. Rev2 (Ghostship SSAA finding, overlay 0036): the render
++    // was in fact SUB-native here — resolution is now governed by the
++    // native-pixel-relative "Supersampling (SSAA)" slider in Settings > iOS
++    // (1.0 = true native). Point there instead of the old (wrong) "always
++    // native" claim.
++    // ASCII only in widget strings (menu font renders em-dash as '?').
++    AddWidget(path, "Internal Resolution: see Supersampling (SSAA) in Settings > iOS (1.0 = native)",
++              WIDGET_SEPARATOR_TEXT);
++#endif
+ #ifndef __WIIU__
+     AddWidget(path, "Anti-aliasing (MSAA)", WIDGET_CVAR_SLIDER_INT)
+         .CVar(CVAR_MSAA_VALUE)

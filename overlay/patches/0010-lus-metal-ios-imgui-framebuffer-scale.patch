@@ -1,0 +1,42 @@
+Overlay patch 0010: the iOS BLACK-SCREEN / corner-render fix.
+
+On __APPLE__ the game reaches the screen (fb 0) by being drawn as an
+ImGui::Image quad. LUS inits the ImGui SDL2 backend via
+ImGui_ImplSDL2_InitForMetal (Fast3dGui.cpp:103), i.e. with NO SDL_Renderer, so
+its NewFrame derives DisplayFramebufferScale from SDL_GL_GetDrawableSize
+(imgui_impl_sdl2.cpp:937) — which returns POINTS on a Metal window. Measured on
+device/sim: DisplaySize=912x420, FramebufferScale=1x1, while the drawable is
+2736x1260 native pixels. So DisplaySize*FramebufferScale=912x420 and
+RenderDrawData's guard (gfx_metal.cpp:123) sees screen_texture(2736) != 912 and
+early-RETURNS -> the whole ImGui pass (incl. the game image) is skipped every
+frame -> solid black. (Forcing the guard through instead draws the game into
+the top-left corner, since the ImGui viewport is DisplaySize*scale=912x420.)
+
+Fix: in RenderDrawData, recompute FramebufferScale from the actual drawable
+pixel size (screen_texture, == SDL_GetRendererOutputSize here) over the
+point-sized DisplaySize. DisplaySize stays in points so the ImGui menu keeps
+its normal on-screen size; the game image then fills the full drawable at
+native 2736x1260 and the guard passes. Verified on the iPhone Air simulator:
+the OoT title screen renders full-screen. iOS-only; desktop untouched.
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -118,6 +118,18 @@
+ 
+     // Workaround for detecting when transitioning to/from full screen mode.
+     MTL::Texture* screen_texture = mTextures[framebuffer.mTextureId].texture;
++#ifdef __IOS__
++    // The ImGui SDL2 backend was init'd for Metal (no SDL_Renderer) so it derives
++    // FramebufferScale from SDL_GL_GetDrawableSize, which returns POINTS on iOS
++    // (scale ends up 1x). Recompute it from the real drawable pixels so
++    // DisplaySize(points)*scale == drawable, or the game image is skipped (black)
++    // / drawn into the top-left corner. See overlay 0010.
++    if (drawData->DisplaySize.x > 0.0f && drawData->DisplaySize.y > 0.0f) {
++        drawData->FramebufferScale =
++            ImVec2((float)screen_texture->width() / drawData->DisplaySize.x,
++                   (float)screen_texture->height() / drawData->DisplaySize.y);
++    }
++#endif
+     int fb_width = (int)(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+     int fb_height = (int)(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+     if (screen_texture->width() != fb_width || screen_texture->height() != fb_height)

@@ -1,0 +1,26 @@
+Overlay patch 0029: mip filtering in Fast3D Metal samplers.
+Companion to 0019 rev3 (mip chains for large HD/4K textures): without a
+sampler mip filter the chains are never read. Linear-filtered textures
+get trilinear + 4x anisotropy; the N64 three-point/nearest path keeps
+nearest-mip so the authentic look is preserved. Samplers are created
+before the texture uploads, so this applies unconditionally — sampling a
+single-level texture with a mip filter is well-defined (level 0).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -434,6 +434,15 @@
+                                           : MTL::SamplerMinMagFilterNearest;
+     sampler_descriptor->setMinFilter(filter);
+     sampler_descriptor->setMagFilter(filter);
++    // SOH_IOS (overlay 0029): read the 0019-rev3 mip chains — trilinear +
++    // modest anisotropy on the linear path; nearest-mip preserves the
++    // three-point/nearest N64 look. Single-level textures sample level 0.
++    if (filter == MTL::SamplerMinMagFilterLinear) {
++        sampler_descriptor->setMipFilter(MTL::SamplerMipFilterLinear);
++        sampler_descriptor->setMaxAnisotropy(4);
++    } else {
++        sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
++    }
+     sampler_descriptor->setSAddressMode(gfx_cm_to_metal(cms));
+     sampler_descriptor->setTAddressMode(gfx_cm_to_metal(cmt));
+     sampler_descriptor->setRAddressMode(MTL::SamplerAddressModeRepeat);

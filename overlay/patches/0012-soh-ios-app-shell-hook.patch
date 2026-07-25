@@ -1,0 +1,31 @@
+Overlay patch 0012: wire the iOS app shell (app/ios/SohIosShell.m) into the
+soh target and have LUS call it right after SDL creates its window.
+The shell lives in the Shipwright-ios repo (not vendor); its dir is passed as
+-DSOH_IOS_SHELL_DIR. It grafts SDL's UIWindow onto the active UIWindowScene,
+forces landscape (iOS 26 sceneless-window fix), and will host touch controls.
+Generated against the post-overlay vendor tree (0004 etc already applied).
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -53,6 +53,10 @@
+ #endif
+ 
+ namespace Fast {
++#ifdef __IOS__
++// iOS app shell hook (overlay 0012), implemented in app/ios/SohIosShell.m.
++extern "C" void SohIos_OnWindowCreated(struct SDL_Window*);
++#endif
+ const SDL_Scancode lus_to_sdl_table[] = {
+     SDL_SCANCODE_UNKNOWN,
+     SDL_SCANCODE_ESCAPE,
+@@ -391,6 +395,10 @@
+     }
+ 
+     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
++#ifdef __IOS__
++    // Graft onto the active UIWindowScene, force landscape, host touch controls.
++    SohIos_OnWindowCreated(mWnd);
++#endif
+ #ifdef _WIN32
+     // Get Windows window handle and use it to subclass the window procedure.
+     // Needed to circumvent SDLs DPI scaling problems under windows (original does only scale *sometimes*).

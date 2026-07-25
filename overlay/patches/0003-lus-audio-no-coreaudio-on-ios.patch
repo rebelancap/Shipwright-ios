@@ -1,0 +1,44 @@
+Overlay patch 0003: Audio.cpp references CoreAudioAudioPlayer under
+__APPLE__, but src/ship/CMakeLists.txt:16-18 only compiles it on Darwin —
+undefined symbol at app link on iOS, and COREAUDIO would be the default
+backend with no implementation. Gate all four __APPLE__ blocks off iOS;
+default/available backend on iOS becomes SDL (works: SDL-iOS configures the
+AVAudioSession internally).
+
+--- a/libultraship/src/ship/audio/Audio.cpp
++++ b/libultraship/src/ship/audio/Audio.cpp
+@@ -1,6 +1,6 @@
+ #include "ship/audio/Audio.h"
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+ #include "ship/audio/CoreAudioAudioPlayer.h"
+ #endif
+ 
+@@ -21,7 +21,7 @@
+             mAudioPlayer = std::make_shared<WasapiAudioPlayer>(this->mAudioSettings);
+             break;
+ #endif
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+         case AudioBackend::COREAUDIO:
+             mAudioPlayer = std::make_shared<CoreAudioAudioPlayer>(this->mAudioSettings);
+             break;
+@@ -48,7 +48,7 @@
+ #ifdef _WIN32
+     mAvailableAudioBackends->push_back(AudioBackend::WASAPI);
+ #endif
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+     mAvailableAudioBackends->push_back(AudioBackend::COREAUDIO);
+ #endif
+     mAvailableAudioBackends->push_back(AudioBackend::SDL);
+@@ -97,7 +97,7 @@
+     return AudioBackend::WASAPI;
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+     return AudioBackend::COREAUDIO;
+ #endif
+ 

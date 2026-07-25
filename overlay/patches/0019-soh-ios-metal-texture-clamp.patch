@@ -1,0 +1,208 @@
+Overlay patch 0019 (rev4): harden Metal UploadTexture — clamp + null-guard
++ exact byte accounting + deferred mip-chain generation.
+rev1 (HD-pack pause crash): Metal ABORTS the process (driver-side
+descriptor validation, active in release builds) when a texture dimension
+exceeds the GPU limit — 8192 on the simulator, 16384 on A-series phones.
+No pack texture is really that big (OoT Reloaded HD maxes at 2560, 4K at
+8192): Interpreter::ImportTextureRaw's OOB-load fallback flattens a load
+request larger than the HD resource into a SINGLE LINE, so a 64 KB
+resource becomes a 16384x1 upload (sim abort) and the 4K pack's Kaleido
+strip is 65536x1 (device abort). Clamp to the device max; the flattened
+data past the clamp is zero-fill/garbage by construction. bytes_per_row
+stays the SOURCE stride so a clamped region reads row-correct sub-rects.
+rev2 (4K long-session pause crash): (a) newTexture returns nil under
+memory pressure and the unchecked replaceRegion dereferenced it — now
+skips with an error log instead of crashing; (b) exact GPU texture byte
+accounting (add on create, subtract on the dim-mismatch release) feeding
+GetTextureBytes/the 0020 byte-budget cache eviction.
+rev3 (4K GPU overload): HD/4K replacement textures uploaded with a single
+mip level — minified sampling of 2048px+ textures is a memory-bandwidth
+catastrophe (device gpu_ms hit 31 ms/frame in vista scenes; 3.8 ms with
+mips). Large textures get a full mip chain, generated on the GPU.
+rev4 (Hyrule Field freeze, Vision Pro 2026-07-15): rev3 committed a fresh
+command buffer per upload MID-FRAME. StartDrawToFramebuffer enqueue()s
+the frame's command buffer before the display list runs, and Metal
+executes a queue's command buffers strictly in enqueue order — so every
+per-upload buffer queued behind an enqueued-but-UNCOMMITTED buffer.
+Past ~63 uploads in one frame (Hyrule Field cold-cache burst, 4K pack)
+commandBuffer() blocks forever waiting for a slot that can only free
+when the frame buffer commits — which the blocked main thread will never
+do. Scenes with smaller bursts (title, Kokiri) drained each frame and
+masked it. Fix: zero mid-frame command buffers — uploads push the texture
+(retained; 0020's eviction can release it first) onto a pending list, and
+EndFrame encodes ONE generateMipmaps blit pass on the frame's own command
+buffer after its render encoding ends. Mips become valid next frame; the
+one frame that samples fresh uploads pre-mips is a load transition.
+Ledger sites are mip-aware (a full chain is +1/3 of the base level).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -385,20 +385,60 @@
+     mCurrentTile = tile;
+     mCurrentTextureIds[tile] = texture_id;
+ }
++
++// SOH_IOS (overlay 0019 rev4): textures awaiting a mip-chain build in
++// EndFrame's single blit pass. Entries are retained on push — the 0020
++// byte-budget cache may evict (release) a texture before the frame ends.
++static std::vector<MTL::Texture*> sSohIosPendingMips;
+ 
++// SOH_IOS (overlay 0019 rev5): per-frame upload ledger — the HD-pack stutter
++// hunt (recurring ~185 ms engine stalls with no log correlate) needs to see
++// texture-upload bursts. Frame counters reset in EndFrame; window totals are
++// read+cleared by the 0008 perf probe.
++static uint64_t sSohIosFrameUpBytes = 0;
++static int sSohIosFrameUpCount = 0;
++static uint32_t sSohIosFrameUpMaxW = 0, sSohIosFrameUpMaxH = 0;
++extern "C" volatile uint64_t gSohIosUpWinBytes;
++extern "C" volatile int gSohIosUpWinCount;
++volatile uint64_t gSohIosUpWinBytes = 0;
++volatile int gSohIosUpWinCount = 0;
++
+ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+     if (width == 0 || height == 0) {
+         return;
+     }
+ 
++    // SOH_IOS (overlay 0019): Metal aborts the process (no error return) if a
++    // texture dimension exceeds the device limit. ImportTextureRaw's OOB-load
++    // fallback flattens over-requested HD-pack loads into a single line
++    // (e.g. 65536x1), which trips that limit. Clamp and log instead of dying;
++    // the flattened bytes past the clamp are zero-fill/garbage by construction.
++    // bytes_per_row keeps the SOURCE stride so a clamped region stays
++    // row-correct.
++    const uint32_t sohIosSrcWidth = width;
++    const uint32_t sohIosMaxDim = (uint32_t)GetMaxTextureSize();
++    if (width > sohIosMaxDim || height > sohIosMaxDim) {
++        SPDLOG_WARN("UploadTexture: clamping oversized texture {}x{} to device max {}", width, height, sohIosMaxDim);
++        width = width > sohIosMaxDim ? sohIosMaxDim : width;
++        height = height > sohIosMaxDim ? sohIosMaxDim : height;
++    }
++
+     TextureDataMetal* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
+ 
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+ 
+-    MTL::TextureDescriptor* texture_descriptor =
+-        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
++    // SOH_IOS (overlay 0019 rev3): HD/4K replacement textures were uploaded
++    // with a single mip level — minified sampling of 2048px+ textures is a
++    // memory-bandwidth catastrophe (device gpu_ms hit 31ms/frame in vista
++    // scenes). Give large textures a full mip chain; tiny native-N64
++    // textures stay single-level (mip gen overhead isn't worth it there).
++    const bool sohIosWantMips = (width >= 256 || height >= 256);
++    MTL::TextureDescriptor* texture_descriptor =
++        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, sohIosWantMips);
+     texture_descriptor->setArrayLength(1);
+-    texture_descriptor->setMipmapLevelCount(1);
++    if (!sohIosWantMips) {
++        texture_descriptor->setMipmapLevelCount(1);
++    }
+     texture_descriptor->setSampleCount(1);
+     texture_descriptor->setStorageMode(MTL::StorageModeShared);
+ 
+@@ -406,18 +446,61 @@
+ 
+     MTL::Texture* texture = texture_data->texture;
+     if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
+-        texture_data->texture->height() != height) {
+-        if (texture_data->texture != nullptr)
++        texture_data->texture->height() != height ||
++        (sohIosWantMips && texture_data->texture->mipmapLevelCount() <= 1)) {
++        if (texture_data->texture != nullptr) {
++            // SOH_IOS (overlay 0019 rev2): keep the GPU byte ledger exact
++            // (rev4: a mip chain adds one third over the base level).
++            size_t sohIosOldBytes =
++                (size_t)texture_data->texture->width() * texture_data->texture->height() * 4;
++            if (texture_data->texture->mipmapLevelCount() > 1) {
++                sohIosOldBytes += sohIosOldBytes / 3;
++            }
++            mTextureBytes -= sohIosOldBytes;
+             texture_data->texture->release();
++            texture_data->texture = nullptr;
++        }
+ 
+         texture = mDevice->newTexture(texture_descriptor);
++        // SOH_IOS (overlay 0019 rev2): under memory pressure newTexture returns
++        // nil; the unchecked replaceRegion below then dereferenced null. Skip
++        // the upload (stale/garbage texel data beats a crash) and log loudly.
++        if (texture == nullptr) {
++            SPDLOG_ERROR("UploadTexture: newTexture failed ({}x{}, {} MB resident) — skipping upload", width,
++                         height, mTextureBytes / (1024 * 1024));
++            autorelease_pool->release();
++            return;
++        }
++        size_t sohIosNewBytes = (size_t)width * height * 4;
++        if (texture->mipmapLevelCount() > 1) {
++            sohIosNewBytes += sohIosNewBytes / 3;
++        }
++        mTextureBytes += sohIosNewBytes;
+     }
+ 
+     NS::UInteger bytes_per_pixel = 4;
+-    NS::UInteger bytes_per_row = bytes_per_pixel * width;
++    NS::UInteger bytes_per_row = bytes_per_pixel * sohIosSrcWidth;
+     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
+     texture_data->texture = texture;
+ 
++    // SOH_IOS (overlay 0019 rev5): upload ledger (stutter hunt).
++    sSohIosFrameUpBytes += (uint64_t)width * height * 4;
++    sSohIosFrameUpCount++;
++    if ((uint64_t)width * height > (uint64_t)sSohIosFrameUpMaxW * sSohIosFrameUpMaxH) {
++        sSohIosFrameUpMaxW = width;
++        sSohIosFrameUpMaxH = height;
++    }
++
++    // SOH_IOS (overlay 0019 rev4): DO NOT create a command buffer here — the
++    // frame's command buffer is already enqueue()d and uncommitted, so buffers
++    // created mid-frame stack up behind it unexecuted; >63 uploads in one frame
++    // deadlocks commandBuffer() (Hyrule Field freeze). Defer to EndFrame's
++    // single blit pass instead.
++    if (sohIosWantMips && texture->mipmapLevelCount() > 1) {
++        texture->retain();
++        sSohIosPendingMips.push_back(texture);
++    }
++
+     autorelease_pool->release();
+ }
+ 
+@@ -646,6 +729,39 @@
+     auto& screen_framebuffer = mFramebuffers[0];
+     if (!screen_framebuffer.mHasEndedEncoding)
+         screen_framebuffer.mCommandEncoder->endEncoding();
++
++    // SOH_IOS (overlay 0019 rev4): build mip chains for this frame's uploads in
++    // ONE blit pass on the frame's own command buffer (see UploadTexture for
++    // why per-upload command buffers deadlock). The command buffer retains
++    // encoder-referenced textures until completion, so our list retain can be
++    // dropped right after encoding — including textures 0020 already evicted.
++    if (!sSohIosPendingMips.empty()) {
++        if (screen_framebuffer.mCommandBuffer != nullptr) {
++            MTL::BlitCommandEncoder* sohIosBlit = screen_framebuffer.mCommandBuffer->blitCommandEncoder();
++            for (MTL::Texture* sohIosTex : sSohIosPendingMips) {
++                sohIosBlit->generateMipmaps(sohIosTex);
++            }
++            sohIosBlit->endEncoding();
++        }
++        for (MTL::Texture* sohIosTex : sSohIosPendingMips) {
++            sohIosTex->release();
++        }
++        sSohIosPendingMips.clear();
++    }
++
++    // SOH_IOS (overlay 0019 rev5): close the frame's upload ledger. A burst
++    // frame (>8 MB uploaded) is logged with its biggest texture — correlate
++    // the timestamps with SOH_PERF max spikes to identify the stutter source.
++    if (sSohIosFrameUpBytes > 8u * 1024 * 1024) {
++        SPDLOG_WARN("SOH_UPLOAD_BURST n={} mb={:.1f} biggest={}x{}", sSohIosFrameUpCount,
++                    sSohIosFrameUpBytes / 1048576.0, sSohIosFrameUpMaxW, sSohIosFrameUpMaxH);
++    }
++    gSohIosUpWinBytes = gSohIosUpWinBytes + sSohIosFrameUpBytes;
++    gSohIosUpWinCount = gSohIosUpWinCount + sSohIosFrameUpCount;
++    sSohIosFrameUpBytes = 0;
++    sSohIosFrameUpCount = 0;
++    sSohIosFrameUpMaxW = 0;
++    sSohIosFrameUpMaxH = 0;
+ 
+     // Deferred screen FB readback: blit the rendered texture into a shared
+     // MTLBuffer using a blit encoder (cheap DMA — no render pass boundary,

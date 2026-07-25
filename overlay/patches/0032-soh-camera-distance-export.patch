@@ -1,0 +1,85 @@
+Overlay patch 0032: export the live camera-to-focus distance (soh z_view.c)
+for adaptive stereo convergence. Device finding (2026-07-16): fixed
+convergence made depth intensity swing wildly per scene — OoT's camera
+distance to Link varies several-fold (uphill close-cam = intense/diplopia,
+open field far-cam = nearly flat). The view code already computes
+dist(eye, lookAt) each frame for its interpolation heuristics; publish it so
+the LUS eye passes can anchor zero-parallax on the camera's subject (Link /
+the Z-target) and scale the eye offset proportionally — background disparity
+(e/C) then stays constant across scenes.
+
+--- a/soh/src/code/z_view.c
++++ b/soh/src/code/z_view.c
+@@ -344,6 +344,72 @@
+     float diry = view->eye.y - view->lookAt.y;
+     float dirz = view->eye.z - view->lookAt.z;
+     float dir_dist = sqrtf(sqr(dirx) + sqr(diry) + sqr(dirz));
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0032 v2): live camera BASIS for stereoscopic 3D.
++     * OoT's G_MTX_PROJECTION is viewing*projection COMBINED, so the LUS eye
++     * passes cannot derive the camera axes from it — the eye offset must run
++     * along the CAMERA's right axis (world-space offsets made depth vary with
++     * heading and injected vertical parallax: unfusable doubles, device
++     * rounds 1-4). Also exported: forward + eye (for the convergence skew),
++     * focal factor P00 = cot(fovx/2), and the focus distance. */
++    if (dir_dist > 0.0f) {
++        extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++        extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++        float fwx = -dirx / dir_dist, fwy = -diry / dir_dist, fwz = -dirz / dir_dist;
++        /* right = normalize(cross(forward, up)) — y-up right-handed */
++        float rx = fwy * view->up.z - fwz * view->up.y;
++        float ry = fwz * view->up.x - fwx * view->up.z;
++        float rz = fwx * view->up.y - fwy * view->up.x;
++        float rlen = sqrtf(sqr(rx) + sqr(ry) + sqr(rz));
++        if (rlen > 1e-4f) {
++            gSoh3DCamRight[0] = rx / rlen;
++            gSoh3DCamRight[1] = ry / rlen;
++            gSoh3DCamRight[2] = rz / rlen;
++            gSoh3DCamFwd[0] = fwx;
++            gSoh3DCamFwd[1] = fwy;
++            gSoh3DCamFwd[2] = fwz;
++            gSoh3DCamEye[0] = view->eye.x;
++            gSoh3DCamEye[1] = view->eye.y;
++            gSoh3DCamEye[2] = view->eye.z;
++            {
++                float aspect_now = (f32)(view->viewport.rightX - view->viewport.leftX) /
++                                   (f32)(view->viewport.bottomY - view->viewport.topY);
++                float half_fovx = tanf(view->fovy * 0.5f * (3.14159265f / 180.0f)) * aspect_now;
++                gSoh3DCamP00 = (half_fovx > 1e-4f) ? (1.0f / half_fovx) : 1.0f;
++            }
++            gSoh3DCamDist = dir_dist;
++        }
++    }
++    /* Pause menu (Kaleido) draws captured-scene layers that fight stereo —
++     * flatten while paused (the interpreter ramps separation to zero). */
++    {
++        extern volatile int gSoh3DPaused;
++        if (gPlayState != NULL) {
++            gSoh3DPaused = (gPlayState->pauseCtx.state != 0) || (gPlayState->pauseCtx.debugState != 0);
++        }
++    }
++    /* Menus with their own perspective views (file select's cloud background,
++     * title) are not gameplay — the interpreter flattens stereo unless the
++     * view being applied is the gameplay view. */
++    {
++        extern volatile int gSoh3DInPlay;
++        gSoh3DInPlay = (gPlayState != NULL) && (view == &gPlayState->view);
++    }
++    /* First-person / aiming cameras (slingshot, bow, boomerang, look-around):
++     * the item model renders inches from the eye — full stereo doubles it.
++     * The interpreter fades depth to the user-tuned aim profile. */
++    {
++        extern volatile int gSoh3DAiming;
++        if (gPlayState != NULL) {
++            Camera* sohCam = GET_ACTIVE_CAM(gPlayState);
++            if (sohCam != NULL) {
++                s16 sohCamMode = sohCam->mode;
++                gSoh3DAiming = (sohCamMode == CAM_MODE_FIRST_PERSON) || (sohCamMode == CAM_MODE_AIM_ADULT) ||
++                               (sohCamMode == CAM_MODE_AIM_BOOMERANG) || (sohCamMode == CAM_MODE_AIM_CHILD);
++            }
++        }
++    }
++#endif
+     dirx /= dir_dist;
+     diry /= dir_dist;
+     dirz /= dir_dist;

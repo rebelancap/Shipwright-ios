@@ -1,0 +1,661 @@
+Overlay patch 0021: SDL2 visionOS compatibility (Phase 1, VISION-PRO-GUIDE).
+SDL 2.32.10 has zero visionOS awareness and its UIKit backend leans on
+UIScreen/status-bar APIs that the xros SDK marks unavailable (90 compile
+errors). This patch:
+1. Adds cmake/dependencies/patches/sdl2-visionos-compat.patch to LUS — a
+   ~25-hunk TARGET_OS_VISION-guarded port of the UIKit backend (virtual
+   1920x1080@90 display replacing UIScreen enumeration; scene-sized
+   UIWindow; traitCollection.displayScale for HIGHDPI; status-bar/launch-
+   image/orientation machinery compiled out; 90 Hz CADisplayLink;
+   SDL_PLATFORM_VISIONOS define for the backported sysurl guard). Inert on
+   iOS/tvOS builds (TARGET_OS_VISION == 0).
+2. Hunks LUS cmake/dependencies/ios.cmake to run it as the SDL2
+   FetchContent PATCH_COMMAND via the existing git-patch.cmake mechanism
+   (same pattern as the imgui/stormlib dep patches).
+Verified: libSDL2.a builds clean for PLATFORM=SIMULATOR_VISIONOS with
+SDL_OPENGLES=OFF (GLES does not exist on visionOS; the Metal renderer is
+the only one LUS uses).
+
+--- /dev/null
++++ b/libultraship/cmake/dependencies/patches/sdl2-visionos-compat.patch
+@@ -0,0 +1,621 @@
++diff --git a/src/misc/ios/SDL_sysurl.m b/src/misc/ios/SDL_sysurl.m
++index 08722ba9e..228ea8c0a 100644
++--- a/src/misc/ios/SDL_sysurl.m
+++++ b/src/misc/ios/SDL_sysurl.m
++@@ -22,6 +22,10 @@
++ #include "../SDL_sysurl.h"
++ 
++ #import <UIKit/UIKit.h>
+++#include <TargetConditionals.h>
+++#if defined(TARGET_OS_VISION) && TARGET_OS_VISION && !defined(SDL_PLATFORM_VISIONOS)
+++#define SDL_PLATFORM_VISIONOS 1
+++#endif
++ 
++ int SDL_SYS_OpenURL(const char *url)
++ {
++diff --git a/src/video/uikit/SDL_uikitappdelegate.m b/src/video/uikit/SDL_uikitappdelegate.m
++index 31b114a93..e97af5171 100644
++--- a/src/video/uikit/SDL_uikitappdelegate.m
+++++ b/src/video/uikit/SDL_uikitappdelegate.m
++@@ -85,7 +85,7 @@ int SDL_UIKitRunApp(int argc, char *argv[], SDL_main_func mainFunction)
++     [UIApplication sharedApplication].idleTimerDisabled = disable;
++ }
++ 
++-#if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++ /* Load a launch image using the old UILaunchImageFile-era naming rules. */
++ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
++ {
++@@ -146,8 +146,10 @@ - (void)viewDidLoad {
++     self.storyboardViewController.view.frame = self.view.bounds;
++     [self.storyboardViewController didMoveToParentViewController:self];
++ 
+++#if !TARGET_OS_VISION
++     UIApplication.sharedApplication.statusBarHidden = self.prefersStatusBarHidden;
++     UIApplication.sharedApplication.statusBarStyle = self.preferredStatusBarStyle;
+++#endif
++ }
++ 
++ - (BOOL)prefersStatusBarHidden {
++@@ -210,6 +212,7 @@ - (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibB
++         }
++     }
++ 
+++#if !TARGET_OS_VISION /* no UIScreen / launch images on visionOS */
++     if (!self.view) {
++         NSArray *launchimages = [bundle objectForInfoDictionaryKey:@"UILaunchImages"];
++         NSString *imagename = nil;
++@@ -322,6 +325,7 @@ - (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibB
++             self.view = view;
++         }
++     }
+++#endif /* !TARGET_OS_VISION */
++ 
++     return self;
++ }
++@@ -390,6 +394,19 @@ - (void)hideLaunchScreen
++ 
++ - (void)postFinishLaunch
++ {
+++#if TARGET_OS_VISION
+++    /* visionOS can re-deliver launch-path callbacks when a scene
+++     * disconnects/reconnects (observed during aggressive window resizing).
+++     * Re-running the game's main() in-process double-initializes the engine
+++     * (twin audio threads -> SEGV) and restarts the game from the intro.
+++     * The engine main runs once per process, ever. */
+++    static BOOL sdl_main_ran = NO;
+++    if (sdl_main_ran) {
+++        NSLog(@"[SDL] postFinishLaunch re-entry suppressed (scene reconnect)");
+++        return;
+++    }
+++    sdl_main_ran = YES;
+++#endif
++     /* Hide the launch screen the next time the run loop is run. SDL apps will
++      * have a chance to load resources while the launch screen is still up. */
++     [self performSelector:@selector(hideLaunchScreen) withObject:nil afterDelay:0.0];
++@@ -425,7 +442,7 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
++     NSString *screenname = nil;
++ 
++     /* tvOS only uses a plain launch image. */
++-#if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++     screenname = [bundle objectForInfoDictionaryKey:@"UILaunchStoryboardName"];
++ 
++     if (screenname) {
++@@ -448,7 +465,11 @@ - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(
++     }
++ 
++     if (vc.view) {
+++#if TARGET_OS_VISION
+++        launchWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 1920, 1080)];
+++#else
++         launchWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+++#endif
++ 
++         /* We don't want the launch window immediately hidden when a real SDL
++          * window is shown - we fade it out ourselves when we're ready. */
++diff --git a/src/video/uikit/SDL_uikitevents.m b/src/video/uikit/SDL_uikitevents.m
++index 0a96c6821..af910eed9 100644
++--- a/src/video/uikit/SDL_uikitevents.m
+++++ b/src/video/uikit/SDL_uikitevents.m
++@@ -59,7 +59,7 @@ - (void)eventPumpChanged
++         [notificationCenter addObserver:self selector:@selector(applicationWillEnterForeground) name:UIApplicationWillEnterForegroundNotification object:nil];
++         [notificationCenter addObserver:self selector:@selector(applicationWillTerminate) name:UIApplicationWillTerminateNotification object:nil];
++         [notificationCenter addObserver:self selector:@selector(applicationDidReceiveMemoryWarning) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
++-#if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++         [notificationCenter addObserver:self selector:@selector(applicationDidChangeStatusBarOrientation) name:UIApplicationDidChangeStatusBarOrientationNotification object:nil];
++ #endif
++     } else if (!UIKit_EventPumpEnabled && self.isObservingNotifications) {
++@@ -99,11 +99,13 @@ - (void)applicationDidReceiveMemoryWarning
++ }
++ 
++ #if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++ - (void)applicationDidChangeStatusBarOrientation
++ {
++     SDL_OnApplicationDidChangeStatusBarOrientation();
++ }
++ #endif
+++#endif
++ 
++ @end
++ 
++diff --git a/src/video/uikit/SDL_uikitmessagebox.m b/src/video/uikit/SDL_uikitmessagebox.m
++index a28f1cf98..63ba12996 100644
++--- a/src/video/uikit/SDL_uikitmessagebox.m
+++++ b/src/video/uikit/SDL_uikitmessagebox.m
++@@ -99,7 +99,11 @@ static BOOL UIKit_ShowMessageBoxAlertController(const SDL_MessageBoxData *messag
++     }
++ 
++     if (window == nil || window.rootViewController == nil) {
+++#if TARGET_OS_VISION
+++        alertwindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 1920, 1080)];
+++#else
++         alertwindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+++#endif
++         alertwindow.rootViewController = [UIViewController new];
++         alertwindow.windowLevel = UIWindowLevelAlert;
++ 
++diff --git a/src/video/uikit/SDL_uikitmetalview.m b/src/video/uikit/SDL_uikitmetalview.m
++index 7c17d8d5d..3f954edba 100644
++--- a/src/video/uikit/SDL_uikitmetalview.m
+++++ b/src/video/uikit/SDL_uikitmetalview.m
++@@ -37,6 +37,20 @@
++ #import "SDL_uikitmetalview.h"
++ 
++ 
+++#if TARGET_OS_VISION
+++/* Provided by the app shell (Settings -> iOS -> Render Scale). Weak so a
+++   plain SDL build without the shell still links. */
+++extern float SohIos_VisionLongEdge(void);
+++static inline CGFloat SDL_VisionTargetLongEdge(void)
+++{
+++    float v = SohIos_VisionLongEdge();
+++    if (v >= 1024.0f && v <= 8192.0f) {
+++        return (CGFloat)v;
+++    }
+++    return 3840.0;
+++}
+++#endif
+++
++ @implementation SDL_uikitmetalview
++ 
++ /* Returns a Metal-compatible layer. */
++@@ -67,6 +81,53 @@ - (void)layoutSubviews
++ - (void)updateDrawableSize
++ {
++     CGSize size = self.bounds.size;
+++#if TARGET_OS_VISION
+++    /* visionOS: the compositor supersamples whatever we render — push the
+++       drawable to a ~3840 long edge for a crisp panel. DEBOUNCED: a live
+++       window drag would otherwise reallocate 4K drawables + engine
+++       framebuffers every tick (Metal keeps the retiring ones alive until
+++       in-flight frames drain) — gigabytes of transient allocations = jetsam
+++       kill. Keep rendering at the old size during the drag (the compositor
+++       stretches it) and apply the new size once the bounds settle. */
+++    CGFloat longEdge = MAX(size.width, size.height);
+++    if (longEdge > 0) {
+++        CGFloat scale = SDL_VisionTargetLongEdge() / longEdge;
+++        if (scale < 1.0) {
+++            scale = 1.0;
+++        }
+++        CGSize target = CGSizeMake(size.width * scale, size.height * scale);
+++        CAMetalLayer *ml = (CAMetalLayer *)self.layer;
+++        if (CGSizeEqualToSize(ml.drawableSize, target)) {
+++            return;
+++        }
+++        if (ml.drawableSize.width < 1.0) {
+++            /* first layout: apply immediately */
+++            self.layer.contentsScale = scale;
+++            ml.drawableSize = target;
+++            return;
+++        }
+++        static int sdl_vision_resize_gen = 0;
+++        int g = ++sdl_vision_resize_gen;
+++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)),
+++                       dispatch_get_main_queue(), ^{
+++            if (g != sdl_vision_resize_gen) {
+++                return; /* superseded — still dragging */
+++            }
+++            CGSize s2 = self.bounds.size;
+++            CGFloat le2 = MAX(s2.width, s2.height);
+++            if (le2 <= 0) {
+++                return;
+++            }
+++            CGFloat sc2 = SDL_VisionTargetLongEdge() / le2;
+++            if (sc2 < 1.0) {
+++                sc2 = 1.0;
+++            }
+++            self.layer.contentsScale = sc2;
+++            ((CAMetalLayer *)self.layer).drawableSize = CGSizeMake(s2.width * sc2, s2.height * sc2);
+++        });
+++        return;
+++    }
+++#endif
++     size.width *= self.layer.contentsScale;
++     size.height *= self.layer.contentsScale;
++     ((CAMetalLayer *)self.layer).drawableSize = size;
++@@ -86,7 +147,14 @@ SDL_MetalView UIKit_Metal_CreateView(_THIS, SDL_Window * window)
++          * dimensions of the screen rather than the dimensions in points
++          * yielding high resolution on retine displays.
++          */
+++#if TARGET_OS_VISION
+++        scale = data.uiwindow.traitCollection.displayScale;
+++        if (scale < 1.0) {
+++            scale = 2.0;
+++        }
+++#else
++         scale = data.uiwindow.screen.nativeScale;
+++#endif
++     }
++ 
++     metalview = [[SDL_uikitmetalview alloc] initWithFrame:data.uiwindow.bounds
++diff --git a/src/video/uikit/SDL_uikitmodes.h b/src/video/uikit/SDL_uikitmodes.h
++index e5b103a38..21125f868 100644
++--- a/src/video/uikit/SDL_uikitmodes.h
+++++ b/src/video/uikit/SDL_uikitmodes.h
++@@ -25,6 +25,20 @@
++ 
++ #include "SDL_uikitvideo.h"
++ 
+++#if TARGET_OS_VISION
+++/* visionOS has no UIScreen: one virtual display is synthesized in
+++   SDL_uikitmodes.m and the screen-watch/orientation machinery is compiled
+++   out. */
+++@interface SDL_DisplayData : NSObject
+++
+++@property (nonatomic) float screenDPI;
+++
+++@end
+++
+++@interface SDL_DisplayModeData : NSObject
+++
+++@end
+++#else
++ @interface SDL_DisplayData : NSObject
++ 
++ - (instancetype)initWithScreen:(UIScreen*)screen;
++@@ -42,9 +56,11 @@
++ 
++ extern SDL_bool UIKit_IsDisplayLandscape(UIScreen *uiscreen);
++ 
++-extern int UIKit_InitModes(_THIS);
++ extern int UIKit_AddDisplay(UIScreen *uiscreen, SDL_bool send_event);
++ extern void UIKit_DelDisplay(UIScreen *uiscreen);
+++#endif /* TARGET_OS_VISION */
+++
+++extern int UIKit_InitModes(_THIS);
++ extern void UIKit_GetDisplayModes(_THIS, SDL_VideoDisplay * display);
++ extern int UIKit_GetDisplayDPI(_THIS, SDL_VideoDisplay * display, float * ddpi, float * hdpi, float * vdpi);
++ extern int UIKit_SetDisplayMode(_THIS, SDL_VideoDisplay * display, SDL_DisplayMode * mode);
++diff --git a/src/video/uikit/SDL_uikitmodes.m b/src/video/uikit/SDL_uikitmodes.m
++index 97c59c250..fa3b6dfce 100644
++--- a/src/video/uikit/SDL_uikitmodes.m
+++++ b/src/video/uikit/SDL_uikitmodes.m
++@@ -29,6 +29,105 @@
++ 
++ #import <sys/utsname.h>
++ 
+++#if TARGET_OS_VISION
+++
+++/* visionOS: no UIScreen. Synthesize one virtual display; the window scene
+++   provides the real size at window creation. */
+++
+++@implementation SDL_DisplayData
+++
+++@synthesize screenDPI;
+++
+++@end
+++
+++@implementation SDL_DisplayModeData
+++
+++@end
+++
+++int UIKit_InitModes(_THIS)
+++{
+++    @autoreleasepool {
+++        SDL_VideoDisplay display;
+++        SDL_DisplayMode mode;
+++        SDL_DisplayData *data;
+++
+++        SDL_zero(mode);
+++        mode.format = SDL_PIXELFORMAT_ABGR8888;
+++        mode.w = 1920;
+++        mode.h = 1080;
+++        mode.refresh_rate = 120; /* M5 Vision Pro panel max; in-game MaxFps governs */
+++
+++        SDL_zero(display);
+++        display.desktop_mode = mode;
+++        display.current_mode = mode;
+++        display.name = "visionOS";
+++
+++        data = [[SDL_DisplayData alloc] init];
+++        if (!data) {
+++            return SDL_OutOfMemory();
+++        }
+++        data.screenDPI = 96.0f;
+++
+++        display.driverdata = (void *) CFBridgingRetain(data);
+++        SDL_AddVideoDisplay(&display, SDL_FALSE);
+++    }
+++    return 0;
+++}
+++
+++void UIKit_GetDisplayModes(_THIS, SDL_VideoDisplay * display)
+++{
+++    SDL_DisplayMode mode = display->desktop_mode;
+++    mode.driverdata = NULL;
+++    SDL_AddDisplayMode(display, &mode);
+++}
+++
+++int UIKit_GetDisplayDPI(_THIS, SDL_VideoDisplay * display, float * ddpi, float * hdpi, float * vdpi)
+++{
+++    @autoreleasepool {
+++        SDL_DisplayData *data = (__bridge SDL_DisplayData *) display->driverdata;
+++        float dpi = data.screenDPI;
+++
+++        if (ddpi) {
+++            *ddpi = dpi * (float)SDL_sqrt(2.0);
+++        }
+++        if (hdpi) {
+++            *hdpi = dpi;
+++        }
+++        if (vdpi) {
+++            *vdpi = dpi;
+++        }
+++    }
+++    return 0;
+++}
+++
+++int UIKit_SetDisplayMode(_THIS, SDL_VideoDisplay * display, SDL_DisplayMode * mode)
+++{
+++    return 0;
+++}
+++
+++int UIKit_GetDisplayUsableBounds(_THIS, SDL_VideoDisplay * display, SDL_Rect * rect)
+++{
+++    int displayIndex = (int) (display - _this->displays);
+++    return SDL_GetDisplayBounds(displayIndex, rect);
+++}
+++
+++void UIKit_QuitModes(_THIS)
+++{
+++    int i;
+++
+++    @autoreleasepool {
+++        for (i = 0; i < _this->num_displays; i++) {
+++            SDL_VideoDisplay *display = &_this->displays[i];
+++            if (display->driverdata != NULL) {
+++                CFRelease(display->driverdata);
+++                display->driverdata = NULL;
+++            }
+++        }
+++    }
+++}
+++
+++#else /* !TARGET_OS_VISION */
+++
++ @implementation SDL_DisplayData
++ 
++ - (instancetype)initWithScreen:(UIScreen*)screen
++@@ -573,6 +672,8 @@ void SDL_OnApplicationDidChangeStatusBarOrientation(void)
++ }
++ #endif /* !TARGET_OS_TV */
++ 
+++#endif /* TARGET_OS_VISION */
+++
++ #endif /* SDL_VIDEO_DRIVER_UIKIT */
++ 
++ /* vi: set ts=4 sw=4 expandtab: */
++diff --git a/src/video/uikit/SDL_uikitvideo.h b/src/video/uikit/SDL_uikitvideo.h
++index 4d3b81a93..783f56434 100644
++--- a/src/video/uikit/SDL_uikitvideo.h
+++++ b/src/video/uikit/SDL_uikitvideo.h
++@@ -23,6 +23,11 @@
++ 
++ #include "../SDL_sysvideo.h"
++ 
+++#include <TargetConditionals.h>
+++#ifndef TARGET_OS_VISION
+++#define TARGET_OS_VISION 0
+++#endif
+++
++ #ifdef __OBJC__
++ 
++ #include <UIKit/UIKit.h>
++@@ -33,7 +38,11 @@
++ 
++ @end
++ 
+++#if TARGET_OS_VISION
+++CGRect UIKit_ComputeViewFrame(SDL_Window *window);
+++#else
++ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen);
+++#endif
++ 
++ #endif /* __OBJC__ */
++ 
++diff --git a/src/video/uikit/SDL_uikitvideo.m b/src/video/uikit/SDL_uikitvideo.m
++index f7aa3fd12..485bb2cd4 100644
++--- a/src/video/uikit/SDL_uikitvideo.m
+++++ b/src/video/uikit/SDL_uikitvideo.m
++@@ -194,6 +194,19 @@ SDL_bool UIKit_IsSystemVersionAtLeast(double version)
++     return [[UIDevice currentDevice].systemVersion doubleValue] >= version;
++ }
++ 
+++#if TARGET_OS_VISION
+++CGRect UIKit_ComputeViewFrame(SDL_Window *window)
+++{
+++    SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
+++    CGRect frame = CGRectMake(0, 0, window->w, window->h);
+++
+++    if (data != nil && data.uiwindow != nil) {
+++        frame = data.uiwindow.bounds;
+++    }
+++
+++    return frame;
+++}
+++#else
++ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
++ {
++     SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
++@@ -236,6 +249,7 @@ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
++ 
++     return frame;
++ }
+++#endif /* TARGET_OS_VISION */
++ 
++ void UIKit_ForceUpdateHomeIndicator(void)
++ {
++diff --git a/src/video/uikit/SDL_uikitviewcontroller.m b/src/video/uikit/SDL_uikitviewcontroller.m
++index dee4b1972..ff712aae8 100644
++--- a/src/video/uikit/SDL_uikitviewcontroller.m
+++++ b/src/video/uikit/SDL_uikitviewcontroller.m
++@@ -181,7 +181,14 @@ - (void)startAnimation
++ 
++     displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(doLoop:)];
++ 
++-#ifdef __IPHONE_10_3
+++#if TARGET_OS_VISION
+++    data = (__bridge SDL_WindowData *) window->driverdata;
+++    (void)data;
+++    /* No UIScreen on visionOS. M2-gen panels run 90 Hz, the M5 model up to
+++       120 — request the adaptive range and let the system clamp. */
+++    displayLink.preferredFrameRateRange = CAFrameRateRangeMake(80.0f, 120.0f, 120.0f / animationInterval);
+++    if (0)
+++#elif defined(__IPHONE_10_3)
++     data = (__bridge SDL_WindowData *) window->driverdata;
++ 
++     if ([displayLink respondsToSelector:@selector(preferredFramesPerSecond)]
++@@ -531,7 +538,11 @@ - (void)updateKeyboard
++ 
++     CGAffineTransform t = self.view.transform;
++     CGPoint offset = CGPointMake(0.0, 0.0);
+++#if TARGET_OS_VISION
+++    CGRect frame = UIKit_ComputeViewFrame(window);
+++#else
++     CGRect frame = UIKit_ComputeViewFrame(window, data.uiwindow.screen);
+++#endif
++ 
++     if (self.keyboardHeight) {
++         int rectbottom = self.textInputRect.y + self.textInputRect.h;
++diff --git a/src/video/uikit/SDL_uikitwindow.m b/src/video/uikit/SDL_uikitwindow.m
++index 0e0ea0577..7f9953dae 100644
++--- a/src/video/uikit/SDL_uikitwindow.m
+++++ b/src/video/uikit/SDL_uikitwindow.m
++@@ -75,9 +75,24 @@ - (void)layoutSubviews
++      * only happen on iOS 8, or it might have been fixed another way with other
++      * code... This code prevents split view (iOS 9+) from working on iPads, so
++      * we want to avoid using it if possible. */
+++#if TARGET_OS_VISION
+++    /* visionOS: the scene owns the window geometry (user-resizable). The
+++     * window was created with a fixed virtual-display frame; keep it glued to
+++     * the scene's actual bounds or the content renders cropped/offset. The
+++     * root view autoresizes, SDL's viewDidLayoutSubviews then reports the
+++     * resize, and the metal view re-derives its 3840-long-edge drawable. */
+++    UIWindowScene *scene = self.windowScene;
+++    if (scene != nil) {
+++        CGRect b = scene.coordinateSpace.bounds;
+++        if (b.size.width > 0 && b.size.height > 0 && !CGRectEqualToRect(self.frame, b)) {
+++            self.frame = b;
+++        }
+++    }
+++#else
++     if (!UIKit_IsSystemVersionAtLeast(9.0)) {
++         self.frame = self.screen.bounds;
++     }
+++#endif
++     [super layoutSubviews];
++ }
++ 
++@@ -90,7 +105,11 @@ static int SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bo
++     SDL_DisplayData *displaydata = (__bridge SDL_DisplayData *) display->driverdata;
++     SDL_uikitview *view;
++ 
+++#if TARGET_OS_VISION
+++    CGRect frame = UIKit_ComputeViewFrame(window);
+++#else
++     CGRect frame = UIKit_ComputeViewFrame(window, displaydata.uiscreen);
+++#endif
++     int width  = (int) frame.size.width;
++     int height = (int) frame.size.height;
++ 
++@@ -106,13 +125,15 @@ static int SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bo
++     /* only one window on iOS, always shown */
++     window->flags &= ~SDL_WINDOW_HIDDEN;
++ 
+++#if !TARGET_OS_VISION
++     if (displaydata.uiscreen != [UIScreen mainScreen]) {
++         window->flags &= ~SDL_WINDOW_RESIZABLE;  /* window is NEVER resizable */
++         window->flags &= ~SDL_WINDOW_INPUT_FOCUS;  /* never has input focus */
++         window->flags |= SDL_WINDOW_BORDERLESS;  /* never has a status bar. */
++     }
+++#endif
++ 
++-#if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++     if (displaydata.uiscreen == [UIScreen mainScreen]) {
++         NSUInteger orients = UIKit_GetSupportedOrientations(window);
++         BOOL supportsLandscape = (orients & UIInterfaceOrientationMaskLandscape) != 0;
++@@ -156,7 +177,7 @@ int UIKit_CreateWindow(_THIS, SDL_Window *window)
++         SDL_DisplayData *data = (__bridge SDL_DisplayData *) display->driverdata;
++         SDL_Window *other;
++         UIWindow *uiwindow;
++-#if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++         const CGSize origsize = data.uiscreen.currentMode.size;
++ #endif
++ 
++@@ -170,7 +191,7 @@ int UIKit_CreateWindow(_THIS, SDL_Window *window)
++         /* If monitor has a resolution of 0x0 (hasn't been explicitly set by the
++          * user, so it's in standby), try to force the display to a resolution
++          * that most closely matches the desired window size. */
++-#if !TARGET_OS_TV
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
++         if ((origsize.width == 0.0f) && (origsize.height == 0.0f)) {
++             int i;
++             const SDL_DisplayMode *bestmode = NULL;
++@@ -207,12 +228,19 @@ int UIKit_CreateWindow(_THIS, SDL_Window *window)
++ 
++         /* ignore the size user requested, and make a fullscreen window */
++         /* !!! FIXME: can we have a smaller view? */
+++#if TARGET_OS_VISION
+++        /* visionOS: no UIScreen; the scene sizes the window. Use the virtual
+++           display's desktop mode as the initial frame. */
+++        uiwindow = [[SDL_uikitwindow alloc]
+++            initWithFrame:CGRectMake(0, 0, display->desktop_mode.w, display->desktop_mode.h)];
+++#else
++         uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
++ 
++         /* put the window on an external display if appropriate. */
++         if (data.uiscreen != [UIScreen mainScreen]) {
++             [uiwindow setScreen:data.uiscreen];
++         }
+++#endif
++ 
++         if (SetupWindowData(_this, window, uiwindow, SDL_TRUE) < 0) {
++             return -1;
++@@ -241,10 +269,16 @@ void UIKit_ShowWindow(_THIS, SDL_Window * window)
++         /* Make this window the current mouse focus for touch input */
++         display = SDL_GetDisplayForWindow(window);
++         displaydata = (__bridge SDL_DisplayData *) display->driverdata;
+++#if TARGET_OS_VISION
+++        (void)displaydata;
+++        SDL_SetMouseFocus(window);
+++        SDL_SetKeyboardFocus(window);
+++#else
++         if (displaydata.uiscreen == [UIScreen mainScreen]) {
++             SDL_SetMouseFocus(window);
++             SDL_SetKeyboardFocus(window);
++         }
+++#endif
++     }
++ }
++ 
++@@ -270,7 +304,9 @@ static void UIKit_UpdateWindowBorder(_THIS, SDL_Window * window)
++     SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
++     SDL_uikitviewcontroller *viewcontroller = data.viewcontroller;
++ 
++-#if !TARGET_OS_TV
+++#if TARGET_OS_VISION
+++    viewcontroller.view.frame = UIKit_ComputeViewFrame(window);
+++#elif !TARGET_OS_TV
++     if (data.uiwindow.screen == [UIScreen mainScreen]) {
++         if (window->flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS)) {
++             [UIApplication sharedApplication].statusBarHidden = YES;
++@@ -367,7 +403,14 @@ void UIKit_GetWindowSizeInPixels(_THIS, SDL_Window * window, int *w, int *h)
++     CGFloat scale = 1.0;
++ 
++     if (window->flags & SDL_WINDOW_ALLOW_HIGHDPI) {
+++#if TARGET_OS_VISION
+++        scale = windata.uiwindow.traitCollection.displayScale;
+++        if (scale < 1.0) {
+++            scale = 2.0; /* Vision Pro reports 2.0; guard against 0 */
+++        }
+++#else
++         scale = windata.uiwindow.screen.nativeScale;
+++#endif
++     }
++ 
++     /* Integer truncation of fractional values matches SDL_uikitmetalview and
+--- a/libultraship/cmake/dependencies/ios.cmake
++++ b/libultraship/cmake/dependencies/ios.cmake
+@@ -3,10 +3,16 @@
+ #=================== SDL2 ===================
+ find_package(SDL2 QUIET)
+ if (NOT ${SDL2_FOUND})
++    # SOH_IOS (overlay 0021): visionOS compatibility for the UIKit backend
++    # (TARGET_OS_VISION-guarded; inert on iOS). Applied via the same
++    # git-patch mechanism as the imgui/stormlib dependency patches.
++    set(sdl2_visionos_patch_file ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/patches/sdl2-visionos-compat.patch)
++    set(sdl2_apply_patch_command ${CMAKE_COMMAND} -Dpatch_file=${sdl2_visionos_patch_file} -Dwith_reset=TRUE -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/git-patch.cmake)
+     FetchContent_Declare(
+         SDL2
+         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+         GIT_TAG release-2.32.10
++        PATCH_COMMAND ${sdl2_apply_patch_command}
+         OVERRIDE_FIND_PACKAGE
+     )
+     FetchContent_MakeAvailable(SDL2)

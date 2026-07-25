@@ -1,0 +1,47 @@
+Overlay patch 0033: skybox stereo markers (soh z_vr_box_draw.c).
+Device finding (2026-07-17, and the sm64coopdx port's D-031 before it —
+"disorienting clouds"): OoT's skybox is drawn CENTERED ON THE CAMERA, so the
+per-eye camera shift cancels for it — the sky lands at ZERO disparity (on the
+panel plane) while the terrain recedes behind: occlusion says "farthest",
+stereo says "nearest". The fix is infinity disparity for skybox draws
+(skew-only, no eye translation), which needs the interpreter to KNOW which
+triangles are skybox. Same mechanism the sm64coopdx port proved: bracket the
+skybox display-list emission with G_NOOP sentinel tags (types 0x5A begin /
+0x5B end — types 7/8 are LUS's disp-stack tags); the interpreter's noop
+handler (0031) flips a flag, cleared defensively at every Run start. The
+extra two commands are __IOS__-gated; desktop skybox output is unchanged.
+
+--- a/soh/src/code/z_vr_box_draw.c
++++ b/soh/src/code/z_vr_box_draw.c
+@@ -19,6 +19,15 @@
+ 
+     Gfx_SetupDL_40Opa(gfxCtx);
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0033): stereo skybox BEGIN sentinel (see header). */
++    {
++        Gfx* sohTag = POLY_OPA_DISP++;
++        sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5A << 16));
++        sohTag->words.w1 = 0;
++    }
++#endif
++
+     // gsSPShaderTest(POLY_OPA_DISP++);
+ 
+     /*gSPSegment(POLY_OPA_DISP++, 0x7, skyboxCtx->staticSegments[0]);
+@@ -94,6 +103,15 @@
+     gDPPipeSync(POLY_OPA_DISP++);
+     // gsSPShaderTest2(POLY_OPA_DISP++);
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0033): stereo skybox END sentinel. */
++    {
++        Gfx* sohTag = POLY_OPA_DISP++;
++        sohTag->words.w0 = (uintptr_t)((G_NOOP << 24) | (0x5B << 16));
++        sohTag->words.w1 = 0;
++    }
++#endif
++
+     FrameInterpolation_RecordCloseChild();
+     CLOSE_DISPS(gfxCtx);
+ }

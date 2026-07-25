@@ -1,0 +1,16 @@
+Add SDL_WINDOW_ALLOW_HIGHDPI to the iOS window flags so SDL sets the
+CAMetalLayer contentsScale/drawableSize to native device pixels (without it
+the layer is 1x — blurry). Framebuffer sizing already flows from
+SDL_GetRendererOutputSize.
+
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -374,7 +374,7 @@
+     int len = snprintf(title, sizeof(title), "%s (%s)", gameName, gfxApiName);
+ 
+ #ifdef __IOS__
+-    Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN;
++    Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI;
+ #else
+     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+ #endif

@@ -1,0 +1,20 @@
+LUS Context: on iOS GetAppBundlePath returned $HOME/Documents, conflating
+the read-only bundle with the writable data dir. Return the real .app
+bundle path (AppleFolderManager is compiled for iOS). Extractor assets and
+soh.o2r ship in the bundle; oot.o2r/config/saves/mods stay in Documents.
+
+--- a/libultraship/src/ship/Context.cpp
++++ b/libultraship/src/ship/Context.cpp
+@@ -466,8 +466,10 @@
+ #endif
+ 
+ #ifdef __IOS__
+-    const char* home = getenv("HOME");
+-    return std::string(home) + "/Documents";
++    // Read-only resources (soh.o2r, extractor assets) live in the signed app
++    // bundle; the writable side (GetAppDirectoryPath) remains Documents.
++    FolderManager iosFolderManager;
++    return iosFolderManager.getMainBundlePath();
+ #endif
+ 
+ #ifdef NON_PORTABLE

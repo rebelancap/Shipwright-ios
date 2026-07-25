@@ -1,0 +1,55 @@
+Overlay patch 0016: never render while backgrounded (iOS).
+Device symptom (2026-07-10): game becomes unplayable/slow after minimize +
+reopen. Metal's nextDrawable must not run while the app is backgrounded —
+it stalls/times out (and background GPU work risks watchdog kills), and the
+drawable pool can come back degraded. Gate the acquisition on the shell's
+SohIos_IsBackgrounded() flag (set in sceneDidEnterBackground, cleared on
+foreground): the game thread parks here while backgrounded — safe, the
+process is about to be suspended anyway — and resumes exactly here with a
+fresh drawable. Also retry a null drawable briefly and skip the frame
+instead of dereferencing null. __IOS__-only; single hunk at
+SetupScreenFramebuffer, disjoint from 0010's NewFrame hunk (D6).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -700,9 +700,40 @@
+     return (int)index;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0016): shell-provided background flag (linkage specs
++// must live at file scope, not inside the function).
++extern "C" int SohIos_IsBackgrounded(void);
++extern "C" void SohIos_ParkTick(void);
++#endif
++
+ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
+     mCurrentDrawable = nullptr;
++#ifdef __IOS__
++    // Park the game thread while backgrounded — nextDrawable in the
++    // background stalls/times out (post-resume slowdown, watchdog risk).
++    // The process suspends moments later and resumes here.
++    {
++        // ParkTick services the main run loop (the game loop IS the main
++        // thread on iOS) so the lifecycle events that clear the flag can
++        // deliver — a sleeping park here deadlocks into a black screen.
++        while (SohIos_IsBackgrounded()) {
++            SohIos_ParkTick();
++        }
++        const struct timespec sohIosRetryNap = { 0, 10 * 1000 * 1000 };
++        for (int i = 0; i < 100 && mCurrentDrawable == nullptr; i++) {
++            mCurrentDrawable = mLayer->nextDrawable();
++            if (mCurrentDrawable == nullptr) {
++                nanosleep(&sohIosRetryNap, nullptr); // pool drained (just resumed?)
++            }
++        }
++        if (mCurrentDrawable == nullptr) {
++            return; // skip the frame rather than crash on ->texture()
++        }
++    }
++#else
+     mCurrentDrawable = mLayer->nextDrawable();
++#endif
+ 
+     bool msaa_enabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gMSAAValue", 1) > 1;
+ 

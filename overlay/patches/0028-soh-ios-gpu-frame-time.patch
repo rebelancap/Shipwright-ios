@@ -1,0 +1,44 @@
+Overlay patch 0028: true GPU frame time in the perf telemetry.
+The 0008 probe's eng_ms includes in-present blocking (compositor pacing),
+so it cannot distinguish "M5 GPU saturated" from "GPU idle, stalls come
+from CPU submission / streaming / pacing" — the exact question the Vision
+Pro optimization hinges on (user: 'M5 shouldn't struggle'). Sample each
+screen command buffer's GPUEndTime-GPUStartTime via addCompletedHandler
+into a global; the shell/probe export it (SohIos_GpuMs).
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -31,6 +31,14 @@
+ #include <imgui_impl_metal.h>
+ #include <spdlog/spdlog.h>
+ #include <spdlog/fmt/fmt.h>
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0028): defined in the app shell; C linkage (the shell is
++// ObjC). File scope — block-scope linkage specs don't compile in C++.
++extern "C" {
++extern volatile float gSohIosGpuMs;
++}
++#endif
+ 
+ #include "fast/backends/gfx_metal_shader.h"
+ 
+@@ -684,6 +692,18 @@
+ 
+     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0028): true GPU duration of the frame's screen pass —
++    // the perf probe's eng_ms includes present blocking and cannot separate
++    // GPU saturation from pacing waits.
++    screen_framebuffer.mCommandBuffer->addCompletedHandler(
++        MTL::HandlerFunction([](MTL::CommandBuffer* cb) {
++            double ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
++            if (ms > 0 && ms < 1000.0) {
++                gSohIosGpuMs = (float)ms;
++            }
++        }));
++#endif
+     screen_framebuffer.mCommandBuffer->commit();
+ 
+     // Now that commit has been called, retain the command buffer for GPU sync

@@ -1,0 +1,63 @@
+Overlay patch 0015 (rev2): iOS menu scale via SoH's OWN ScaleImGui.
+Root cause of "menu scale does nothing" (device feedback 2026-07-12): SoH
+has its own live scale system — OTRGlobals::ScaleImGui(), driven by
+gSettings.ImGuiScale (preset index), ratio-tracked so changes apply LIVE —
+and it overwrote the old LUS-side 0015's FontGlobalScale on boot. Fix:
+multiply gSohIos.MenuScale (default 0.85) INTO ScaleImGui's target on iOS
+and compare the combined float, so both the preset combobox and the iOS
+slider apply immediately, no restart. Also fatter slider grabs on iOS
+(fingers). Replaces the deleted LUS Gui.cpp patch.
+
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -980,14 +980,31 @@
+ 
+ void OTRGlobals::ScaleImGui() {
+     int32_t imGuiScaleIndex = CVarGetInteger(CVAR_SETTING("ImGuiScale"), defaultImGuiScale);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0015): gSohIos.MenuScale multiplies the preset for
++    // fine phone-fit control. Comparing the combined float (not the index)
++    // keeps upstream's ratio mechanism and makes BOTH knobs apply live.
++    float scale = imguiScaleOptionToValue[imGuiScaleIndex] * CVarGetFloat("gSohIos.MenuScale", 0.85f);
++    if (scale == previousImGuiScale) {
++        return;
++    }
++#else
+     if (imGuiScaleIndex == previousImGuiScaleIndex) {
+         return;
+     }
+ 
+     float scale = imguiScaleOptionToValue[imGuiScaleIndex];
++#endif
+     float newScale = scale / previousImGuiScale;
+     ImGui::GetStyle().ScaleAllSizes(newScale);
+     ImGui::GetIO().FontGlobalScale = scale;
++#ifdef __IOS__
++    // Finger-sized slider grabs regardless of scale (sliders were hard to
++    // drag on device).
++    if (ImGui::GetStyle().GrabMinSize < 22.0f) {
++        ImGui::GetStyle().GrabMinSize = 22.0f;
++    }
++#endif
+     previousImGuiScale = scale;
+     previousImGuiScaleIndex = imGuiScaleIndex;
+ }
+@@ -1002,7 +1019,18 @@
+ 
+ uint32_t OTRGlobals::GetInterpolationFPS() {
+     if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
++#ifdef __IOS__
++        // SOH_IOS (overlay 0015): battery-saver cap — gSohIos.MaxFps combo
++        // index 0 = 60 fps, 1 = 120 fps (default).
++        uint32_t sohIosCap = (uint32_t)CVarGetInteger("gSohIos.MaxFps", 120);
++        if (sohIosCap <= 1) { // legacy index values: 0=60, 1=120
++            sohIosCap = sohIosCap == 0 ? 60 : 120;
++        }
++        uint32_t sohIosRate = Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
++        return sohIosRate < sohIosCap ? sohIosRate : sohIosCap;
++#else
+         return Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
++#endif
+     } else if (CVarGetInteger(CVAR_VSYNC_ENABLED, 1) ||
+                !Ship::Context::GetRawInstance()->GetWindow()->CanDisableVerticalSync()) {
+         return std::min<uint32_t>(Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate(),

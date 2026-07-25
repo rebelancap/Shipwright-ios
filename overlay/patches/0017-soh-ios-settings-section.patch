@@ -1,0 +1,156 @@
+Overlay patch 0017: "iOS" section in SoH's Settings sidebar.
+Phase 2 requires an in-game iOS settings page via the port's own menu.
+v1 knobs: double-tap-Z lock (touchscreen) and the LIVE menu scale slider
+(gSohIos.MenuScale, applied LIVE via ScaleImGui, overlay 0015 rev2).
+Anchored after the Controls sidebar entry; __IOS__-gated so the desktop
+the desktop build is unchanged.
+
+--- a/soh/soh/SohGui/SohMenuSettings.cpp
++++ b/soh/soh/SohGui/SohMenuSettings.cpp
+@@ -446,6 +446,146 @@
+     path.sidebarName = "Controls";
+     path.column = SECTION_COLUMN_1;
+     AddSidebarEntry("Settings", "Controls", 2);
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0017): phone-specific settings, organized:
++    // Touch Controls -> Display -> Menu -> Advanced. The touch overlay
++    // itself lives in the app shell (SohIosShell.m); these CVars are its
++    // knobs (consumed live by the shell's 0.25 s poll unless noted).
++    path.sidebarName = "iOS";
++    AddSidebarEntry("Settings", "iOS", 1);
++
++    AddWidget(path, "Touch Controls", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Double-Tap Z to Lock", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.ZDoubleTap")
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("The on-screen Z is held while your finger is on it. With this on, double-tapping Z "
++                              "LOCKS it held (button lights up) until you tap it again. Physical controllers are "
++                              "unaffected.")
++                     .DefaultValue(true));
++    static std::map<int32_t, const char*> sohIosHapticsOptions = { { 0, "Off" },
++                                                                             { 1, "Light" },
++                                                                             { 2, "Strong" } };
++    AddWidget(path, "Haptic Feedback", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.Haptics")
++        .RaceDisable(false)
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosHapticsOptions)
++                     .Tooltip("Vibration when touch buttons are pressed.")
++                     .DefaultIndex(1));
++    AddWidget(path, "Touch Control Opacity", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.TouchOpacity")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions()
++                     .Tooltip("How visible the on-screen controls are during play.")
++                     .ShowButtons(true)
++                     .IsPercentage()
++                     .Min(0.3f)
++                     .Max(1.0f)
++                     .DefaultValue(1.0f));
++    AddWidget(path, "Left-Handed Layout", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.LeftyFlip")
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("Mirrors all touch controls left<->right (custom layouts mirror too).")
++                     .DefaultValue(false));
++    static std::map<int32_t, const char*> sohIosCurveOptions = { { 0, "Linear" }, { 1, "Precise (Expo)" } };
++    AddWidget(path, "Stick Response", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.StickCurve")
++        .RaceDisable(false)
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosCurveOptions)
++                     .Tooltip("Linear: deflection maps 1:1. Precise: finer control near the center, same maximum.")
++                     .DefaultIndex(0));
++    AddWidget(path, "Customize Layout...", WIDGET_BUTTON)
++        .RaceDisable(false)
++        .Callback([](WidgetInfo& info) { CVarSetInteger("gSohIos.EditLayout", 1); })
++        .Options(ButtonOptions().Tooltip(
++            "Rearrange the on-screen controls: drag any button (and the stick's spawn area), scale them with the "
++            "slider, then save with the checkmark. Reset restores the default layout."));
++
++    AddWidget(path, "Display", WIDGET_SEPARATOR_TEXT);
++    static std::map<int32_t, const char*> sohIosFpsOptions = { { 60, "60 fps" },
++                                                                          { 90, "90 fps" },
++                                                                          { 120, "120 fps" } };
++    AddWidget(path, "Max Frame Rate", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.MaxFps")
++        .RaceDisable(false)
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosFpsOptions)
++                     .Tooltip("Cap for Match Refresh Rate. iPhone panels run up to 120 Hz; Vision Pro's panel "
++                              "runs at 90 Hz (its maximum).")
++                     .DefaultIndex(120));
++#if TARGET_OS_VISION
++    static std::map<int32_t, const char*> sohIosScaleOptions = { { 2880, "75% (2880)" },
++                                                                           { 3264, "85% (3264)" },
++                                                                           { 3840, "100% (3840, 4K)" } };
++    AddWidget(path, "Render Scale", WIDGET_CVAR_COMBOBOX)
++        .CVar("gSohIos.VisionLongEdge")
++        .RaceDisable(false)
++        .Options(ComboboxOptions()
++                     .ComboMap(sohIosScaleOptions)
++                     .Tooltip("Long-edge resolution the game renders at. The window supersamples either way; "
++                              "85% is usually indistinguishable and buys the headroom for locked 90 fps.")
++                     .DefaultIndex(3840));
++#endif
++#if TARGET_OS_VISION
++    // SOH_IOS (0017 rev + D-035): no SSAA slider on visionOS — the 4K
++    // drawable already renders ~2x the panel's angular resolution of the
++    // window (the known oversampling optimum); factors above 1.0 cost GPU
++    // for no visible gain. A truth line beats a hidden or greyed control
++    // (users with both devices would ask where the slider went). ASCII ONLY
++    // in widget strings — the menu font has no em-dash/bullet (renders '?').
++    AddWidget(path, "Supersampling: automatic", WIDGET_SEPARATOR_TEXT);
++#else
++    AddWidget(path, "Supersampling (SSAA)", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.Supersample")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions()
++                     .Tooltip("Renders above native resolution and downsamples for smoother, less-grainy visuals "
++                              "(especially with HD texture packs). 1.0 = native; 2.0 = 4x the pixels. Raise "
++                              "gradually and watch the Performance HUD for drops or warmth.")
++                     .ShowButtons(true)
++                     .Min(1.0f)
++                     .Max(2.0f)
++                     .Format("%.2f")
++                     .DefaultValue(1.0f));
++#endif
++    AddWidget(path, "Performance HUD", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.PerfHud")
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("Small fps + thermal readout in the top-right corner.")
++                     .DefaultValue(false));
++
++    AddWidget(path, "Menu", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Menu Scale", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.MenuScale")
++        .RaceDisable(false)
++        .Callback([](WidgetInfo& info) { OTRGlobals::Instance->ScaleImGui(); })
++        .Options(FloatSliderOptions()
++                     .Tooltip("Size of this menu and its text. Applies immediately.")
++                     .ShowButtons(true)
++                     .IsPercentage()
++                     .Min(0.6f)
++                     .Max(1.2f)
++                     .DefaultValue(0.85f));
++
++#if SOH_REMOTE_CONSOLE
++    // Only present in dev/OTA builds — the bridge itself is compiled out of
++    // public builds (D-040), so the toggle must not linger as a dead control.
++    AddWidget(path, "Advanced", WIDGET_SEPARATOR_TEXT);
++    AddWidget(path, "Remote Console", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.RemoteConsole")
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("Opens a TCP debug console on port 8765 while the app runs, reachable from your "
++                              "local network. Leave off unless troubleshooting.")
++                     .DefaultValue(false));
++#endif
++    path.sidebarName = "Controls";
++#endif
+     AddWidget(path, "Clear Devices", WIDGET_BUTTON)
+         .Callback([](WidgetInfo& info) {
+             SohGui::mModalWindow->RegisterPopup(

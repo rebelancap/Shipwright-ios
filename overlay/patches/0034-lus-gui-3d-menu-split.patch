@@ -1,0 +1,135 @@
+Overlay patch 0034: SoH menu inside stereoscopic 3D (Gui split).
+The 3D path skips gui StartDraw/EndDraw entirely (the Metal backend's ImGui
+NewFrame acquires the SCREEN drawable — a stall while the window is hidden),
+so the enhancement menu was unreachable in 3D. Split the frame: a public
+build-once method that runs the ImGui frame WITHOUT the backend NewFrame
+(the caller primes ImGui_ImplMetal against an eye framebuffer instead) and
+skips DrawGame/viewport work (the menu composites OVER the already-rendered
+eye images); the caller renders the resulting draw data into BOTH eyes
+(ImGui explicitly supports rendering one draw list multiple times), then a
+finish method closes the ImGui frame.
+
+--- a/libultraship/include/ship/window/gui/Gui.h
++++ b/libultraship/include/ship/window/gui/Gui.h
+@@ -137,6 +137,12 @@
+      * @brief Returns true if the menu bar or the full-screen menu window is currently visible.
+      */
+     bool GetMenuOrMenubarVisible();
++    // SOH_IOS (overlay 0034): stereo 3D menu frame — build once (no
++    // backend NewFrame: the caller primed ImGui_ImplMetal with an eye
++    // framebuffer), render the draw data per eye, then finish.
++    void Soh3DBuildMenuFrame();
++    void* Soh3DGetDrawData();
++    void Soh3DFinishMenuFrame();
+ 
+     /** @brief Returns true if the mouse cursor is currently over any ImGui item. */
+     bool IsMouseOverAnyGuiItem();
+--- a/libultraship/src/ship/window/gui/Gui.cpp
++++ b/libultraship/src/ship/window/gui/Gui.cpp
+@@ -161,6 +161,10 @@
+ void Gui::ImGuiWMNewFrame() {
+ }
+ 
++// SOH_IOS (overlay 0034): 3D mode flag (shell) — gates the Main Game
++// re-dock self-heal below to 2D frames.
++extern "C" volatile int gSoh3DMode;
++
+ void Gui::DrawMenu() {
+     const std::shared_ptr<Window> wnd = Context::GetRawInstance()->GetWindow();
+     const std::shared_ptr<Config> conf = Context::GetRawInstance()->GetConfig();
+@@ -199,6 +203,17 @@
+     }
+ 
+     ImGui::DockSpace(dockId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None | ImGuiDockNodeFlags_NoDockingInCentralNode);
++    // SOH_IOS (overlay 0034): self-heal — if Main Game ever ends up
++    // FLOATING (the round-14 3D overlay host bug undocked it at the 3D
++    // canvas size, and imgui.ini can persist that layout), the engine
++    // renders the floating size into the smaller drawable = top-left
++    // crop. Re-dock it. 2D only: 3D frames must never touch Main Game.
++    if (gSoh3DMode == 0) {
++        ImGuiWindow* sohMg = ImGui::FindWindowByName("Main Game");
++        if (sohMg != NULL && sohMg->DockId == 0) {
++            ImGui::DockBuilderDockWindow("Main Game", dockId);
++        }
++    }
+ 
+     if (ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+         (ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false) &&
+@@ -254,10 +269,77 @@
+             } else {
+                 window->Flags &= ~(flags);
+             }
++        }
++    }
++}
++
++// SOH_IOS (overlay 0034): the 2D perf HUD is a UIKit label on the parked
++// window — invisible on the panel. The shell composes the same text here
++// and the 3D frame draws it into the eye images (predecessor pattern:
++// HUD text rides in the rendered frame). Returns -1 when the HUD is off,
++// else the thermal state for color.
++extern "C" int SohIos_PerfHud3DText(char* buf, int cap);
++
++// SOH_IOS (overlay 0034): see Gui.h. DrawGame/CalculateGameViewport are
++// intentionally absent — the menu composites over the rendered eyes.
++void Gui::Soh3DBuildMenuFrame() {
++    HandleMouseCapture();
++    ImGuiWMNewFrame();
++    // The SDL backend just set DisplaySize from the PARKED 480x320 card —
++    // menu layout against that canvas renders 8x too large on the panel
++    // (device round 12 verdict: huge). Lay out against a 2D-window-like
++    // logical canvas at the eye aspect instead; the render step's
++    // FramebufferScale recompute maps it onto the eye texture (2.0x).
++    ImGui::GetIO().DisplaySize = ImVec2(1920.0f, 1080.0f);
++    ImGui::NewFrame();
++    // The main dockspace window normally hosts the game image (DrawGame,
++    // skipped here) — left opaque it curtains the rendered eyes. Every
++    // backdrop goes transparent so only menu chrome composites.
++    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
++    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
++    ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0, 0, 0, 0));
++    DrawMenu();
++    ImGui::PopStyleColor(3);
++    // Notification overlay: Draw() begins its own full-viewport
++    // GameOverlay window. NEVER wrap it in a Begin(Main Game) here —
++    // SetNextWindowPos/Size on the REAL Main Game window undocks it and
++    // leaves it floating at the 3D canvas size; back in 2D the engine
++    // then renders 1920x1080 into the smaller drawable = the round-14
++    // top-left crop (mCurDimensions comes from that window's size in
++    // CalculateGameViewport).
++    GetGameOverlay()->Draw();
++    // Perf HUD in 3D: same text as the 2D label, top-right, every frame
++    // the HUD CVar is on (independent of menu visibility). Foreground
++    // draw list is part of the draw data, so it reaches both eyes.
++    {
++        char sohHudBuf[64];
++        int sohHudTh = SohIos_PerfHud3DText(sohHudBuf, (int)sizeof(sohHudBuf));
++        if (sohHudTh >= 0 && sohHudBuf[0] != 0) {
++            ImDrawList* sohFg = ImGui::GetForegroundDrawList();
++            ImFont* sohFont = ImGui::GetFont();
++            const float sohHudSize = 30.0f;
++            ImVec2 sohTs = sohFont->CalcTextSizeA(sohHudSize, FLT_MAX, 0.0f, sohHudBuf);
++            ImVec2 sohPos = ImVec2(ImGui::GetIO().DisplaySize.x - sohTs.x - 34.0f, 18.0f);
++            ImU32 sohCol = (sohHudTh >= 2)  ? IM_COL32(255, 102, 77, 242)
++                           : (sohHudTh == 1) ? IM_COL32(255, 204, 102, 230)
++                                             : IM_COL32(255, 255, 255, 217);
++            sohFg->AddText(sohFont, sohHudSize, ImVec2(sohPos.x + 2, sohPos.y + 2),
++                           IM_COL32(0, 0, 0, 200), sohHudBuf);
++            sohFg->AddText(sohFont, sohHudSize, sohPos, sohCol, sohHudBuf);
+         }
+     }
++    ImGui::Render();
+ }
+ 
++void* Gui::Soh3DGetDrawData() {
++    return (void*)ImGui::GetDrawData();
++}
++
++void Gui::Soh3DFinishMenuFrame() {
++    ImGui::EndFrame();
++    CheckSaveCvars();
++}
++
+ void Gui::StartFrame() {
+     HandleMouseCapture();
+     ImGuiBackendNewFrame();

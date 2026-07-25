@@ -1,0 +1,20 @@
+Overlay patch 0023: visionOS is Metal-only — no ENABLE_OPENGL.
+visionOS has neither desktop GL (glew) nor GLES frameworks, so LUS's
+OpenGL comparator backend cannot compile there. Upstream already guards
+the whole backend (gfx_opengl.cpp body and the Fast3dWindow
+instantiation) behind ENABLE_OPENGL — this patch just stops defining it
+when SOH_VISIONOS is set. The iOS build (which uses the GLES flavor as
+a debugging comparator) is unchanged.
+
+--- a/libultraship/src/CMakeLists.txt
++++ b/libultraship/src/CMakeLists.txt
+@@ -203,7 +203,8 @@
+     endif()
+ else()
+     target_compile_definitions(libultraship PRIVATE
+-        ENABLE_OPENGL
++        # SOH_IOS (overlay 0023): no GL of any kind on visionOS — Metal only.
++        $<$<NOT:$<BOOL:${SOH_VISIONOS}>>:ENABLE_OPENGL>
+         $<$<CONFIG:Debug>:_DEBUG>
+         $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
