@@ -1,0 +1,45 @@
+name: Refresh SideStore sources
+
+# A release here should reach the SideStore sources straight away instead of waiting
+# for their hourly cron. The per-project sources (where one exists) already rebuild
+# themselves on release; rebelancap/all-ports cannot see this repo's events, so it has
+# to be poked over repository_dispatch.
+#
+# "edited" is included on purpose: the release body becomes the version's changelog in
+# SideStore, so fixing a typo in the notes should republish them too.
+#
+# Needs a repo secret ALL_PORTS_DISPATCH — a fine-grained PAT with
+# Contents: read & write on rebelancap/all-ports. Without it this job warns and
+# succeeds, so it is safe to sit here unconfigured.
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: refresh-sidestore-sources
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poke rebelancap/all-ports
+        env:
+          TOKEN: ${{ secrets.ALL_PORTS_DISPATCH }}
+        run: |
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::ALL_PORTS_DISPATCH is not set — the aggregate source will"
+            echo "::warning::pick this release up on its hourly cron instead (max 1h lag)."
+            echo "To wire it up: create a fine-grained PAT with Contents: read & write on"
+            echo "rebelancap/all-ports, then: gh secret set ALL_PORTS_DISPATCH --repo <this repo>"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            https://api.github.com/repos/rebelancap/all-ports/dispatches \
+            -d '{"event_type":"app-released"}'
+          echo "dispatched app-released -> rebelancap/all-ports"
