@@ -1,6 +1,4 @@
 #!/bin/bash
-# Build the macOS oracle: native SoH from the pristine vendor tree, Release.
-# One command: scripts/build-oracle.sh [--clean]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

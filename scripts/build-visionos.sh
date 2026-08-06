@@ -1,8 +1,4 @@
 #!/bin/bash
-# One command: pristine vendor -> overlay -> visionOS DEVICE app build (signed).
-# Produces build-visionos/soh/Release-xros/soh.app
-# Phase 1 of the Vision Pro port (VISION-PRO-GUIDE.md). The iOS build
-# (build-ios.sh / build-ios/) is untouched.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,15 +12,8 @@ TEAM="${SOH_IOS_TEAM:?set your Apple Developer team id (see README)}"
 [[ -f "$PREFIX/lib/libopusfile.a" ]] || SOH_IOS_SDK=visionos "$ROOT/scripts/build-audio-deps-ios.sh"
 [[ -f "$SOH_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
-# TARGETED_DEVICE_FAMILY=7 (Vision Pro); STRIP_INSTALLED_PRODUCT=NO — archive-
-# time stripping removes dlsym'd symbols and kills OTA builds that work over
-# cable (VISION-PRO-GUIDE 1.4 #1). Cache-level Xcode attributes override the
-# per-target 0004 values.
-# Port versioning (D-039) + remote console gate (D-040).
 SOH_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 SOH_BUILD="$(date -u +%Y%m%d%H%M)"
-# Remote console: ON by default (OTA test builds are the common case);
-# turned OFF for the rare GitHub release via SOH_REMOTE_CONSOLE=OFF.
 CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 echo "=== soh visionOS $SOH_VERSION (build $SOH_BUILD), remote console: $CONSOLE ==="
 

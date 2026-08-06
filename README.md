@@ -132,7 +132,7 @@ Requires macOS with Xcode and `cmake` (`brew install cmake`).
 
 ```sh
 scripts/bootstrap.sh          # clone + pin upstream Shipwright (submodules recursive)
-scripts/build-oracle.sh       # native macOS build — generates the soh.o2r asset archive
+scripts/build-oracle.sh       # native macOS build — generates the asset archive
 scripts/extract-oot-o2r.sh    # build oot.o2r from your ROM (for the simulator)
 
 scripts/build-sim.sh          # iOS Simulator build
@@ -143,8 +143,8 @@ scripts/build-visionos.sh     # signed Apple Vision Pro build
 ```
 
 Upstream Shipwright is vendored **unmodified and pinned by commit**; every local change is
-a reviewable patch in `overlay/patches/`, applied by `scripts/apply-overlay.sh` (a patch
-that fails to apply fails the build). The iOS/visionOS app shell lives in `app/ios/`.
+a reviewable patch in `overlay/patches/`, applied by `scripts/apply-overlay.sh` (a patch that fails to apply fails the build). The iOS/visionOS app shell lives in `app/ios/`.
+
 
 ## Credits & license
 
@@ -158,6 +158,6 @@ that fails to apply fails the build). The iOS/visionOS app shell lives in `app/i
 - THE LEGEND OF ZELDA: OCARINA OF TIME © **Nintendo**. This project is not affiliated
   with or endorsed by Nintendo, and ships no Nintendo content.
 
-This port's own code — the app shell (`app/ios/`) and the overlay patches — is released
-under the **MIT License** (see [`LICENSE`](LICENSE)). It builds on upstream components under
-their own terms: libultraship and ZAPDTR (MIT), OTRExporter (© Harbour Masters).
+<!-- TODO: pick a license for this repo's own code (the app shell + overlay patches).
+     Upstream Shipwright has no root LICENSE file; its components are MIT (libultraship,
+     ZAPDTR) and a Harbour Masters copyright (OTRExporter). -->

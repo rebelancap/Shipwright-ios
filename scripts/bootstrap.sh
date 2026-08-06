@@ -1,5 +1,4 @@
 #!/bin/bash
-# Clean checkout → buildable vendor tree. Idempotent. The upstream pin lives HERE.
 set -euo pipefail
 
 PIN="417256b42c722a2a8dcb9627c3762f0072c78310" # develop, 9.2.3-245, 2026-07-10

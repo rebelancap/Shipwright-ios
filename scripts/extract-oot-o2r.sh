@@ -1,17 +1,10 @@
 #!/bin/bash
-# Generate oot.o2r from the user's ROM with the standalone ZAPD binary,
-# replicating soh's in-app Extractor::CallZapd argv exactly
-# (soh/soh/Extractor/Extract.cpp:641-702). Our ROM is PAL GC Debug (non-MQ)
-# → version GC_NMQ_D → oot.o2r. Usage: extract-oot-o2r.sh [rom] [outdir]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROM="${1:-$ROOT/work/gamedata/oot-usa.z64}"
 OUTDIR="${2:-$ROOT/oracle/shiphome}"
 ZAPD="$ROOT/oracle/build-cmake/ZAPD/ZAPD.out"
-# The merged extractor layout (Config_*.xml + filelists + xml/) is assembled by
-# the build next to the soh binary (soh/CMakeLists.txt:611-612) — same layout
-# the shipped app carries at GetAppBundlePath()/assets.
 ASSETS="$ROOT/oracle/build-cmake/soh/assets"
 VERSION="GC_NMQ_D"
 PORTVER="9.2.3"

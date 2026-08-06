@@ -1,14 +1,7 @@
 #!/bin/bash
-# Build static ogg/vorbis/opus/opusfile for iOS (device, arm64) into
-# work/ios-deps/prefix. Predecessor pattern: deps built once, referenced as
-# imported targets by the soh iOS CMake branch (overlay 0004).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# SOH_IOS_SDK=device (default) → iphoneos arm64, prefix work/ios-deps/prefix.
-# SOH_IOS_SDK=simulator        → iphonesimulator arm64, prefix work/ios-sim-deps/prefix.
-# SOH_IOS_SDK=visionsim        → xrsimulator arm64, prefix work/vision-sim-deps/prefix.
-# SOH_IOS_SDK=visionos         → xros arm64, prefix work/vision-deps/prefix.
 SDK="${SOH_IOS_SDK:-device}"
 SYSNAME=iOS
 DEPTGT=15.0
@@ -59,10 +52,6 @@ fetch ogg      https://github.com/xiph/ogg.git      v1.3.6
 fetch vorbis   https://github.com/xiph/vorbis.git   v1.3.7
 fetch opus     https://github.com/xiph/opus.git     v1.5.2
 fetch libpng   https://github.com/pnggroup/libpng.git v1.6.50
-# opusfile: CMake support postdates the last release (v0.12, 2020) — use
-# master and record the resolved commit here after the first successful build.
-# Resolved 2026-07-10: 3ecc22aa0a4430f61c2403d57370a089536d197a. Needs full
-# clone + tags (CMake derives its version from git describe).
 fetch opusfile https://github.com/xiph/opusfile.git master
 if git -C "$SRC/opusfile" rev-parse --is-shallow-repository | grep -q true; then
     git -C "$SRC/opusfile" fetch -q --unshallow --tags
@@ -78,10 +67,6 @@ build opusfile -DOP_DISABLE_HTTP=ON -DOP_DISABLE_DOCS=ON -DOP_DISABLE_EXAMPLES=O
                "-DOPUS_INCLUDE_DIR=$PREFIX/include/opus" "-DOPUS_LIBRARY=$PREFIX/lib/libopus.a"
 
 echo "=== verify ($SDK) ==="
-# Assert the exact platform so a device slice can never sneak into a sim build
-# (or vice-versa) — that mismatch only surfaces as a confusing app-link error.
-# otool may print the platform as a name (IOS/IOSSIMULATOR) or its numeric
-# code (2=IOS, 7=IOSSIMULATOR) depending on toolchain version — accept both.
 case "$SDK" in
     simulator) WANT="IOSSIMULATOR|7" ;;
     visionos)  WANT="XROS|11" ;;

@@ -1,7 +1,4 @@
 #!/bin/bash
-# Build SoH for the iOS SIMULATOR (arm64). Mirrors build-ios.sh but targets
-# iphonesimulator and the simulator-slice deps. Produces
-# spikes/soh-sim-build/soh/Release-iphonesimulator/soh.app
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,17 +11,13 @@ SOH_O2R="$ROOT/oracle/build-cmake/soh/soh.o2r"
 [[ -f "$PREFIX/lib/libopusfile.a" ]] || SOH_IOS_SDK=simulator "$ROOT/scripts/build-audio-deps-ios.sh"
 [[ -f "$SOH_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
-# Simulator apps don't need real signing; disable it so no dev team is required.
-# PLATFORM=SIMULATORARM64 makes LUS's ios-toolchain-populate (overlay 0009)
-# select the simulator sysroot instead of forcing device.
-# Port versioning (D-039) + remote console gate (D-040).
 SOH_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 SOH_BUILD="$(date -u +%Y%m%d%H%M)"
-# Simulator = the dev loop, so the console is ON unless told otherwise.
 CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 echo "=== soh sim $SOH_VERSION (build $SOH_BUILD), remote console: $CONSOLE ==="
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Shipwright" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     "-DSOH_IOS_VERSION=$SOH_VERSION" "-DSOH_IOS_BUILD=$SOH_BUILD" \
     "-DSOH_REMOTE_CONSOLE=$CONSOLE" \
     -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=SIMULATORARM64 \

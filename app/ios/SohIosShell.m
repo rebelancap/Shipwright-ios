@@ -334,6 +334,121 @@ static void SohIos_InstallCrashHandler(void) {
     }
 }
 
+#pragma mark - Input trace (Documents/input-trace.txt)
+
+// A user on iPadOS 26.5 reported that a controller's B button opened and
+// closed the SoH menu on every press, on top of acting as the in-game B —
+// and that unbinding EVERY controller button in SoH did not stop it. It
+// could not: the toggle arrives as a keyboard Escape, not as a controller
+// button, so it never passes through SoH's binding system at all. iPadOS
+// forges UIKit "cancel" input from a game controller and SDL's UIKit
+// backend converted it into SDL_SCANCODE_ESCAPE.
+//
+// Remote users have no console bridge, so the evidence has to travel by
+// itself: Documents/input-trace.txt is reachable from the Files app
+// (UIFileSharingEnabled) and can simply be sent back.
+//
+// It is written LAZILY. On a healthy device nothing is ever forged, so
+// creating the file at every launch would put a mystery file in every
+// user's Files folder for nothing. Instead lines accumulate in a small
+// in-memory ring, and the file only materializes the first time a forged
+// key is actually dropped — at which point the buffered environment
+// (device, iOS version, keyboard, pads) is flushed ahead of it, so the
+// evidence arrives with its context. The file existing at all is itself
+// the signal that something is still forging input.
+#define SOHIOS_TRACE_MAX_LINES 300
+#define SOHIOS_TRACE_RING 60
+static void SohIos_Trace(NSString* fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void SohIos_TraceArm(void); // first drop: start writing, flush the ring
+static volatile int32_t sSohIosTraceLines; // read unlocked: a race just costs a line
+static volatile int32_t sSohIosTraceArmed;
+
+static dispatch_queue_t SohIos_TraceQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("soh.ios.trace", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+
+// Queue-confined state — only ever touched inside SohIos_TraceQueue().
+static NSMutableArray<NSString*>* sSohIosTraceRing;
+static int sSohIosTraceWritten;
+
+static void SohIos_TraceWriteLocked(NSString* line) {
+    static NSString* path;
+    if (path == nil) {
+        path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+            stringByAppendingPathComponent:@"input-trace.txt"];
+        [NSFileManager.defaultManager createFileAtPath:path contents:nil attributes:nil];
+    }
+    NSFileHandle* fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+
+static void SohIos_Trace(NSString* fmt, ...) {
+    // Hard stop once full — a forged key can arrive on EVERY button press, so
+    // this must cost nothing at all after the cap, not just skip the write.
+    if (sSohIosTraceLines >= SOHIOS_TRACE_MAX_LINES) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    NSString* msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[SohIosInput] %@", msg);
+    double t = CACurrentMediaTime();
+    dispatch_async(SohIos_TraceQueue(), ^{
+        NSString* line = [NSString stringWithFormat:@"%8.2f  %@\n", t, msg];
+        if (!sSohIosTraceArmed) {
+            if (sSohIosTraceRing == nil) {
+                sSohIosTraceRing = [NSMutableArray array];
+            }
+            [sSohIosTraceRing addObject:line];
+            if (sSohIosTraceRing.count > SOHIOS_TRACE_RING) {
+                [sSohIosTraceRing removeObjectAtIndex:0];
+            }
+            return;
+        }
+        if (sSohIosTraceWritten >= SOHIOS_TRACE_MAX_LINES) {
+            return;
+        }
+        sSohIosTraceLines = ++sSohIosTraceWritten;
+        SohIos_TraceWriteLocked(sSohIosTraceWritten == SOHIOS_TRACE_MAX_LINES
+                                    ? [line stringByAppendingString:@"[trace full]\n"]
+                                    : line);
+    });
+}
+
+// Called the first time a forged key is dropped. Everything buffered so far
+// becomes the header of the file, then tracing goes live.
+static void SohIos_TraceArm(void) {
+    if (sSohIosTraceArmed) {
+        return;
+    }
+    dispatch_async(SohIos_TraceQueue(), ^{
+        if (sSohIosTraceArmed) {
+            return;
+        }
+        sSohIosTraceArmed = 1;
+        SohIos_TraceWriteLocked(@"# input-trace: forged input was detected on this device.\n"
+                                @"# Lines above the marker are the buffered lead-up.\n");
+        for (NSString* buffered in sSohIosTraceRing) {
+            SohIos_TraceWriteLocked(buffered);
+            sSohIosTraceWritten++;
+        }
+        sSohIosTraceRing = nil;
+        SohIos_TraceWriteLocked(@"# --- live from here ---\n");
+        sSohIosTraceLines = sSohIosTraceWritten;
+    });
+}
+
+// Stamped into SDL_Keysym's otherwise-unused field so the event filter can
+// tell the shell's own menu keystrokes (≡ button, restore dot, soh://menu,
+// the bridge) apart from anything the system forged.
+#define SOHIOS_KEY_MAGIC 0x5348494Fu // 'SHIO'
+
 #pragma mark - Virtual game controller (input backend)
 
 // An SDL virtual game controller: LUS's SDL controller stack sees it as a
@@ -467,6 +582,7 @@ static void SohIos_InjectKey(SDL_Keycode sym, SDL_Scancode scancode) {
     e.key.state = SDL_PRESSED;
     e.key.keysym.sym = sym;
     e.key.keysym.scancode = scancode;
+    e.key.keysym.unused = SOHIOS_KEY_MAGIC; // survives the Escape guard below
     SDL_PushEvent(&e);
     e.type = SDL_KEYUP;
     e.key.state = SDL_RELEASED;
@@ -583,7 +699,7 @@ static BOOL SohIos_DocumentsHasExt(NSArray<NSString*>* exts) {
 
 // Native first-run flow: if there's no ROM and no extracted archive yet,
 // offer a document picker (Files/iCloud) and copy the chosen ROM into
-// Documents with sane protection/permissions. The in-engine
+// Documents with sane protection/permissions . The in-engine
 // extractor popups then find it and do the rest.
 @interface SohIosOnboarding : NSObject <UIDocumentPickerDelegate>
 @property(nonatomic, strong) UIWindow* window;
@@ -641,7 +757,7 @@ static SohIosOnboarding* gOnboarding = nil;
     [NSFileManager.defaultManager removeItemAtPath:dst error:nil];
     BOOL ok = [NSFileManager.defaultManager moveItemAtPath:src.path toPath:dst error:&err];
     if (ok) {
-        // User-imported data gets NSFileProtectionNone + sane modes.
+        // user-imported data gets NSFileProtectionNone + sane modes.
         [NSFileManager.defaultManager setAttributes:@{
             NSFileProtectionKey : NSFileProtectionNone,
             NSFilePosixPermissions : @0644
@@ -693,7 +809,7 @@ void SohIos_SetAudioAnchorStatus(int s) {
 #if SOH_REMOTE_CONSOLE
 
 // SOH_CONSOLE=1 → listen on TCP 8765 and accept newline-delimited commands.
-// Converts "needs hands" into "scriptable" for remote testing.
+// Converts "needs hands" into "scriptable" for remote testing .
 // Protocol (one command per line, replies "ok"/"err …"):
 //   ping                 liveness
 //   btn NAME [ms]        press virtual pad button (A B START L R) for ms (default 200)
@@ -1110,6 +1226,38 @@ static int SohIos_EventFilter(void* userdata, SDL_Event* event) {
         event->drop.file = NULL;
         dispatch_async(dispatch_get_main_queue(), ^{ SohIos_HandleDeepLink(url); });
         return 0; // consumed
+    }
+    // Stray-Escape guard. LUS toggles the menu on Escape (Gui.cpp), and on
+    // iOS the ONLY legitimate sources of Escape are this shell's own
+    // injections — the ≡ button, the restore dot, the deep link, the bridge.
+    // Anything else is forged: iPadOS turns a game controller's B into a
+    // UIKit "cancel", which SDL's UIKit backend used to hand over as a
+    // keyboard Escape, so B opened/closed the menu on every press. The SDL
+    // dependency patch closes both forgery routes at the source; this is
+    // the backstop that holds no matter what synthesizes the key.
+    if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
+        event->key.keysym.scancode == SDL_SCANCODE_ESCAPE && event->key.keysym.unused != SOHIOS_KEY_MAGIC) {
+        // Arm first: both hop the same serial queue, so the buffered context
+        // is flushed ahead of this line rather than racing it.
+        SohIos_TraceArm();
+        SohIos_Trace(@"DROPPED forged escape (%@) — a controller or the system sent Escape",
+                     event->type == SDL_KEYDOWN ? @"down" : @"up");
+        return 0; // consumed: the menu does not move
+    }
+    if (event->type == SDL_KEYDOWN) {
+        SohIos_Trace(@"key down scancode=%d sym=%d%@", (int)event->key.keysym.scancode, (int)event->key.keysym.sym,
+                     event->key.keysym.unused == SOHIOS_KEY_MAGIC ? @" (shell)" : @"");
+    }
+    // First few physical-pad presses only: enough to prove the pad's normal
+    // path works, without tracing a whole play session.
+    if (event->type == SDL_CONTROLLERBUTTONDOWN) {
+        static int seen;
+        if (seen++ < 24) {
+            SohIos_Trace(@"pad button %d down (joystick %d)", (int)event->cbutton.button, (int)event->cbutton.which);
+        }
+    }
+    if (event->type == SDL_CONTROLLERDEVICEADDED) {
+        SohIos_Trace(@"pad added: index %d", (int)event->cdevice.which);
     }
     return 1;
 }
@@ -1962,7 +2110,7 @@ void SohIos_RestoreWindowTo(CGSize target) {
 
 // LUS applies Port1.LeftStick.DeadzonePercentage (default 20) to all stick
 // input — right for physical sticks, wrong for touch (the touch layer has
-// zero mechanical noise; we want zero effective deadzone). Precompensate:
+// zero mechanical noise; spec wants zero effective deadzone). Precompensate:
 // any deflection starts past the deadzone, and the remaining travel maps
 // linearly, so walk/run gradation is preserved. Physical pads are untouched.
 static const CGFloat kLusDeadzone = 0.20;
@@ -3089,7 +3237,19 @@ void SohIos_OnWindowCreated(struct SDL_Window* sdlWindow) {
     SohIos_InstallConfigPersist(); // flush CVars on resign (swipe-kill safety)
     dispatch_async(dispatch_get_main_queue(), ^{ SohIos_InstallBackgroundReconciler(); });
     SohIos_SeedDefaultsOnce();     // per-device fidelity defaults, first run only
-    SDL_SetEventFilter(SohIos_EventFilter, NULL); // soh:// deep links
+    SDL_SetEventFilter(SohIos_EventFilter, NULL); // soh:// deep links + stray-Escape guard
+    // Input environment, first lines of the trace: which device, which pads,
+    // and whether a hardware keyboard is attached — the last one decides
+    // which of SDL's UIKit keyboard routes was even live on the reporter's
+    // iPad (pressesBegan: is skipped whenever a GCKeyboard exists).
+    NSDictionary* info = NSBundle.mainBundle.infoDictionary;
+    SohIos_Trace(@"soh %@ (build %@) on %@ %@", info[@"CFBundleShortVersionString"], info[@"CFBundleVersion"],
+                 UIDevice.currentDevice.model, UIDevice.currentDevice.systemVersion);
+    SohIos_Trace(@"hardware keyboard attached: %@", GCKeyboard.coalescedKeyboard != nil ? @"YES" : @"no");
+    SohIos_Trace(@"controllers: %@",
+                 GCController.controllers.count
+                     ? [[GCController.controllers valueForKey:@"vendorName"] componentsJoinedByString:@", "]
+                     : @"(none yet)");
     UIWindow* window = SohIos_GetSDLWindow(sdlWindow);
     if (window == nil) {
         NSLog(@"[SohIosShell] no UIKit window for SDL window");
@@ -3098,7 +3258,7 @@ void SohIos_OnWindowCreated(struct SDL_Window* sdlWindow) {
     dispatch_async(dispatch_get_main_queue(), ^{
         SohIos_InstallSceneDelegate(); // soh:// URL delivery (scene-routed)
         SohIos_EnsureLandscape(window, 0);
-        // Native ROM picker if there's nothing to play yet.
+        // Native ROM picker if there's nothing to play yet .
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(),
                        ^{ [SohIosOnboarding maybePresentIn:window]; });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(),

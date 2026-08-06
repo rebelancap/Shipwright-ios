@@ -1,9 +1,4 @@
 #!/bin/bash
-# Build SoH for the visionOS SIMULATOR (arm64). Phase 1 of the Vision Pro
-# port (VISION-PRO-GUIDE.md): same tree, PLATFORM=SIMULATOR_VISIONOS, the
-# vision-sim dep slices, and SOH_VISIONOS=1 for platform deltas. The iOS
-# targets/scripts are untouched. Produces
-# spikes/soh-vision-sim-build/soh/Release-xrsimulator/soh.app
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,17 +11,13 @@ SOH_O2R="$ROOT/oracle/build-cmake/soh/soh.o2r"
 [[ -f "$PREFIX/lib/libopusfile.a" ]] || SOH_IOS_SDK=visionsim "$ROOT/scripts/build-audio-deps-ios.sh"
 [[ -f "$SOH_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
-# SDL_OPENGLES/SDL_OPENGL OFF: GLES does not exist on visionOS; LUS renders
-# through SDL's Metal path. SOH_VISIONOS gates app-target deltas (device
-# family 7, xrOS plist keys) in the overlay CMake.
-# Port versioning (D-039) + remote console gate (D-040).
 SOH_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 SOH_BUILD="$(date -u +%Y%m%d%H%M)"
-# Simulator = the dev loop, so the console is ON unless told otherwise.
 CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 echo "=== soh vision-sim $SOH_VERSION (build $SOH_BUILD), remote console: $CONSOLE ==="
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Shipwright" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     "-DSOH_IOS_VERSION=$SOH_VERSION" "-DSOH_IOS_BUILD=$SOH_BUILD" \
     "-DSOH_REMOTE_CONSOLE=$CONSOLE" \
     -DCMAKE_SYSTEM_NAME=visionOS -DPLATFORM=SIMULATOR_VISIONOS \
