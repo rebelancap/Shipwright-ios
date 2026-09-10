@@ -26,18 +26,26 @@ finish method closes the ImGui frame.
      bool IsMouseOverAnyGuiItem();
 --- a/libultraship/src/ship/window/gui/Gui.cpp
 +++ b/libultraship/src/ship/window/gui/Gui.cpp
-@@ -161,6 +161,10 @@
+@@ -160,6 +160,18 @@
+ 
  void Gui::ImGuiWMNewFrame() {
  }
- 
++
 +// SOH_IOS (overlay 0034): 3D mode flag (shell) — gates the Main Game
 +// re-dock self-heal below to 2D frames.
 +extern "C" volatile int gSoh3DMode;
-+
++#ifndef __IOS__
++// rev3: WEAK zeroed default so desktop builds (the macOS build) link
++// without the iOS shell. The shell's strong definition wins on device;
++// here the flag is a constant 0 and the gated path is unreachable.
++extern "C" {
++__attribute__((weak)) volatile int gSoh3DMode = 0;
++}
++#endif
+ 
  void Gui::DrawMenu() {
      const std::shared_ptr<Window> wnd = Context::GetRawInstance()->GetWindow();
-     const std::shared_ptr<Config> conf = Context::GetRawInstance()->GetConfig();
-@@ -199,6 +203,17 @@
+@@ -199,6 +211,17 @@
      }
  
      ImGui::DockSpace(dockId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None | ImGuiDockNodeFlags_NoDockingInCentralNode);
@@ -55,20 +63,25 @@ finish method closes the ImGui frame.
  
      if (ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
          (ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false) &&
-@@ -254,10 +269,77 @@
-             } else {
-                 window->Flags &= ~(flags);
-             }
-+        }
-+    }
-+}
-+
+@@ -258,6 +281,82 @@
+     }
+ }
+ 
 +// SOH_IOS (overlay 0034): the 2D perf HUD is a UIKit label on the parked
 +// window — invisible on the panel. The shell composes the same text here
 +// and the 3D frame draws it into the eye images (predecessor pattern:
 +// HUD text rides in the rendered frame). Returns -1 when the HUD is off,
 +// else the thermal state for color.
 +extern "C" int SohIos_PerfHud3DText(char* buf, int cap);
++#ifndef __IOS__
++// rev3: WEAK no-op default (see the gSoh3DMode note above). -1 is the
++// documented "HUD is off" return, so desktop simply never draws it.
++extern "C" __attribute__((weak)) int SohIos_PerfHud3DText(char* buf, int cap) {
++    (void)buf;
++    (void)cap;
++    return -1;
++}
++#endif
 +
 +// SOH_IOS (overlay 0034): see Gui.h. DrawGame/CalculateGameViewport are
 +// intentionally absent — the menu composites over the rendered eyes.
@@ -116,11 +129,11 @@ finish method closes the ImGui frame.
 +            sohFg->AddText(sohFont, sohHudSize, ImVec2(sohPos.x + 2, sohPos.y + 2),
 +                           IM_COL32(0, 0, 0, 200), sohHudBuf);
 +            sohFg->AddText(sohFont, sohHudSize, sohPos, sohCol, sohHudBuf);
-         }
-     }
++        }
++    }
 +    ImGui::Render();
- }
- 
++}
++
 +void* Gui::Soh3DGetDrawData() {
 +    return (void*)ImGui::GetDrawData();
 +}

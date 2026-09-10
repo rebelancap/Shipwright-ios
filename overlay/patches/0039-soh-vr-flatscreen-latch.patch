@@ -1,0 +1,501 @@
+Overlay patch 0039: the flat-screen-context latch (VR-spec D3,
+VR-DONOR-MAP §2). The donor's biggest surprise is that OoT needs no
+enumerated table of 2D contexts -- it is one line:
+
+    s32 vrFlatScreen = (gPlayState == NULL) || (gPlayState->pauseCtx.state != 0);
+
+"no PlayState at all" (title, file select, name entry, the debug select menu)
+"or the kaleido pause menu is up". Shops, dialogue, cutscenes, the ocarina,
+the item roulette all render as normal stereo world.
+
+The architecturally load-bearing part is WHERE it is evaluated, not what it
+says. It is LATCHED at the tick boundary, immediately before GameState_Update
+builds this frame's display list, so a DL is never interpreted in a different
+mode than the one it was built for (the donor's VR_ApplyModeRequest latch --
+its best structural idea). Reading the predicate later, from inside the
+interpreter or from the compositor thread, would let the mode flip mid-frame.
+
+Two values are published:
+  gSohVRFlatLatch  -- the latched predicate for THIS frame's DL. 0031 reads it
+                      and keeps the game's own matrix (mono, flat) instead of
+                      substituting the per-eye A.V.P, so a flat frame lands on
+                      the panel rather than being smeared across the world.
+  gSohVRFlatRaw    -- the live predicate, for diagnostics (`vr mode`) only.
+
+Published unconditionally (not gated on gSohVRMode) so `vr mode` can report
+the predicate before VR is ever entered -- it costs one pointer test per tick
+and nothing reads it outside VR. __IOS__-only.
+
+rev2 (VR R2a, device round): PRE-RENDERED ROOMS JOIN THE PREDICATE.
+Overlay 0040 flipped SoH's "Disable 2D Pre-Rendered Scenes" enhancement on in
+VR, following the donor, which ships it default-on. SoH's own tooltip says what
+that actually needs: "Enable this when using a mod that implements 3D backdrops
+for these areas." Without such a mod the room draws its bare placeholder mesh,
+which is why the user's Link's house was an all-green box on 1.0.1.1 (his
+Documents/mods holds a 4K TEXTURE pack, not a 3D-backdrop mod).
+
+The room's own header says which kind of room it is: MeshHeader type 1 is the
+image-backed ("pre-rendered background") shape, drawn by func_80096F6C through
+Room_DrawBackground2D as a SCREEN-SPACE image (z_room.c). A screen-space image
+has no disparity: through 0031's ortho gate it lands identical in both eyes,
+i.e. a flat painting glued to the head while Link moves in 3D in front of it.
+
+So VR gets a three-way setting, gSohVRRoomMode, published by the shell:
+  0 panel (DEFAULT) -- the whole room is treated as a flat-screen context and
+      renders mono onto the world-locked panel, exactly like file select. The
+      pre-rendered art is shown as authored, world-locked rather than
+      head-glued, and the transition is one the player already knows.
+  1 flat  -- the backdrop is drawn per eye (the head-glued painting above).
+  2 3d    -- SoH's enhancement, for users who install a 3D-backdrop mod.
+Only mode 0 touches this latch, and only inside VR: outside VR (gSohVRMode 0)
+the predicate is byte-for-byte what rev1 published, so the flat window and the
+3D panel cannot regress.
+
+rev3 (VR R3) -- THE RIGHT STICK BECOMES THE TURN, AND ONLY THE TURN. This is
+the fix for the user's 1.0.1.3 report: "when i snap turn, it stops my controller
+from working properly, where i can't move anymore, and i can't perform actions,
+except i can still keep snap turning."
+
+The mechanism, measured rather than guessed. LUS binds the right stick TWICE.
+Ship::ControllerDefaultMappings maps RIGHTX/RIGHTY to the right stick axes
+(ControllerDefaultMappings.cpp:125-129), and the LUS subclass ALSO maps them to
+the C-BUTTONS -- RIGHTY- = C-up, RIGHTY+ = C-down, RIGHTX- = C-left, RIGHTX+ =
+C-right (libultraship/.../LUS ControllerDefaultMappings.cpp:94-102) -- at the
+global axis threshold of 25% (GlobalSDLDeviceSettings.cpp:11) of MAX_AXIS_RANGE
+85, i.e. raw 21. R2b's snap turn armed at 0.6 (raw 51). So every turn flick
+pressed C a frame or two BEFORE it turned, and was still holding C when the turn
+disarmed: C-up is first-person look, C-left/right/down are item use, and any of
+them puts Link in a state that eats the left stick and the face buttons. Turning
+kept working because it was read out of Play_Draw, which runs in every one of
+those states -- exactly the asymmetry the user described.
+
+rev3 fixes it where spec D9 says input decisions belong: at the ONE merged
+snapshot, at the tick boundary, before Play_Update, so Player, the camera and
+free-look all see the same corrected bytes.
+
+  (a) PUBLISH gSohVRTurnAxis -- the right stick x as a level in -1..1. The shell
+      owns the single edge detector and the single integrator, on the loop
+      thread, where dt is real and the turn pivots on the LIVE head (donor
+      vr_apply_snap_turn, vr_openxr.cpp:672-682). SMOOTH is the default style
+      (donor style 1); snap is the option. the user: "SMOOTH should be an option
+      instead of snap turning ... and smooth turning should be the default."
+  (b) CLEAR the C bits the right stick just set, by exactly the provenance test
+      the mapping used (past 25% of MAX_AXIS_RANGE on that axis, that direction)
+      -- so a C-button a user has bound to an actual BUTTON still gets through.
+      rev5 (VR R5): and so does a C-button the SENSE PAIR set. Overlay 0047 ORs
+      the Sense six-input taxonomy into the pad EARLIER, in padmgr, and R4
+      recorded the resulting collision honestly rather than fixing it: a
+      Sense-produced C-left arriving on the same tick as a right-stick
+      deflection past 25% left was cleared with the stick's, because this mask
+      worked by BIT and the two are indistinguishable once merged. They are NOT
+      indistinguishable at the source -- 0047 publishes exactly what it OR'd in
+      as gSohVRSensePadBits -- so the mask is now by PROVENANCE: subtract the
+      Sense-sourced bits (this tick's and, for the release edge, the previous
+      tick's) from the stick-driven set before masking anything. A bit the
+      Sense set is never cleared, whatever the stick is doing.
+  (c) ZERO right_stick_x/y in the snapshot, which also takes the stick away from
+      free-look (z_camera.c:1421,1504) and from RightStickAim (z_player.c:12633)
+      -- in VR the head IS the camera, so there is nothing for them to do.
+  (d) REMAP THE D-PAD TO THE C-BUTTONS. Without this, (b) and (c) would leave VR
+      with no way to use a C item at all. The D-pad is unused in OoT gameplay,
+      so in VR it becomes the C-pad, edges included (press/rel are taken from
+      the D-pad's own edge bits, which are already correct).
+  (e) SUPPRESS the turn while the ocarina is out. Audio_GetOcaInput
+      (code_800EC960.c:1302) calls PadMgr_RequestPadData AGAIN -- a genuine
+      second snapshot in vanilla that this block cannot reach -- so the right
+      stick still plays notes there. Rather than fight it, VR stops turning
+      while the ocarina is out so the two cannot contend. rev8 fixes WHICH test
+      says "out": `msgCtx.ocarinaMode` is a LATCH that stays non-zero until the
+      next textbox, so the VR turn used to die for the rest of a session after
+      one ocarina use; the predicate is now msgMode in 0x09..0x33. HONEST GAP: with
+      "CustomOcarina.RightStick" on, the right stick plays notes and does not
+      turn; that is the vanilla binding and R3 leaves it alone.
+
+All of (a)-(e) are gated on VR gameplay -- gSohVRMode != 0 and the latch this
+same block just computed being 0. The flat window, the 3D panel, the pause menu
+and every iPhone build see the pad byte for byte as before.
+
+rev9 (VR R16 part B): THE MARKET IS A PANEL TOO -- FIXED CAMERAS JOIN THE
+PREDICATE. the user, wearing 1.0.1.20: in the Market it "wasn't the 2D panel as
+it should be, wasn't rendered properly, and hard to get out."
+
+rev2's arm is the only pre-rendered test in this tree and it asks the ROOM:
+meshHeader type 1, the image-backed room shape. The Market is not one. Measured
+straight out of the user's own oot.o2r: market_day/night/ruins carry NO
+Background resource at all -- their rooms are ordinary 3D geometry -- while
+their scene collision carries CAM_SET_PREREND_PIVOT (0x1A) and, in the day
+scene, CAM_SET_MARKET_BALCONY (0x14). The Market's "pre-rendered" look is
+CAMERA data, not room data: geometry authored to be seen from one fixed angle.
+In stereo, with a camera that refuses to follow the head, that is exactly what
+the user described. (The back alley, the Market entrance, the Temple of Time
+exterior, the houses and the shops all DO carry Background resources, so rev2's
+room arm already latches them; this arm adds nothing there.)
+
+SoH's own set of fixed-camera settings is DisableFixedCamera.cpp:86-89 --
+CAM_SET_PREREND_FIXED, CAM_SET_PREREND_PIVOT, CAM_SET_PIVOT_FROM_SIDE,
+CAM_SET_MARKET_BALCONY -- plus CAM_SET_PREREND_SIDE_SCROLL, which the same o2r
+scan finds only in hairal_niwa (the castle courtyard guards). We do NOT
+re-enable that enhancement: R1 took a SIGSEGV inside Camera_Normal1 with it
+forced on (OTRGlobals.cpp ~1080-1090, overlay 0040 rev2). This is a read of the
+active camera's setting and nothing else.
+
+SCENE-GATED, because the setting alone is too broad. The same scan finds those
+settings live in a dungeon (jyasinzou, the Spirit Temple, 5 regions), in the
+Lost Woods (spot10), in the Sacred Forest Meadow (spot05), on the castle
+grounds (spot15), in the courtyard (hairal_niwa, 9 side-scroll regions) and in
+half a dozen minigame rooms. Turning a Spirit Temple region or a Lost Woods
+clearing into a flat panel as the player walks across a camera boundary is a
+worse bug than the one being fixed. So the arm is gated on the TOWN scenes --
+SoH's own skyboxSceneControlList (Disable2DBackgrounds.cpp:46-60) minus the
+courtyard and the Forest Temple: the Market entrance, the back alley, the
+Market and the Temple of Time exterior, day / night / ruins.
+
+DEBOUNCED, in the spirit of 0031's size hold: the active camera's setting flips
+as Link crosses a camera region, and a latch that flips with it would strobe the
+whole frame between panel and stereo. The arm must hold its new value for
+SOH_VR_FIXEDCAM_HOLD consecutive ticks before the latch follows it.
+
+ONE TICK OLD, said out loud: gSohVRCamSetting is published by overlay 0037 from
+inside Camera_Update, which runs in Play_Update -- i.e. AFTER this block. The
+value read here is therefore the setting the PREVIOUS tick's camera had. With a
+multi-tick debounce in front of it that is a rounding error on the transition,
+and it is never wrong about which arm fired.
+
+Published as gSohVRRoomFixedCam beside gSohVRRoomImage so `vr room` says which
+arm latched the frame.
+
+rev6 (VR R6) adds one thing that is not about the pad at all, and it is here for
+the THREAD rather than the topic: the overlay-0050 hand-matrix table is cleared
+in this block, because this block runs once per frame ON THE GAME THREAD, which
+is the only thread that writes that table. R6's first attempt cleared it from
+the compositor loop thread at VR exit -- the same two-owner mistake as the
+gSohVROverlayDL crash this round diagnosed, milder only because the consumers are
+bounds-checked. The loop thread now asks; this clears. See the comment at the
+site.
+
+--- a/soh/src/code/graph.c
++++ b/soh/src/code/graph.c
+@@ -295,6 +295,323 @@
+     CLOSE_DISPS(gfxCtx);
+ 
+     GameState_ReqPadData(gameState);
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0039, VR-spec D3 / VR-DONOR-MAP 2): latch the
++     * flat-screen predicate at the TICK BOUNDARY, before the display list for
++     * this frame is built, so the DL is never interpreted in a mode other
++     * than the one it was built for. */
++    {
++        extern volatile int gSohVRFlatLatch;
++        extern volatile int gSohVRFlatRaw;
++        extern volatile int gSohVRMode;
++        extern volatile int gSohVRRoomMode;
++        extern volatile int gSohVRRoomImage;
++        int sohVRFlat = (gPlayState == NULL) || (gPlayState->pauseCtx.state != 0);
++        /* rev2: is this room IMAGE-BACKED? MeshHeader type 1 is OoT's
++         * pre-rendered-background room shape (z64scene.h / z_room.c's
++         * func_80096F6C). Published unconditionally for `vr contract`. */
++        int sohVRImageRoom = 0;
++        int sohVRFixedCam = 0;
++        if ((gPlayState != NULL) && (gPlayState->roomCtx.curRoom.meshHeader != NULL) &&
++            (gPlayState->roomCtx.curRoom.meshHeader->base.type == 1)) {
++            sohVRImageRoom = 1;
++        }
++        gSohVRRoomImage = sohVRImageRoom;
++        /* rev9 (VR R16 part B): is a FIXED CAMERA in force? The Market's
++         * pre-rendered look is camera data, not room data -- see the patch
++         * header for the o2r scan that says so, for why this is gated on the
++         * town scenes, and for why the setting read here is one tick old.
++         * Published unconditionally, like the room arm, so `vr room` can be
++         * read before VR is entered. */
++        {
++            extern volatile int gSohVRCamSetting;
++            extern volatile int gSohVRRoomFixedCam;
++            /* ticks the raw arm must hold before the latch follows it. The
++             * camera setting changes as Link crosses a region boundary and a
++             * latch that strobed with it would flip the whole frame between
++             * panel and stereo (0031's SIZE hold, same reason). */
++            const int sohVRFixedHold = 5;
++            static int sSohVRFixedRawPrev = 0;
++            static int sSohVRFixedHeld = 0;
++            static int sSohVRFixedState = 0;
++            int sohVRFixedRaw = 0;
++            if (gPlayState != NULL) {
++                s32 sohVRScene = (s32)gPlayState->sceneNum;
++                s32 sohVRSet = (s32)gSohVRCamSetting;
++                if ((sohVRScene == SCENE_MARKET_ENTRANCE_DAY) || (sohVRScene == SCENE_MARKET_ENTRANCE_NIGHT) ||
++                    (sohVRScene == SCENE_MARKET_ENTRANCE_RUINS) || (sohVRScene == SCENE_BACK_ALLEY_DAY) ||
++                    (sohVRScene == SCENE_BACK_ALLEY_NIGHT) || (sohVRScene == SCENE_MARKET_DAY) ||
++                    (sohVRScene == SCENE_MARKET_NIGHT) || (sohVRScene == SCENE_MARKET_RUINS) ||
++                    (sohVRScene == SCENE_TEMPLE_OF_TIME_EXTERIOR_DAY) ||
++                    (sohVRScene == SCENE_TEMPLE_OF_TIME_EXTERIOR_NIGHT) ||
++                    (sohVRScene == SCENE_TEMPLE_OF_TIME_EXTERIOR_RUINS)) {
++                    if ((sohVRSet == CAM_SET_PREREND_FIXED) || (sohVRSet == CAM_SET_PREREND_PIVOT) ||
++                        (sohVRSet == CAM_SET_PREREND_SIDE_SCROLL) || (sohVRSet == CAM_SET_PIVOT_FROM_SIDE) ||
++                        (sohVRSet == CAM_SET_MARKET_BALCONY)) {
++                        sohVRFixedRaw = 1;
++                    }
++                }
++            }
++            if (sohVRFixedRaw != sSohVRFixedRawPrev) {
++                sSohVRFixedRawPrev = sohVRFixedRaw;
++                sSohVRFixedHeld = 1;
++            } else if (sSohVRFixedHeld < sohVRFixedHold) {
++                sSohVRFixedHeld++;
++            }
++            if (sSohVRFixedHeld >= sohVRFixedHold) {
++                sSohVRFixedState = sSohVRFixedRawPrev;
++            }
++            sohVRFixedCam = sSohVRFixedState;
++            gSohVRRoomFixedCam = sohVRFixedCam;
++        }
++        /* rev2: in VR, with the default "panel" room treatment, an
++         * image-backed room is a flat-screen context: the whole room renders
++         * mono onto the world-locked panel, which is the only way the
++         * authored 2D art reads correctly in stereo. Modes 1 and 2, and every
++         * non-VR build, see exactly rev1's predicate.
++         * rev9: and so is a fixed-camera region of the town scenes, for the
++         * same reason -- the geometry is authored for one angle and the camera
++         * will not follow the head. */
++        if ((gSohVRMode != 0) && (gSohVRRoomMode == 0) && (sohVRImageRoom || sohVRFixedCam)) {
++            sohVRFlat = 1;
++        }
++        gSohVRFlatRaw = sohVRFlat;
++        gSohVRFlatLatch = sohVRFlat;
++        /* rev6 (VR R6): CLEAR THE HAND-MATRIX TABLE HERE, ON THIS THREAD.
++         *
++         * The table (overlay 0050) holds raw graph-pool addresses recorded
++         * during the limb draw, and it must not outlive the session that
++         * recorded them -- the arena reuses those addresses, and the
++         * interpreter's pointer-identity search would then re-seat an
++         * unrelated display-list matrix onto a hand delta. R6 first cleared it
++         * from the compositor loop thread at VR exit, which is the SAME
++         * two-owner mistake as the gSohVROverlayDL crash this round fixed:
++         * every writer of this table is the GAME thread (0042's limb override
++         * sets the tag, 0050's Matrix_ToMtx funnel appends the pointers), and a
++         * draw that had already sampled gSohVRFpActive could still be writing
++         * while the loop zeroed it. Milder than the crash -- the consumers are
++         * bounds-checked, so the damage is one frame of torn hand matrix rather
++         * than a fault -- and wrong for exactly the same reason.
++         *
++         * So the loop thread only asks (gSohVRHandMtxClearReq) and the game
++         * thread clears, here, at the tick boundary before the frame's display
++         * list is built. gSohVRMode == 0 is the backstop, and it is a durable
++         * state: Soh_Exit3DFinalize sets it once, on the main queue this thread
++         * pumps, so a lost request still costs at most a frame.
++         *
++         * gSohVRFpActive is deliberately NOT one of the triggers, and the first
++         * version of this block used it and was measured wrong: it is
++         * recomputed in Play_Draw, i.e. AFTER this block runs, and it is not
++         * stable frame to frame (the far-camera guard alone flips it). Clearing
++         * on it wipes the registrations the previous draw just made -- observed
++         * directly as mtx_n stuck at 0,0 and live_hits 0 in a live VR session
++         * whose pointer search was running 27k times. The table being stale
++         * INSIDE a session is harmless (same graph pool, same addresses); it is
++         * only stale ACROSS sessions that matters, and mode covers that.
++         *
++         * The count goes first, so a draw that catches this mid-clear sees an
++         * empty table rather than a live count over cleared pointers. */
++        {
++            extern volatile int gSohVRHandMtxClearReq;
++            extern volatile int gSohVRHandMtxTag;
++            extern void* volatile gSohVRHandMtxPtr[2][4];
++            extern volatile int gSohVRHandMtxCount[2];
++            extern volatile float gSohVRHandRecMat[2][16];
++            extern volatile int gSohVRHandRecValid[2];
++
++            if ((gSohVRHandMtxClearReq != 0) || (gSohVRMode == 0)) {
++                if ((gSohVRHandMtxTag != 0) || (gSohVRHandMtxCount[0] != 0) || (gSohVRHandMtxCount[1] != 0) ||
++                    (gSohVRHandRecValid[0] != 0) || (gSohVRHandRecValid[1] != 0)) {
++                    s32 sohMtxH;
++                    s32 sohMtxI;
++
++                    gSohVRHandMtxTag = 0;
++                    for (sohMtxH = 0; sohMtxH < 2; sohMtxH++) {
++                        gSohVRHandMtxCount[sohMtxH] = 0;
++                        gSohVRHandRecValid[sohMtxH] = 0;
++                        for (sohMtxI = 0; sohMtxI < 4; sohMtxI++) {
++                            gSohVRHandMtxPtr[sohMtxH][sohMtxI] = NULL;
++                        }
++                        for (sohMtxI = 0; sohMtxI < 16; sohMtxI++) {
++                            gSohVRHandRecMat[sohMtxH][sohMtxI] = 0.0f;
++                        }
++                    }
++                }
++                gSohVRHandMtxClearReq = 0;
++            }
++        }
++        /* rev3 (VR R3, spec D6/D9): the right stick is the TURN in VR, and
++         * only the turn. See the patch header for the full mechanism -- LUS
++         * binds the right stick to the C-buttons as well, at a LOWER threshold
++         * than any turn gesture, which is what wedged Link into item use while
++         * turning kept working. One snapshot, one place, before Play_Update. */
++        if ((gSohVRMode != 0) && (sohVRFlat == 0)) {
++            extern volatile float gSohVRTurnAxis;
++            extern volatile int gSohVRPadCur;
++            extern volatile int gSohVRPadCMasked;
++            extern volatile int gSohVRSensePadBits;
++            Input* sohIn = &gameState->input[0];
++            s32 sohRx = sohIn->cur.right_stick_x;
++            s32 sohRy = sohIn->cur.right_stick_y;
++            /* 25% of MAX_AXIS_RANGE (85) -- the exact provenance test the
++             * SDLAxisDirectionToButtonMapping used to set these bits. */
++            const s32 sohCThresh = 21;
++            u16 sohCFromStick = 0;
++            u16 sohCFromDpad = 0;
++            /* rev5 (VR R5): the bits overlay 0047 OR'd in from the Sense pair
++             * THIS tick. Zero when no pair is connected, when 0047 is not
++             * built, and in every non-VR build -- so the mask below reduces
++             * to rev4's exactly. */
++            u16 sohCFromSense = (u16)((unsigned int)gSohVRSensePadBits & 0xFFFFu);
++            /* rev8 (VR R8 part B): THE CHORD IS GONE, and with it the last
++             * path by which the right stick could produce a C button.
++             *
++             * rev7 made "hold the right grip and the stick becomes the C-pad"
++             * because on a Sense pair the C items had nothing else to live on.
++             * The item wheel (overlay 0051) now lives on that same right grip
++             * and covers the C items properly, and the user's ruling is flat:
++             * "we still have the right joystick sometimes acting like c
++             * buttons... let's move it [the wheel] to the RIGHT GRIP." So the
++             * right stick is the TURN and nothing else, in every mode: X turns,
++             * Y is ignored, and no deflection of it can ever set a C bit.
++             *
++             * What survives from rev3 is the MASK -- LUS's own gamepad
++             * axis-to-button mapping raises C bits from the right stick at a
++             * lower threshold than any turn gesture, and those are cleared here
++             * exactly as before. The D-pad remap survives too: it is
++             * gamepad-only (a Sense pair has no D-pad) and it is the gamepad's
++             * only way to reach the C items in VR. */
++            static u16 sohCFromSensePrev = 0;
++            u16 sohPressFromDpad = 0;
++            u16 sohRelFromDpad = 0;
++            float sohAxis;
++            /* (a) the turn level. (e) not while the ocarina is out. */
++            sohAxis = (float)sohRx / 85.0f;
++            if (sohAxis > 1.0f) {
++                sohAxis = 1.0f;
++            } else if (sohAxis < -1.0f) {
++                sohAxis = -1.0f;
++            }
++            /* rev8 (VR R8 part B): THE SAME OCARINA LATCH BUG overlay 0047 had.
++             * `msgCtx.ocarinaMode` holds OCARINA_MODE_04 from the moment the
++             * ocarina is put away until the next textbox opens, so rev3's test
++             * killed the VR smooth turn for the rest of the session after one
++             * ocarina use. msgMode 0x09..0x33 is every state that takes ocarina
++             * notes and nothing else, and it falls when the ocarina goes away. */
++            if ((gPlayState != NULL) &&
++                (gPlayState->msgCtx.msgMode >= MSGMODE_OCARINA_STARTING) &&
++                (gPlayState->msgCtx.msgMode <= MSGMODE_FROGS_WAITING)) {
++                sohAxis = 0.0f;
++            }
++            gSohVRTurnAxis = sohAxis;
++            /* rev7 (VR R7 verdict 9): the live scene, for the crash record and
++             * the heartbeat. It costs one store per tick and it is the
++             * difference between "the app died" and "the app died in Hyrule
++             * Field". -1 outside gameplay, which the shell prints as-is. */
++            {
++                extern volatile int gSohVRSceneNum;
++                gSohVRSceneNum = (gPlayState != NULL) ? (int)gPlayState->sceneNum : -1;
++            }
++            /* (b) clear only the C bits this stick deflection produced. */
++            if (sohRx > sohCThresh) {
++                sohCFromStick |= BTN_CRIGHT;
++            }
++            if (sohRx < -sohCThresh) {
++                sohCFromStick |= BTN_CLEFT;
++            }
++            if (sohRy > sohCThresh) {
++                sohCFromStick |= BTN_CUP;
++            }
++            if (sohRy < -sohCThresh) {
++                sohCFromStick |= BTN_CDOWN;
++            }
++            /* (d) the D-pad becomes the C-pad, edges and all. */
++            if (sohIn->cur.button & BTN_DUP) {
++                sohCFromDpad |= BTN_CUP;
++            }
++            if (sohIn->cur.button & BTN_DDOWN) {
++                sohCFromDpad |= BTN_CDOWN;
++            }
++            if (sohIn->cur.button & BTN_DLEFT) {
++                sohCFromDpad |= BTN_CLEFT;
++            }
++            if (sohIn->cur.button & BTN_DRIGHT) {
++                sohCFromDpad |= BTN_CRIGHT;
++            }
++            if (sohIn->press.button & BTN_DUP) {
++                sohPressFromDpad |= BTN_CUP;
++            }
++            if (sohIn->press.button & BTN_DDOWN) {
++                sohPressFromDpad |= BTN_CDOWN;
++            }
++            if (sohIn->press.button & BTN_DLEFT) {
++                sohPressFromDpad |= BTN_CLEFT;
++            }
++            if (sohIn->press.button & BTN_DRIGHT) {
++                sohPressFromDpad |= BTN_CRIGHT;
++            }
++            if (sohIn->rel.button & BTN_DUP) {
++                sohRelFromDpad |= BTN_CUP;
++            }
++            if (sohIn->rel.button & BTN_DDOWN) {
++                sohRelFromDpad |= BTN_CDOWN;
++            }
++            if (sohIn->rel.button & BTN_DLEFT) {
++                sohRelFromDpad |= BTN_CLEFT;
++            }
++            if (sohIn->rel.button & BTN_DRIGHT) {
++                sohRelFromDpad |= BTN_CRIGHT;
++            }
++            /* rev4 (VR R4): the RELEASE edge needs the PREVIOUS tick's set.
++             * sohCFromStick is this tick's deflection, so on the very tick the
++             * stick falls back under threshold it is already 0 -- and that is
++             * exactly the tick PadMgr_ProcessInputs raises `rel` for the C
++             * button the stick had been holding. rev3's rel mask was therefore
++             * a no-op, and a phantom "C released" edge with no matching press
++             * leaked to the game at the end of EVERY turn flick. Mask rel with
++             * the union of this tick's and last tick's stick-driven C set. */
++            {
++                static u16 sohCFromStickPrev = 0;
++                u16 sohCRelMask;
++                /* rev5 (VR R5): MASK BY PROVENANCE, not by bit. A bit the Sense
++                 * pair produced is never the stick's to clear, even when the
++                 * stick happens to be deflected the same way on the same tick.
++                 * The release edge needs the union of both ticks on BOTH sides:
++                 * the stick's previous set (rev4's fix for the phantom "C
++                 * released" at the end of every turn flick) and the Sense's
++                 * previous set (a Sense button released one tick before the
++                 * stick falls under threshold must still deliver its rel). */
++                sohCFromStick = (u16)(sohCFromStick & ~sohCFromSense);
++                sohCRelMask = (u16)((sohCFromStick | sohCFromStickPrev) &
++                                    ~(u16)(sohCFromSense | sohCFromSensePrev));
++                sohIn->cur.button = (u16)((sohIn->cur.button & ~sohCFromStick) | sohCFromDpad);
++                sohIn->press.button = (u16)((sohIn->press.button & ~sohCFromStick) | sohPressFromDpad);
++                sohIn->rel.button = (u16)((sohIn->rel.button & ~sohCRelMask) | sohRelFromDpad);
++                sohCFromStickPrev = sohCFromStick;
++                sohCFromSensePrev = sohCFromSense;
++            }
++            /* (c) the stick itself goes away: free-look and RightStickAim have
++             * nothing to do when the head IS the camera. */
++            sohIn->cur.right_stick_x = 0;
++            sohIn->cur.right_stick_y = 0;
++            sohIn->rel.right_stick_x = 0;
++            sohIn->rel.right_stick_y = 0;
++            sohIn->press.right_stick_x = 0;
++            sohIn->press.right_stick_y = 0;
++            /* Diagnostics for `vr room`: the pad the GAME will see this tick,
++             * and which C bits the stick had set. A right-stick flick that
++             * leaves pad_c_masked non-zero and pad_cur's C bits clear IS the
++             * regression-2 assertion, made in one line from the simulator. */
++            gSohVRPadCur = (int)sohIn->cur.button;
++            gSohVRPadCMasked = (int)sohCFromStick;
++        } else {
++            extern volatile float gSohVRTurnAxis;
++            extern volatile int gSohVRPadCMasked;
++            gSohVRTurnAxis = 0.0f;
++            gSohVRPadCMasked = 0;
++        }
++    }
++#endif
+     GameState_Update(gameState);
+ 
+     OPEN_DISPS(gfxCtx);

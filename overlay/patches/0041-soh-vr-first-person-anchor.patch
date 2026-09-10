@@ -1,0 +1,214 @@
+Overlay patch 0041: the FIRST-PERSON anchor stack (VR-spec D4,
+VR-DONOR-MAP 3 "Anchor computation"). Mirrors the donor's single block at the
+top of Play_Draw (z_play.c:1355-1500) almost literally, minus the hand/roomscale
+pieces that belong to later rounds.
+
+WHY IT LIVES IN Play_Draw, NOT IN THE SHELL: the anchor is a GAME quantity
+(actor root, age, action state) sampled at the tick boundary, one tick per
+display list, AFTER Camera_Update has run. Computing it on the compositor
+thread would race the actor update and interpolate a pose against a body that
+had already moved.
+
+The five subtleties, each one of the donor's recorded scars:
+
+1. ANCHOR = actor ROOT + eye height, NEVER actor.focus.pos (the animated head
+   bone). focus.pos carries the walk-cycle bob and sway; riding it is instant
+   motion sickness. The body still animates visually, the camera does not.
+   (donor z_play.c:1391-1395, gVrHeadHeightOffset default -9.0.)
+
+2. EYE HEIGHT is Player_GetHeight() (44 child / 68 adult, +32 on horse --
+   z_actor.c:1401) plus that -9.0 offset. At the spec's 35 units/m that is
+   1.00 m as a child and 1.69 m as an adult, which is the arithmetic that makes
+   35 units/m the right world scale rather than a taste setting.
+
+3. CRAWLING and ON_HORSE halve it (donor :1409-1424): standing height in a
+   crawlspace floats the camera into the ceiling, and Link's root is already at
+   the saddle. The STANDING height is exported separately so world-scale
+   calibration and the child<->adult swap see a stable number.
+
+4. +6.0 units of BODY-RELATIVE FORWARD offset, rotated by shape.rot.y (donor
+   :1425-1437). Applied in game units so it interacts with world scale
+   physically.
+
+5. FAR-CAMERA FALLBACK (donor :1370-1388, gVrFpFallbackDist 1200). If the
+   active camera sits further than 1200 units from Link, the first-person
+   anchor is withdrawn and the shell falls back to seating on the game
+   camera's own basis -- "ride the director's camera" for cutscenes framing a
+   distant location, and for scenes still loading. It returns under 60% of
+   that (720) so a camera hovering at the boundary cannot flap.
+
+   NOTE (R2b scope change, the user 2026-09-03): third person is no longer a
+   user-facing VR view mode -- the 3D panel mode is the third-person
+   experience. This fallback is NOT that mode: it is the unnamed, automatic
+   safety net spec D4 requires, and there is no setting that reaches it.
+
+Also published here: whether first person is actually in force this tick, which
+is the gate every branch of overlay 0042 reads.
+
+rev2 (VR R3) -- THE TURN INPUT MOVED OUT OF THIS FILE ENTIRELY. rev1 ran a
+snap-turn edge detector HERE, in Play_Draw, off play->state.input[0]. the user's
+1.0.1.3 verdict: "when i snap turn, it stops my controller from working
+properly, where i can't move anymore, and i can't perform actions, except i can
+still keep snap turning."
+
+The cause was not this detector but the input it read: LUS binds the right stick
+to the C-BUTTONS as well as to right_stick_x/y
+(libultraship/src/libultraship/.../ControllerDefaultMappings.cpp:94-102) at a
+25% axis threshold (GlobalSDLDeviceSettings.cpp:11, MAX_AXIS_RANGE 85), so every
+turn flick crossed the C threshold (21) a frame or two BEFORE it crossed the
+snap threshold (51) and was still holding C when the snap disarmed. C-left /
+C-right / C-up put Link into item use, first-person aiming or the ocarina --
+states that eat the left stick and the face buttons -- while Play_Draw kept
+running, which is precisely why turning was the only control that still worked.
+
+The fix belongs at the ONE merged snapshot (spec D9), which is overlay 0039's
+block in graph.c right after GameState_ReqPadData: see gen-patch-0039.py rev3.
+rev2 of THIS patch simply deletes the detector, leaving Play_Draw to compute the
+anchor and nothing else.
+
+rev3 (VR R16 part B) -- A RETURN IS NOT AN ENTRY. the user, wearing 1.0.1.20:
+"running forward, stop, pause, unpause -- it always flips me around."
+
+The chain, and every link of it is in this tree. Overlay 0039 latches
+gSohVRFlatLatch while pauseCtx.state != 0, so first person DROPS for the whole
+pause -- this block is gated on the latch being 0. On unpause the latch falls,
+sohVRFp goes 0 -> 1, and rev1's rising edge bumped gSohVRFpEntered
+unconditionally. The shell consumes that counter as a height calibration, and
+the calibration used to zero sohvr_turnYaw as well. turnYaw 0 is not "no
+change": it is an ABSOLUTE compass direction -- "the wearer's forward is the
+game's -Z" -- so a player running north was turned exactly 180 degrees, and
+overlay 0042's facing pin then turned Link's body to match. Every far-camera
+flap across the 1200/720 hysteresis did the same thing.
+
+The yaw half of that is fixed in the shell (SohImmersive.m: the calibration
+re-seats the room ORIGIN only; the yaw is reset by the explicit recenter and by
+VR entry, and by nothing else). The half that belongs HERE is that those two
+returns were never entries in the first place. rev3 remembers WHY first person
+dropped:
+
+  gSohVRFpEntered  -- still the RISING EDGE OF A GENUINE ENTRY: VR entry, a
+                      fresh scene, first person coming up for the first time.
+  gSohVRFpResumed  -- NEW: first person coming back after it was suspended by
+                      something this block did to itself -- the flat latch
+                      (pause, the kaleido menu, a panel room) or the far-camera
+                      fallback. Counted, so `vr room` still sees every return.
+
+Both make the shell re-seat the room origin (the wearer may genuinely have
+moved during a pause); neither touches the yaw any more.
+
+Gating: every write is inside `gSohVRMode != 0`, so the flat window, the 3D
+panel and every iPhone build execute nothing but one integer test per tick.
+__IOS__-only; the macOS build compiles the block with gSohVRMode a weak
+constant 0.
+
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -1349,6 +1349,108 @@
+         recapturePauseBuffer = true;
+     }
+     // #endregion
++
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0041, VR-spec D4 / VR-DONOR-MAP 3): the first-person
++     * anchor stack. See the patch header for the five donor scars this
++     * mirrors. Runs once per tick, after Camera_Update, before the display
++     * list for this frame is built. */
++    {
++        extern volatile int gSohVRMode;
++        extern volatile int gSohVRFlatLatch;
++        extern volatile int gSohVRFpActive;
++        extern volatile int gSohVRFpFar;
++        extern volatile int gSohVRFpEntered;
++        extern volatile int gSohVRFpResumed;
++        extern volatile float gSohVRFpAnchor[3];
++        extern volatile float gSohVRFpEyeHeight;
++        extern volatile int gSohVRFpBodyYaw;
++        extern volatile float gSohVRHeadOffsetFwd;
++        extern volatile float gSohVRHeadHeightOffset;
++        extern volatile float gSohVRFpFallbackDist;
++        static int sSohVRFpWasActive = 0;
++        static int sSohVRFpWasFar = 0;
++        /* rev3: why first person is not in force. Set when THIS block withdrew
++         * it (flat latch or far camera), cleared the moment it is back and at
++         * every VR exit, so an entry after a suspension is counted as a resume
++         * and an entry after anything else is counted as an entry. */
++        static int sSohVRFpSuspended = 0;
++        int sohVRFp = 0;
++        if ((gSohVRMode != 0) && (gSohVRFlatLatch == 0)) {
++            Player* sohPlayer = GET_PLAYER(play);
++            Camera* sohCam = GET_ACTIVE_CAM(play);
++            if ((sohPlayer != NULL) && (sohCam != NULL)) {
++                /* (5) far-camera guard, with 0.6x hysteresis. */
++                float sohDx = sohCam->eye.x - sohPlayer->actor.world.pos.x;
++                float sohDy = sohCam->eye.y - sohPlayer->actor.world.pos.y;
++                float sohDz = sohCam->eye.z - sohPlayer->actor.world.pos.z;
++                float sohDist = sqrtf(sohDx * sohDx + sohDy * sohDy + sohDz * sohDz);
++                float sohFar = gSohVRFpFallbackDist;
++                if (sohFar < 100.0f) {
++                    sohFar = 1200.0f;
++                }
++                if (sSohVRFpWasFar) {
++                    sSohVRFpWasFar = (sohDist > (sohFar * 0.6f));
++                } else {
++                    sSohVRFpWasFar = (sohDist > sohFar);
++                }
++                if (!sSohVRFpWasFar) {
++                    /* (2)(3) eye height: standing, then the crawl/horse halving. */
++                    float sohStand = Player_GetHeight(sohPlayer) + gSohVRHeadHeightOffset;
++                    float sohEyeH = sohStand;
++                    if ((sohPlayer->stateFlags2 & PLAYER_STATE2_CRAWLING) ||
++                        (sohPlayer->stateFlags1 & PLAYER_STATE1_ON_HORSE)) {
++                        sohEyeH *= 0.5f;
++                    }
++                    /* (4) body-relative forward offset, rotated by the body yaw. */
++                    float sohYawRad = (float)sohPlayer->actor.shape.rot.y * (3.14159265358979f / 32768.0f);
++                    float sohFwdOff = gSohVRHeadOffsetFwd;
++                    /* (1) actor ROOT, never actor.focus.pos. */
++                    gSohVRFpAnchor[0] =
++                        sohPlayer->actor.world.pos.x + (sinf(sohYawRad) * sohFwdOff);
++                    gSohVRFpAnchor[1] = sohPlayer->actor.world.pos.y + sohEyeH;
++                    gSohVRFpAnchor[2] =
++                        sohPlayer->actor.world.pos.z + (cosf(sohYawRad) * sohFwdOff);
++                    gSohVRFpEyeHeight = sohStand;
++                    gSohVRFpBodyYaw = sohPlayer->actor.shape.rot.y;
++                    sohVRFp = 1;
++                }
++            }
++        } else {
++            sSohVRFpWasFar = 0;
++        }
++        gSohVRFpFar = sSohVRFpWasFar;
++        /* Recenter on the RISING edge of first person (donor :1396-1402). The
++         * shell's recenter captures nothing into steering -- that is the
++         * donor's "walking sideways" scar (VR-DONOR-MAP 4) -- so this is a
++         * pure roomscale re-seat.
++         *
++         * rev3 (VR R16 part B): AND A RETURN IS NOT AN ENTRY. The pause menu
++         * raises 0039's flat latch, which withdraws first person for the whole
++         * pause; the far-camera fallback withdraws it whenever the director's
++         * camera steps past 1200 units. Both come BACK, and rev1 counted both
++         * returns as entries -- which cost the user a 180-degree flip on every
++         * unpause while the shell still zeroed the yaw on that counter. The
++         * suspended returns get their own counter now. See the patch header. */
++        if (sohVRFp && !sSohVRFpWasActive) {
++            if (sSohVRFpSuspended) {
++                gSohVRFpResumed = gSohVRFpResumed + 1;
++            } else {
++                gSohVRFpEntered = gSohVRFpEntered + 1;
++            }
++        }
++        if (sohVRFp) {
++            sSohVRFpSuspended = 0;
++        } else if (gSohVRMode == 0) {
++            /* leaving VR is not a suspension: the next entry is a real one. */
++            sSohVRFpSuspended = 0;
++        } else if ((gSohVRFlatLatch != 0) || sSohVRFpWasFar) {
++            sSohVRFpSuspended = 1;
++        }
++        sSohVRFpWasActive = sohVRFp;
++        gSohVRFpActive = sohVRFp;
++    }
++#endif
+ 
+     OPEN_DISPS(gfxCtx);
+ 

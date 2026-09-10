@@ -39,8 +39,20 @@ int Soh_Get3DMode(void) {
 }
 
 // Engine -> compositor bridge globals also live in SohIosShell.m.
-extern void* volatile gSoh3DEyeTexture[2];
+extern void* volatile gSoh3DEyeTexture[3];
+extern void* volatile gSoh3DEyeDepthTexture[3];
 extern volatile int gSoh3DEyeFrames[2];
+
+// R1 depth handoff (VR-spec D2): the eye's DEPTH texture, published by 0031
+// rev13 on the same GPU completion as its colour texture. Gated on the same
+// per-eye rendered flag for the same reason — before the first draw it is
+// undefined garbage, and undefined DEPTH reprojects the world into a smear.
+void* Soh3D_GetEyeDepthMTLTexture(int eye) {
+    if (eye < 1 || eye > 2) {
+        return NULL;
+    }
+    return gSoh3DEyeFrames[eye - 1] > 0 ? gSoh3DEyeDepthTexture[eye - 1] : NULL;
+}
 
 void* Soh3D_GetEyeMTLTexture(int eye) {
     if (eye < 1 || eye > 2) {
@@ -146,6 +158,8 @@ void Soh_RequestWindowSize(CGSize size) { // non-static: restore controller re-r
     }
 }
 
+extern volatile int gSohVRMode;
+
 static void Soh_SetCurtain(bool show) {
     UIWindow* w = Soh_KeyGameWindow();
     if (show) {
@@ -156,7 +170,7 @@ static void Soh_SetCurtain(bool show) {
         v.backgroundColor = UIColor.blackColor;
         v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         UILabel* l = [[UILabel alloc] initWithFrame:v.bounds];
-        l.text = @"Playing in 3D";
+        l.text = gSohVRMode ? @"Playing in VR" : @"Playing in 3D";
         l.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
         l.font = [UIFont systemFontOfSize:28 weight:UIFontWeightSemibold];
         l.textAlignment = NSTextAlignmentCenter;
@@ -230,13 +244,14 @@ void Soh_Enter3D(bool on) {
         }
         NSLog(@"[SohHost] exiting 3D: stopping render thread first");
         gSoh3DStop = 1;
+        gSohVRStop = 1; // whichever loop is live must leave the layerRenderer
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             // Wait for the loop to leave the layerRenderer (2 s timeout — it
             // paces at the compositor cadence, so this is normally <30 ms).
-            for (int i = 0; i < 200 && gSoh3DRunning; i++) {
+            for (int i = 0; i < 200 && (gSoh3DRunning || gSohVRRunning); i++) {
                 usleep(10 * 1000);
             }
-            if (gSoh3DRunning) {
+            if (gSoh3DRunning || gSohVRRunning) {
                 NSLog(@"[SohHost] WARNING: render thread still running at dismiss");
             }
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -244,6 +259,54 @@ void Soh_Enter3D(bool on) {
             });
         });
     }
+}
+
+// VR-spec D1 (round R0): entering VR reuses the SAME engine/window
+// sequencing as the 3D panel (engine offscreen first, park + curtain after the
+// transition settles) — only the immersive SPACE differs, and the Swift side
+// picks it from gSohVRMode. Soh3D's space and its configuration are untouched.
+//
+// R1 (spec D9): the enhancement CVars VR overrides (VR-DONOR-MAP §5b) are
+// stashed-then-overridden on the way in and given back on the way out, with the
+// stash written to the config synchronously so a SIGKILL in VR cannot leave a
+// user's flat game permanently altered (overlay 0040).
+extern void SohIos_VRApplyEnhancementCVars(int on);
+void Soh_EnterVR(bool on) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ Soh_EnterVR(on); });
+        return;
+    }
+    if (on) {
+        if (gSoh3DMode) {
+            return; // already immersive (panel or VR) — exit first, D1's dismiss-then-open
+        }
+        SohIos_VRApplyEnhancementCVars(1); // BEFORE the mode flag: the engine
+                                           // must never render one VR frame
+                                           // with a pre-rendered 2D backdrop
+        gSohVRMode = 1; // set BEFORE the space opens: Swift reads it to pick the id
+    } else if (!gSohVRMode) {
+        return; // spec D1's tri-state: leaving VR never touches the 3D panel
+    }
+    Soh_Enter3D(on);
+    // gSohVRMode is cleared in Soh_Exit3DFinalize, after the space is dismissed.
+}
+
+// R2a: a room-mode change taken mid-session. The 3DSceneRender enhancement
+// installs its hooks through RegisterShipInitFunc, so setting the CVar is not
+// enough — ShipInit::Init has to re-run, which is what the overlay-0040 helper
+// does. Restore-then-override rather than a partial poke: the stash stays the
+// single description of "what the user's own settings were", and it is written
+// synchronously at both ends (spec D9's crash-safe rule).
+void SohVR_ReapplyRoomMode(void) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ SohVR_ReapplyRoomMode(); });
+        return;
+    }
+    if (!gSohVRMode) {
+        return; // nothing overridden outside VR
+    }
+    SohIos_VRApplyEnhancementCVars(0);
+    SohIos_VRApplyEnhancementCVars(1);
 }
 
 // Live stereo tuning from the SwiftUI sheet: CVar-backed (the eye passes
@@ -260,8 +323,25 @@ void Soh3D_SetStereoParams(float depthFrac, float convBias) {
 }
 
 void Soh_Exit3DFinalize(void) {
-    NSLog(@"[SohHost] 3D exit finalized — engine back onscreen");
+    // spec D9: IDEMPOTENT. Crown dismissal, the ornament and the console can
+    // all reach here for the same exit, and running the restore controller
+    // twice re-captures a parked window size as the "pre-3D" one — the historic
+    // "window stays tiny" trap.
+    if (!gSoh3DMode && !gSohVRMode) {
+        NSLog(@"[SohHost] exit finalize ignored — already flat");
+        return;
+    }
+    NSLog(@"[SohHost] %s exit finalized — engine back onscreen", gSohVRMode ? "VR" : "3D");
+    int wasVR = gSohVRMode;
     gSoh3DMode = 0;
+    gSohVRMode = 0; // VR-spec D1: cleared only after the space is dismissed
+    if (wasVR) {
+        // Give the user's own enhancement settings back, and write the config
+        // SYNCHRONOUSLY — iOS swipe-kill is SIGKILL and the desktop
+        // write-on-quit never runs ( / D9).
+        SohIos_VRApplyEnhancementCVars(0);
+        CVarSave();
+    }
     Soh_SetCurtain(false);
     // Restore to the EXACT size captured before entering 3D (predecessor
     // ports' pattern) — the controller requests the geometry, waits for the

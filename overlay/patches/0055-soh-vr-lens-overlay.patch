@@ -1,0 +1,683 @@
+Overlay patch 0055 (VR R18 part B): THE LENS OF TRUTH, IN A HEADSET.
+
+the user, on 1.0.1.22: "I select it; it should show the same red interface with a
+circle like vanilla."
+
+WHAT WAS ALREADY TRUE, and had to be established before writing a line: the lens
+mask IS drawn in VR, per eye, and no gate skips it. Actor_DrawLensOverlay /
+Actor_DrawLensActors (this file) emit two gSPWideTextureRectangle of the 64x64 I8
+gLensOfTruthMaskTex into POLY_XLU_DISP -- the WORLD list -- so overlay 0043's HUD
+detachment never touches them, and the toggle itself is reachable in VR through
+overlay 0051's item compass writing the item's own C button. Three things,
+none of them "the lens is missing", made it not read as vanilla's lens:
+
+  (i)  IT WAS AN OVAL WITH CLIPPED SIDES. That is overlay 0031 rev20's fix and
+       not this patch's: the display list is built while mCurDimensions is still
+       the HUD pass's 4:3 1600x1200, so OTRGetRectDimensionFromLeftEdge(0) is 0
+       and the rect already spans the whole field -- and then
+       AdjXForAspectRatio multiplied its edges by (4/3)/eye_aspect anyway. See
+       0031's header; that fix un-stretches every world-list screen-space rect
+       and the world's own geometry with it.
+  (ii) THE TINT READ AS NOTHING. Vanilla's mask alpha peaks at 74/255 and its
+       combiner (G_CC_MODULATEIA_PRIM) spends that same 74 on the COLOUR too, so
+       the ring is a 29 %-opaque 29 %-bright red. On a television that is a
+       tint; over a ~1900 px eye at 100 degrees it is nearly invisible.
+  (iii) IT HANDED THE COMPOSITOR A NEAR-PLANE FIELD. Vanilla's first pass sets
+       gDPSetPrimDepth(0, 0) -- the NEAR plane -- with Z_UPD across everything
+       the mask covers, because that is how it clips the invisible actors to the
+       circle. 0031 rev13 publishes the eye's DEPTH texture to the compositor
+       for reprojection, so with the lens on, the compositor was reprojecting a
+       large part of the view as if it were centimetres from the wearer's face.
+
+THE OVERLAY THIS PATCH ADDS: Actor_VrDrawLensOverlay, branched in at BOTH call
+sites of Actor_DrawLensOverlay -- the depth pass and the colour pass -- so the
+hole in the depth mask and the hole in the tint are the SAME hole by
+construction. #ifdef __IOS__, and behaviourally gated on
+`gSohVRMode != 0 && gSohVRFlatLatch == 0`, the same predicate every other VR
+overlay uses for "this frame's list belongs in the world". Everything else --
+the oracle, iPhone, VR's own flat-screen frames, the pause menu -- takes
+vanilla's function, byte for byte.
+
+GEOMETRY, DERIVED RATHER THAN TUNED. One rect, from
+OTRGetRectDimensionFromLeftEdge(0) to OTRGetRectDimensionFromRightEdge(
+SCREEN_WIDTH): those two helpers are exactly the pair whose output spans the
+field edge to edge under whatever aspect the list was built with, which is why
+using them (rather than a hard 0..SCREEN_WIDTH) keeps this correct with the HUD
+plane on OR off -- `vr set hudplane 0` is the A/B for 0031's half and must not
+change the lens's half. The circle is kept ROUND in the eye by scaling s and t
+independently:
+
+    Dv = 2*LENS_MASK_HEIGHT * SCREEN_HEIGHT / (SCREEN_HEIGHT - 2*LENS_MASK_OFFSET_T)
+    Dh = Dv * built_aspect / eye_aspect
+
+-- Dv is vanilla's OWN vertical diameter re-derived from its own constants (128
+texels of tile spread over 140 of the 240 screen rows), and Dh is the width that
+makes the circle physically round given that the field is `eye_aspect` wide and
+1 tall while its coordinates are `built_aspect` wide and 1 tall. The tile is
+centred on the field centre by arithmetic (the tile's own s/t centre minus the
+rate times the distance to the rect's left/top edge), so nothing here is a
+magic offset. `vr set lensscale` (0.3 .. 2.0, default 1.0 = vanilla's
+proportion) exists because a headset's field is far wider than a television's
+and no one has WORN vanilla's proportion in one.
+
+THE TINT: `vr set lenstint` (1.0 .. 6.0, default 2.2), realised as repeated
+passes of the same rect, with a combiner that spends the mask on the ALPHA only
+and takes the colour from PRIMITIVE:
+
+    colour = PRIMITIVE                       (a real red, not 29 % of one)
+    alpha  = TEXEL0 * PRIMITIVE              (the mask, times this pass's alpha)
+
+so opacity accumulates as 1 - (1 - a)^n: 29 % at vanilla, about 53 % at the
+shipped 2.2. THE CENTRE STAYS CLEAR BY CONSTRUCTION rather than by clamping --
+the mask is 0 inside the circle, G_AC_THRESHOLD discards a zero-alpha fragment,
+and zero stays zero however many times it is drawn. The FIRST pass is always
+full alpha, which matters at the depth site: it is the pass whose fragments
+write the depth mask, and it must cover exactly what vanilla's covered.
+
+THE DEPTH (item iii): `vr set lenszfar` (default 1). AFTER the invisible-actor
+loop and the colour pass -- i.e. after everything that USES vanilla's near-plane
+mask has used it -- the same masked region is re-written at prim depth 0x7FFF,
+the FAR plane, through vanilla's own "update the z-buffer but not the color
+frame buffer" mode (which Fast3D recognises as its `invisible` shader option, so
+no pixel changes colour). The actor clipping is untouched because it happened
+first; what changes is only what the compositor is handed. HONEST COST, and it
+is why there is a dial: vanilla's near-plane field also rejects anything drawn
+LATER in the frame at those pixels, and a far field lets such a draw through. 0
+restores vanilla exactly.
+
+Storage rule as ever: every gSohVRLens* global is DEFINED in app/ios/SohIosShell.m
+and only externed here, so no overlay owns storage and the oracle links.
+
+REV 2 -- R19 PART B (D-073): THE RECT WAS DRAWN TWICE AND FUSED NOWHERE.
+
+the user, on 1.0.1.23: "I see doubled red circles in my eyes; it should be ONE
+oval open space surrounded by red."
+
+Two circles is what a SCREEN-SPACE rect must produce in this headset, and the
+reason is arithmetic in two parts:
+
+  (a) ZERO DISPARITY. A texrect lands at the same PIXELS in both eyes. Overlay
+      0031's Soh3DStereoP substitutes the per-eye view*projection at the MP
+      sites -- it never touches an orthographic screen-space draw -- so eye 0
+      and eye 1 get identical pixels. Identical pixels fuse at INFINITY, while
+      everything else in the frame fuses at its own distance. The wearer's
+      vergence cannot serve both, so one of them doubles.
+  (b) THE CENTRE OF THE FIELD IS NOT THE GAZE AXIS. This device's per-eye frusta
+      are strongly asymmetric -- measured on the drawable, the left eye's
+      tangents are (L -1.7321, R 1.0), i.e. NDC x = 0 sits about 8 degrees
+      temporal of straight ahead, and the right eye's asymmetry is the MIRROR of
+      it. A rect centred on the field is therefore centred several degrees off
+      axis in OPPOSITE directions per eye: the two images are not merely at the
+      wrong depth, they are pulled apart horizontally.
+
+THE FIX IS TO STOP DRAWING IN SCREEN SPACE. Actor_VrLensQuad draws the same mask
+as a HEAD-LOCKED WORLD QUAD in POLY_XLU at gSohVRLensDist metres (default 1.5)
+in front of the head, using the head pose the shell already publishes in GAME
+units for exactly this class of problem (gSohVRCamEye / gSohVRCamFwd /
+gSohVRCamUp / gSohVRCamValid, overlay 0037's unification). Both eyes then look
+at the SAME WORLD POINT, so the circle fuses where the wearer's eyes converge
+and lands on the gaze axis in both eyes BY CONSTRUCTION -- the per-eye frustum
+asymmetry is now the projection's business, which is precisely where it belongs.
+The basis is fully 3D (right = normalize(fwd x up), up2 = right x fwd), so a
+head ROLL rotates the quad with the head and the circle stays a circle. The mask
+is radially symmetric, so the handedness of that cross product is unobservable
+-- a mirrored circle is the same circle.
+
+THE SIZE, AND THE ONE NUMBER THAT WAS MEASURED RATHER THAN ASSUMED. The mask's
+circle is not the whole texture. Reading the shipped resource out of the
+extracted archive (objects/gameplay_keep/gLensOfTruthMaskTex, 64x64 I8, value 74
+outside the circle and 0 inside, MIRROR|CLAMP so the 64 texels are a QUARTER of
+the mask with the circle's centre at the corner (63,63)), the 74->0 boundary
+sits at radius 54.2 .. 55.1 texels, i.e. **54.8**, sampled every fourth row.
+That is the number the screen-space rect never had to know, because it inherited
+vanilla's rates. In tile coordinates the mirror centre is 63.5 and the tile is
+128 texels, which vanilla spreads over Dv = 2*64*240/140 = 219.43 screen rows,
+so vanilla's circle radius is 54.8/128 * 219.43 = 93.95 rows out of the 120-row
+half field: **0.7828 of the vertical half field**, which is the proportion this
+quad reproduces:
+
+    D    = clamp(gSohVRLensDist, 0.4, 4.0) * gSohVRWorldScale     (game units)
+    tv   = max(|tanT|, |tanB|) over both eyes  (gSohVREyeTan, published by the
+           shell this round; 1.0 if it has not arrived)
+    r_c  = 0.7828 * D * tv * gSohVRLensScale                      (game units)
+    H    = 3.0 * D                        (the quad's half extent; oversize)
+    k    = 54.8 / r_c                     (texels per game unit)
+    tc   = (63.5 +/- H*k - 0.5 + tile origin) << 5                (S10.5)
+
+H is deliberately three times the distance -- far larger than the frustum's own
+1.73 * D -- because the tile is MIRROR|CLAMP and Fast3D's clamp is a shader
+clamp to the tile's 128 texels, so everything past the circle is the same flat
+red field and oversizing it simply guarantees no edge of the quad can enter the
+view at any head roll. The 0.5 is Fast3D's own bilerp offset, which it adds to a
+TRIANGLE's texture coordinates and not to a rect's (interpreter.cpp: "Linear
+filter adds 0.5f to the coordinates ... if (!is_rect)"). H is capped so the
+largest texture coordinate stays inside s16 at the tightest legal dials
+(lensscale 0.3 with a narrow field), and the cap is far away from anything a
+real headset produces.
+
+BOTH CALL SITES AND THE FAR-DEPTH WRITE GO THROUGH THE SAME QUAD, because the
+branch is the first thing Actor_VrDrawLensOverlay does. That is not tidiness: the
+depth pass writes PRIM depth (G_ZS_PRIM), so the geometry it is drawn with
+changes only its FOOTPRINT, and routing it through the quad makes the hole in
+the depth mask coincide with the visible circle PER EYE by construction. A
+screen-space depth mask with a world-space tint would have clipped the invisible
+actors to a circle that is not where either eye sees one.
+
+THE KNOWN COST, SAID OUT LOUD: the head pose is sampled when the display list is
+BUILT, i.e. at the game's tick rate, and the quad's anchor rides a recorded
+matrix so frame interpolation glides it -- but interpolation is a lerp between
+two sampled poses, not a fresh pose, so a fast head turn can make the vignette
+swim slightly behind the head. If that reads badly in the headset the fallback
+is a shell-side Metal disc composited after the eye pass (which needs a depth
+state that does not write depth); it is NOT implemented this round, and the
+one-command A/B is `vr set lensworld 0`, which restores the screen-space rect
+byte for byte.
+
+
+--- a/soh/src/code/z_actor.c
++++ b/soh/src/code/z_actor.c
+@@ -2854,10 +2854,455 @@
+     gSPWideTextureRectangle(POLY_XLU_DISP++, 0, 0, w, SCREEN_HEIGHT << 2, G_TX_RENDERTILE, LENS_MASK_OFFSET_S << 5,
+                             LENS_MASK_OFFSET_T << 5, (1 << 10) * (SCREEN_WIDTH - 2 * LENS_MASK_OFFSET_S) / SCREEN_WIDTH,
+                             (1 << 10) * (SCREEN_HEIGHT - 2 * LENS_MASK_OFFSET_T) / SCREEN_HEIGHT);
++    gDPPipeSync(POLY_XLU_DISP++);
++    CLOSE_DISPS(gfxCtx);
++}
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0055, VR R18 part B, D-071): THE LENS OF TRUTH IN VR.
++ *
++ * the user, on 1.0.1.22: "I select it; it should show the same red interface with
++ * a circle like vanilla."
++ *
++ * The mask was never missing -- it is drawn per eye out of the WORLD list, which
++ * overlay 0043's HUD detachment does not touch. What was wrong was its SHAPE
++ * (fixed in overlay 0031 rev20, which corrects AdjXForAspectRatio to the aspect
++ * the display list was BUILT with instead of the pass being rendered), its
++ * STRENGTH (74/255 of alpha AND of colour, which over a ~1900 px eye is very
++ * nearly nothing), and the NEAR-PLANE depth field it left for the compositor to
++ * reproject. This function is the second and third of those. See the patch
++ * header for the derivation of every number below.
++ *
++ * Every one of these globals is DEFINED in app/ios/SohIosShell.m. */
++extern volatile int gSohVRMode;
++extern volatile int gSohVRFlatLatch;
++extern volatile int gSoh3DEyeW, gSoh3DEyeH;
++extern volatile int gSohVRLensZFar;
++extern volatile int gSohVRLensDraws;
++extern volatile int gSohVRLensPasses;
++extern volatile float gSohVRLensTint;
++extern volatile float gSohVRLensScale;
++/* R19 part B (D-073): the mask as a head-locked WORLD quad. */
++extern volatile int gSohVRLensWorld;
++extern volatile float gSohVRLensDist;
++extern volatile float gSohVRWorldScale;
++extern volatile int gSohVRCamValid;
++extern volatile float gSohVRCamEye[3];
++extern volatile float gSohVRCamFwd[3];
++extern volatile float gSohVRCamUp[3];
++extern volatile float gSohVREyeTan[2][4]; /* [eye][L,R,B,T] */
++
++/* VR GAMEPLAY, not merely VR: gSohVRFlatLatch is the same predicate overlays
++ * 0031, 0039 and 0043 use for "this frame's display list belongs in the world
++ * rather than on the flat panel". A menu frame keeps vanilla's rect. */
++static s32 Actor_VrLensActive(void) {
++    return (gSohVRMode != 0) && (gSohVRFlatLatch == 0);
++}
++
++/* ------------------------------------------------------------------------
++ * R19 part B (D-073): THE MASK AS A HEAD-LOCKED WORLD QUAD.
++ *
++ * the user, on 1.0.1.23: "I see doubled red circles in my eyes; it should be ONE
++ * oval open space surrounded by red." A screen-space texrect lands at identical
++ * PIXELS in both eyes (overlay 0031 substitutes the per-eye view*projection at
++ * the MP sites and never touches an orthographic draw), so it carries zero
++ * disparity and fuses at infinity -- and this device's per-eye frusta are
++ * asymmetric, so the centre of the field is several degrees off the gaze axis in
++ * OPPOSITE directions per eye. Two circles, pulled apart. Drawn in the WORLD at
++ * gSohVRLensDist metres instead, both eyes see the SAME POINT and the circle
++ * fuses on the gaze axis by construction. See the patch header for every number
++ * below, including the 54.8-texel circle radius measured off the shipped
++ * gLensOfTruthMaskTex resource.
++ * --------------------------------------------------------------------- */
++/* The mask tile: 128 texels of MIRROR|CLAMP whose mirror centre is 63.5, with
++ * the circle's 74->0 boundary at 54.8 texels from that centre (measured). */
++#define SOH_LENS_TEX_CTR 63.5f
++#define SOH_LENS_TEX_RAD 54.8f
++/* Vanilla's own proportion of the vertical HALF field, re-derived:
++ * (54.8 / 128) * (2*LENS_MASK_HEIGHT * SCREEN_HEIGHT /
++ * (SCREEN_HEIGHT - 2*LENS_MASK_OFFSET_T)) / (SCREEN_HEIGHT / 2) = 0.7828. */
++#define SOH_LENS_VR_FRAC 0.7828f
++/* The quad's half extent, in multiples of its distance. The frustum's own
++ * widest tangent on this device is 1.7321, so 3.0 cannot be reached by any
++ * corner of the view at any head roll; the flat red field extends by the tile's
++ * clamp, so oversize costs nothing but the two triangles. */
++#define SOH_LENS_VR_EXTENT 3.0f
++/* Texture coordinates are s16 in S10.5, and the tile origin (96 in s, 56 in t)
++ * is added before the shift -- so the largest texel offset that cannot overflow
++ * is (32767/32) - 96 - 63.5 = 864. 850 keeps a margin there while still
++ * leaving the quad wider than the frustum's own widest tangent at the tightest
++ * legal dials (lensscale 0.3 into a narrow field); at anything a headset
++ * actually reports the cap is not reached at all and H is the full 3 * D. */
++#define SOH_LENS_TEX_MAX 850.0f
++
++static Vtx sSohVrLensVtx[4];
++
++/* The vertical half-tangent of the eye's field. ONE display list is rasterised
++ * into BOTH eyes, so this cannot be per-eye: the max is taken, which errs
++ * towards a slightly larger circle rather than a clipped one. */
++static f32 Actor_VrLensTanV(void) {
++    f32 sohTv = 0.0f;
++    s32 sohEye;
++    s32 sohI;
++
++    for (sohEye = 0; sohEye < 2; sohEye++) {
++        for (sohI = 2; sohI < 4; sohI++) {
++            f32 sohA = gSohVREyeTan[sohEye][sohI];
++
++            if (sohA < 0.0f) {
++                sohA = -sohA;
++            }
++            if (sohA > sohTv) {
++                sohTv = sohA;
++            }
++        }
++    }
++    if (!(sohTv > 0.05f) || (sohTv > 8.0f)) {
++        sohTv = 1.0f; /* the shell has not published yet, or published nonsense */
++    }
++    return sohTv;
++}
++
++static void Actor_VrLensQuad(GraphicsContext* gfxCtx, s32 sohTinted) {
++    f32 sohScale;
++    f32 sohTint;
++    f32 sohRemain;
++    f32 sohWs;
++    f32 sohDist;
++    f32 sohD;
++    f32 sohTv;
++    f32 sohRc;
++    f32 sohK;
++    f32 sohH;
++    f32 sohOff;
++    f32 sohLen;
++    Vec3f sohFwd;
++    Vec3f sohUp;
++    Vec3f sohRight;
++    Vec3f sohUp2;
++    Vec3f sohAt;
++    s32 sohPasses;
++    s32 sohPass;
++    s32 sohAlpha;
++    s32 sohS0;
++    s32 sohS1;
++    s32 sohT0;
++    s32 sohT1;
++    s32 sohI;
++
++    /* --- the head's basis, in game units (overlay 0037's publication) ----- */
++    sohFwd.x = gSohVRCamFwd[0];
++    sohFwd.y = gSohVRCamFwd[1];
++    sohFwd.z = gSohVRCamFwd[2];
++    sohLen = sqrtf((sohFwd.x * sohFwd.x) + (sohFwd.y * sohFwd.y) + (sohFwd.z * sohFwd.z));
++    if (!(sohLen > 1e-4f)) {
++        return;
++    }
++    sohFwd.x /= sohLen;
++    sohFwd.y /= sohLen;
++    sohFwd.z /= sohLen;
++    sohUp.x = gSohVRCamUp[0];
++    sohUp.y = gSohVRCamUp[1];
++    sohUp.z = gSohVRCamUp[2];
++    /* right = fwd x up, up2 = right x fwd. FULLY 3D on purpose: a head roll
++     * must roll the quad, or the circle shears into an oval. The mask is
++     * radially symmetric, so which way round the cross product goes is
++     * unobservable. */
++    sohRight.x = (sohFwd.y * sohUp.z) - (sohFwd.z * sohUp.y);
++    sohRight.y = (sohFwd.z * sohUp.x) - (sohFwd.x * sohUp.z);
++    sohRight.z = (sohFwd.x * sohUp.y) - (sohFwd.y * sohUp.x);
++    sohLen = sqrtf((sohRight.x * sohRight.x) + (sohRight.y * sohRight.y) + (sohRight.z * sohRight.z));
++    if (!(sohLen > 1e-4f)) {
++        return; /* looking exactly along up: no basis, and no frame to draw */
++    }
++    sohRight.x /= sohLen;
++    sohRight.y /= sohLen;
++    sohRight.z /= sohLen;
++    sohUp2.x = (sohRight.y * sohFwd.z) - (sohRight.z * sohFwd.y);
++    sohUp2.y = (sohRight.z * sohFwd.x) - (sohRight.x * sohFwd.z);
++    sohUp2.z = (sohRight.x * sohFwd.y) - (sohRight.y * sohFwd.x);
++
++    /* --- the distance, the circle, and the texture rate ------------------- */
++    sohWs = gSohVRWorldScale;
++    if (!(sohWs > 1.0f)) {
++        sohWs = 34.0f;
++    }
++    sohDist = gSohVRLensDist;
++    if (!(sohDist > 0.4f)) {
++        sohDist = 0.4f;
++    }
++    if (sohDist > 4.0f) {
++        sohDist = 4.0f;
++    }
++    sohD = sohDist * sohWs;
++
++    sohScale = gSohVRLensScale;
++    if (!(sohScale > 0.3f)) {
++        sohScale = 0.3f;
++    }
++    if (sohScale > 2.0f) {
++        sohScale = 2.0f;
++    }
++
++    sohTv = Actor_VrLensTanV();
++    sohRc = SOH_LENS_VR_FRAC * sohD * sohTv * sohScale;
++    if (!(sohRc > 1e-3f)) {
++        return;
++    }
++    sohK = SOH_LENS_TEX_RAD / sohRc;
++    sohH = SOH_LENS_VR_EXTENT * sohD;
++    if ((sohH * sohK) > SOH_LENS_TEX_MAX) {
++        sohH = SOH_LENS_TEX_MAX / sohK; /* s16 texture coordinates, not taste */
++    }
++    sohOff = sohH * sohK;
++
++    sohAt.x = gSohVRCamEye[0] + (sohFwd.x * sohD);
++    sohAt.y = gSohVRCamEye[1] + (sohFwd.y * sohD);
++    sohAt.z = gSohVRCamEye[2] + (sohFwd.z * sohD);
++
++    /* Fast3D subtracts the tile origin and adds half a texel to a TRIANGLE's
++     * coordinates (it does not to a rect's), so both are undone here. */
++    sohS0 = (s32)(((SOH_LENS_TEX_CTR - sohOff - 0.5f) + (f32)(SCREEN_WIDTH / 2 - LENS_MASK_WIDTH)) * 32.0f);
++    sohS1 = (s32)(((SOH_LENS_TEX_CTR + sohOff - 0.5f) + (f32)(SCREEN_WIDTH / 2 - LENS_MASK_WIDTH)) * 32.0f);
++    sohT0 = (s32)(((SOH_LENS_TEX_CTR - sohOff - 0.5f) + (f32)(SCREEN_HEIGHT / 2 - LENS_MASK_HEIGHT)) * 32.0f);
++    sohT1 = (s32)(((SOH_LENS_TEX_CTR + sohOff - 0.5f) + (f32)(SCREEN_HEIGHT / 2 - LENS_MASK_HEIGHT)) * 32.0f);
++
++    /* Local space: the matrix below puts the origin at sohAt. */
++    for (sohI = 0; sohI < 4; sohI++) {
++        f32 sohSx = ((sohI & 1) != 0) ? sohH : -sohH;
++        f32 sohSy = ((sohI & 2) != 0) ? -sohH : sohH;
++
++        sSohVrLensVtx[sohI].v.ob[0] = (s16)((sohRight.x * sohSx) + (sohUp2.x * sohSy));
++        sSohVrLensVtx[sohI].v.ob[1] = (s16)((sohRight.y * sohSx) + (sohUp2.y * sohSy));
++        sSohVrLensVtx[sohI].v.ob[2] = (s16)((sohRight.z * sohSx) + (sohUp2.z * sohSy));
++        sSohVrLensVtx[sohI].v.flag = 0;
++        sSohVrLensVtx[sohI].v.tc[0] = (s16)(((sohI & 1) != 0) ? sohS1 : sohS0);
++        sSohVrLensVtx[sohI].v.tc[1] = (s16)(((sohI & 2) != 0) ? sohT1 : sohT0);
++        sSohVrLensVtx[sohI].v.cn[0] = 255;
++        sSohVrLensVtx[sohI].v.cn[1] = 255;
++        sSohVrLensVtx[sohI].v.cn[2] = 255;
++        sSohVrLensVtx[sohI].v.cn[3] = 255;
++    }
++
++    OPEN_DISPS(gfxCtx);
++
++    /* The same tile as the screen-space path, so the depth site's combiner --
++     * which the caller owns and which reads TEXEL0 -- sees the same texels. */
++    gDPLoadTextureBlock(POLY_XLU_DISP++, gLensOfTruthMaskTex, G_IM_FMT_I, G_IM_SIZ_8b, LENS_MASK_WIDTH,
++                        LENS_MASK_HEIGHT, 0, G_TX_MIRROR | G_TX_CLAMP, G_TX_MIRROR | G_TX_CLAMP, 6, 6, G_TX_NOLOD,
++                        G_TX_NOLOD);
++    gDPSetTileSize(POLY_XLU_DISP++, G_TX_RENDERTILE, (SCREEN_WIDTH / 2 - LENS_MASK_WIDTH) << 2,
++                   (SCREEN_HEIGHT / 2 - LENS_MASK_HEIGHT) << 2, (SCREEN_WIDTH / 2 + LENS_MASK_WIDTH - 1) << 2,
++                   (SCREEN_HEIGHT / 2 + LENS_MASK_HEIGHT - 1) << 2);
++
++    /* The anchor rides a RECORDED matrix, so LUS glides the quad at render rate
++     * between two tick-sampled head poses instead of stepping it. Pushed and
++     * popped on both stacks: this function runs in the middle of the frame's
++     * own matrix work and owes it the stack it was handed. Repeated keys are
++     * matched by ORDINAL by frame_interpolation.cpp, so all three lens sites
++     * may share one. */
++    Matrix_Push();
++    FrameInterpolation_RecordOpenChild((const void*)sSohVrLensVtx, 0);
++    Matrix_Translate(sohAt.x, sohAt.y, sohAt.z, MTXMODE_NEW);
++    gSPMatrix(POLY_XLU_DISP++, MATRIX_NEWMTX(gfxCtx), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_PUSH);
++    FrameInterpolation_RecordCloseChild();
++    /* Culling and lighting off: a two-triangle billboard with no normals. Every
++     * Gfx_SetupDL_* the frame runs afterwards loads both back (z_rcp.c). */
++    gSPClearGeometryMode(POLY_XLU_DISP++, G_CULL_BOTH | G_LIGHTING);
++    gSPTexture(POLY_XLU_DISP++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_ON);
++    gSPVertex(POLY_XLU_DISP++, (uintptr_t)&sSohVrLensVtx[0], 4, 0);
++
++    sohTint = gSohVRLensTint;
++    if (!(sohTint > 1.0f)) {
++        sohTint = 1.0f;
++    }
++    if (sohTint > 6.0f) {
++        sohTint = 6.0f;
++    }
++    sohPasses = (sohTinted != 0) ? (s32)(sohTint + 0.98f) : 1;
++    for (sohPass = 0; sohPass < sohPasses; sohPass++) {
++        if (sohTinted != 0) {
++            /* Identical to the screen-space path: colour = PRIMITIVE, alpha =
++             * TEXEL0 * PRIMITIVE, first pass at full alpha, centre clear by
++             * construction because the mask is 0 there. */
++            sohRemain = sohTint - (f32)sohPass;
++            sohAlpha = (sohRemain >= 1.0f) ? 255 : (s32)(255.0f * sohRemain);
++            if (sohAlpha < 1) {
++                sohAlpha = 1;
++            }
++            gDPSetCombineLERP(POLY_XLU_DISP++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0,
++                              0, PRIMITIVE, 0);
++            gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, 255, 0, 0, (u8)sohAlpha);
++        }
++        gSP2Triangles(POLY_XLU_DISP++, 0, 1, 2, 0, 2, 1, 3, 0);
++        gSohVRLensDraws = gSohVRLensDraws + 1;
++    }
++    if (sohTinted != 0) {
++        gSohVRLensPasses = sohPasses;
++    }
++    gSPPopMatrix(POLY_XLU_DISP++, G_MTX_MODELVIEW);
++    gDPPipeSync(POLY_XLU_DISP++);
++
++    CLOSE_DISPS(gfxCtx);
++    Matrix_Pop();
++}
++
++/* sohTinted != 0: this is a COLOUR site, so the pass sets its own combiner and
++ * prim colour and repeats itself gSohVRLensTint times. 0: this is the depth
++ * site, whose combiner, prim colour, prim depth and other mode all belong to
++ * the caller and must not be touched -- one rect, exactly one. */
++static void Actor_VrDrawLensOverlay(GraphicsContext* gfxCtx, s32 sohTinted) {
++    f32 sohBuilt;
++    f32 sohEye;
++    f32 sohScale;
++    f32 sohTint;
++    f32 sohRemain;
++    f32 sohDv;
++    f32 sohDh;
++    f32 sohRateS;
++    f32 sohRateT;
++    s32 sohX0;
++    s32 sohX1;
++    s32 sohPasses;
++    s32 sohPass;
++    s32 sohAlpha;
++
++    /* R19 part B (D-073): the WORLD quad, which is the shipped path. Branched
++     * here rather than at the call sites so that BOTH of them and the far-depth
++     * write take it together -- the depth pass writes PRIM depth, so only its
++     * footprint changes, and routing it through the same geometry makes the
++     * hole in the depth mask coincide with the visible circle per eye. `vr set
++     * lensworld 0` is the instant A/B back to the rect below. */
++    if ((gSohVRLensWorld != 0) && (gSohVRCamValid != 0)) {
++        Actor_VrLensQuad(gfxCtx, sohTinted);
++        return;
++    }
++
++    OPEN_DISPS(gfxCtx);
++
++    /* The aspect the GAME laid this list out against (OTRGetAspectRatio is what
++     * OTRGetRectDimensionFrom*Edge below is built on), and the aspect of the eye
++     * it will be rasterised into. With the HUD plane on these differ, which is
++     * the whole reason the circle needs its own s/t rates. */
++    sohBuilt = OTRGetAspectRatio();
++    if (!(sohBuilt > 0.1f)) {
++        sohBuilt = 4.0f / 3.0f;
++    }
++    sohEye = ((gSoh3DEyeW > 0) && (gSoh3DEyeH > 0)) ? ((f32)gSoh3DEyeW / (f32)gSoh3DEyeH) : sohBuilt;
++
++    sohScale = gSohVRLensScale;
++    if (!(sohScale > 0.3f)) {
++        sohScale = 0.3f;
++    }
++    if (sohScale > 2.0f) {
++        sohScale = 2.0f;
++    }
++
++    /* Vanilla's own vertical diameter, re-derived from vanilla's own constants:
++     * 2*LENS_MASK_HEIGHT texels of tile spread over
++     * SCREEN_HEIGHT - 2*LENS_MASK_OFFSET_T screen rows. Dh is then whatever
++     * makes that circle physically ROUND in a field that is sohEye wide and 1
++     * tall while its coordinates are sohBuilt wide and 1 tall. */
++    sohDv = (f32)(2 * LENS_MASK_HEIGHT) * (f32)SCREEN_HEIGHT / (f32)(SCREEN_HEIGHT - 2 * LENS_MASK_OFFSET_T);
++    sohDv *= sohScale;
++    sohDh = sohDv * sohBuilt / sohEye;
++    sohRateS = (f32)(2 * LENS_MASK_WIDTH) / sohDh;
++    sohRateT = (f32)(2 * LENS_MASK_HEIGHT) / sohDv;
++
++    /* EDGE TO EDGE under either aspect: these two helpers exist precisely to
++     * name the field's own edges, so `vr set hudplane 0` (the A/B for 0031's
++     * half of this round) cannot move the lens. */
++    sohX0 = OTRGetRectDimensionFromLeftEdge(0);
++    sohX1 = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH);
++
++    gDPLoadTextureBlock(POLY_XLU_DISP++, gLensOfTruthMaskTex, G_IM_FMT_I, G_IM_SIZ_8b, LENS_MASK_WIDTH,
++                        LENS_MASK_HEIGHT, 0, G_TX_MIRROR | G_TX_CLAMP, G_TX_MIRROR | G_TX_CLAMP, 6, 6, G_TX_NOLOD,
++                        G_TX_NOLOD);
++    gDPSetTileSize(POLY_XLU_DISP++, G_TX_RENDERTILE, (SCREEN_WIDTH / 2 - LENS_MASK_WIDTH) << 2,
++                   (SCREEN_HEIGHT / 2 - LENS_MASK_HEIGHT) << 2, (SCREEN_WIDTH / 2 + LENS_MASK_WIDTH - 1) << 2,
++                   (SCREEN_HEIGHT / 2 + LENS_MASK_HEIGHT - 1) << 2);
++
++    sohTint = gSohVRLensTint;
++    if (!(sohTint > 1.0f)) {
++        sohTint = 1.0f;
++    }
++    if (sohTint > 6.0f) {
++        sohTint = 6.0f;
++    }
++    sohPasses = (sohTinted != 0) ? (s32)(sohTint + 0.98f) : 1;
++    for (sohPass = 0; sohPass < sohPasses; sohPass++) {
++        if (sohTinted != 0) {
++            /* colour = PRIMITIVE, alpha = TEXEL0 * PRIMITIVE. Vanilla's
++             * G_CC_MODULATEIA_PRIM spends the mask on BOTH, which is why its
++             * ring is a 29 % red as well as a 29 %-opaque one. The first pass
++             * is always full alpha: it is the one whose fragments write the
++             * depth mask at the depth site, and it must cover exactly what
++             * vanilla covered. The centre needs no clamp -- the mask is 0
++             * there, G_AC_THRESHOLD discards it, and 0 * anything is 0. */
++            sohRemain = sohTint - (f32)sohPass;
++            sohAlpha = (sohRemain >= 1.0f) ? 255 : (s32)(255.0f * sohRemain);
++            if (sohAlpha < 1) {
++                sohAlpha = 1;
++            }
++            gDPSetCombineLERP(POLY_XLU_DISP++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0,
++                              0, PRIMITIVE, 0);
++            gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, 255, 0, 0, (u8)sohAlpha);
++        }
++        gSPWideTextureRectangle(
++            POLY_XLU_DISP++, sohX0 << 2, 0, sohX1 << 2, SCREEN_HEIGHT << 2, G_TX_RENDERTILE,
++            (s32)((((f32)(SCREEN_WIDTH / 2) - 0.5f) - (((f32)(SCREEN_WIDTH / 2) - (f32)sohX0) * sohRateS)) * 32.0f),
++            (s32)((((f32)(SCREEN_HEIGHT / 2) - 0.5f) - ((f32)(SCREEN_HEIGHT / 2) * sohRateT)) * 32.0f),
++            (s32)(sohRateS * 1024.0f), (s32)(sohRateT * 1024.0f));
++        gSohVRLensDraws = gSohVRLensDraws + 1;
++    }
++    if (sohTinted != 0) {
++        gSohVRLensPasses = sohPasses;
++    }
+     gDPPipeSync(POLY_XLU_DISP++);
+     CLOSE_DISPS(gfxCtx);
+ }
+ 
++/* Item (iii): NEUTRALISE THE NEAR-PLANE FIELD, AFTER EVERYTHING HAS USED IT.
++ * Vanilla writes prim depth 0 (near) with Z_UPD wherever the mask is opaque,
++ * because that is how the invisible actors get clipped to the circle -- and
++ * overlay 0031 rev13 publishes this eye's depth texture to the compositor,
++ * which then reprojects that whole region as if it were at the wearer's nose.
++ * Called at the very END of Actor_DrawLensActors: the actor loop and the colour
++ * pass have both already run, so the clipping is unaffected and only the
++ * compositor's copy changes. The mode is vanilla's own "update the z-buffer but
++ * not the color frame buffer" (Fast3D reads it as its `invisible` shader
++ * option), and the combiner per lens mode is vanilla's own, so the region
++ * re-written is EXACTLY the region vanilla wrote. */
++static void Actor_VrLensDepthFar(PlayState* play, GraphicsContext* gfxCtx) {
++    OPEN_DISPS(gfxCtx);
++
++    gDPPipeSync(POLY_XLU_DISP++);
++    gDPSetOtherMode(POLY_XLU_DISP++,
++                    G_AD_DISABLE | G_CD_MAGICSQ | G_CK_NONE | G_TC_FILT | G_TF_BILERP | G_TT_NONE | G_TL_TILE |
++                        G_TD_CLAMP | G_TP_NONE | G_CYC_1CYCLE | G_PM_NPRIMITIVE,
++                    G_AC_THRESHOLD | G_ZS_PRIM | Z_UPD | IM_RD | CVG_DST_SAVE | ZMODE_OPA | FORCE_BL |
++                        GBL_c1(G_BL_CLR_BL, G_BL_0, G_BL_CLR_MEM, G_BL_1MA) |
++                        GBL_c2(G_BL_CLR_BL, G_BL_0, G_BL_CLR_MEM, G_BL_1MA));
++    if (play->roomCtx.curRoom.lensMode == LENS_MODE_HIDE_ACTORS) {
++        gDPSetCombineMode(POLY_XLU_DISP++, G_CC_MODULATEIA_PRIM, G_CC_MODULATEIA_PRIM);
++        gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, 255, 255, 255, 255);
++    } else {
++        gDPSetCombineLERP(POLY_XLU_DISP++, PRIMITIVE, TEXEL0, PRIM_LOD_FRAC, 0, PRIMITIVE, TEXEL0, PRIM_LOD_FRAC, 0,
++                          PRIMITIVE, TEXEL0, PRIM_LOD_FRAC, 0, PRIMITIVE, TEXEL0, PRIM_LOD_FRAC, 0);
++        gDPSetPrimColor(POLY_XLU_DISP++, 0, 0xFF, 74, 74, 74, 74);
++    }
++    /* 0x7FFF is Fast3D's own far end of the 15-bit prim-depth register
++     * (interpreter.cpp: "N64 prim_depth is 15-bit (0 near, 0x7FFF far)"). */
++    gDPSetPrimDepth(POLY_XLU_DISP++, 0x7FFF, 0);
++
++    Actor_VrDrawLensOverlay(gfxCtx, 0);
++
++    gDPPipeSync(POLY_XLU_DISP++);
++
++    CLOSE_DISPS(gfxCtx);
++}
++#endif /* __IOS__ */
++
+ void Actor_DrawLensActors(PlayState* play, s32 numInvisibleActors, Actor** invisibleActors) {
+     Actor** invisibleActor;
+     GraphicsContext* gfxCtx;
+@@ -2905,6 +3350,16 @@
+     gDPSetPrimDepth(POLY_XLU_DISP++, 0, 0);
+ 
+     // The z-buffer will be updated where the mask is not fully transparent.
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0055, VR R18 part B): the VR rect at BOTH sites, so the
++     * hole in this depth mask and the hole in the tint below are the same hole
++     * by construction. Not tinted here unless this lens mode is the one that
++     * paints its colour in this pass (LENS_MODE_HIDE_ACTORS has no second
++     * pass), because the caller owns this pass's combiner and prim depth. */
++    if (Actor_VrLensActive()) {
++        Actor_VrDrawLensOverlay(gfxCtx, play->roomCtx.curRoom.lensMode == LENS_MODE_HIDE_ACTORS);
++    } else
++#endif
+     Actor_DrawLensOverlay(gfxCtx);
+ 
+     // "Magic lens invisible Actor display START"
+@@ -2934,12 +3389,31 @@
+         gDPSetCombineMode(POLY_XLU_DISP++, G_CC_MODULATEIA_PRIM, G_CC_MODULATEIA_PRIM);
+         gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, 255, 0, 0, 255);
+ 
++#ifdef __IOS__
++        /* SOH_IOS (overlay 0055, VR R18 part B): the tinted VR rect -- see
++         * Actor_VrDrawLensOverlay for why vanilla's 74/255 reads as nothing in
++         * a headset and how `vr set lenstint` raises it. */
++        if (Actor_VrLensActive()) {
++            Actor_VrDrawLensOverlay(gfxCtx, 1);
++        } else
++#endif
+         Actor_DrawLensOverlay(gfxCtx);
+ 
+         gDPNoOpString(POLY_OPA_DISP++, "青い眼鏡(外側)", 1); // "Blue spectacles (exterior)"
+     }
+ 
+     gDPNoOpString(POLY_OPA_DISP++, "魔法のメガネ END", 0); // "Magic lens END"
++
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0055, VR R18 part B, item iii): the near-plane depth
++     * field this function wrote has now been used by the invisible-actor pass
++     * and by the tint; hand the COMPOSITOR the far plane there instead, or it
++     * reprojects the periphery as if it were at the wearer's nose.
++     * `vr set lenszfar 0` restores vanilla exactly. */
++    if (Actor_VrLensActive() && (gSohVRLensZFar != 0)) {
++        Actor_VrLensDepthFar(play, gfxCtx);
++    }
++#endif
+ 
+     CLOSE_DISPS(gfxCtx);
+ }

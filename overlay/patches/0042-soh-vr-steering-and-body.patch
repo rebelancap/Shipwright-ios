@@ -1,0 +1,3047 @@
+Overlay patch 0042: head-relative STEERING, Link's first-person BODY, and
+DIRECT MOVEMENT (VR-spec D4/D6, VR-DONOR-MAP 3 "Link's body" + 4 "Movement
+& heading", whole).
+
+rev21 (VR R20 item 1c, 2026-09-09). the user, wearing 1.0.1.24: the hammer's
+swing came down about the wrong axis and sank the whole weapon, so "the butt of
+the handle hangs on the ground". The shell's fix pivots at the hand and drops
+the grip by nothing -- which means the head now finishes ABOVE the floor on a
+waist-height chop, and vanilla's ground line test stops at the tip. One pure
+addition to func_80842DF4 extends that probe past the tip by gSohVRHammerProbe
+game units, VR + motion hands + hammer only, with vanilla's own surface filters
+and vanilla's own response.
+
+rev20 (VR R19, 2026-09-08). the user, wearing 1.0.1.23: "The Megaton hammer
+works with either trigger and I see the wind/swish animation, but the hammer
+doesn't do the hitting-the-ground swing animation. It stays in my arm,
+upright." R18 restored vanilla's authored hammer swing; the authored swing
+moves the ARM, and the arm in VR is the controller. So the hammer gets what
+R9-R12 built for the sword -- a shell-side envelope that moves the HELD MESH --
+started from a counter bumped at func_80837948, vanilla's one melee-animation
+site, and its ground hit counted at func_80842A28. Nothing about vanilla's
+hammer is reimplemented: the animation, the swish, the quake, the shockwave and
+the melee quads all stay whole, and the quads and the ground line test follow
+the envelope for free because vanilla builds them through the L_HAND limb
+matrix, which is the controller.
+
+rev17 (VR R16, 2026-09-07). Four of the user's reports from wearing 1.0.1.20,
+three of which land in this patch:
+  * THE CROSSHAIR WAS INVISIBLE, and so was vanilla's hookshot reticle, for
+    one reason: Player_DrawHookshotReticle emits to OVERLAY_DISP and overlay
+    0043 detaches the overlay buffer from the world list in VR gameplay to
+    render it as the flat HUD plane. A world-space draw left in it is
+    composited onto a billboard in front of the wearer's face. The VR sites
+    get Player_VrDrawAimReticle -- vanilla's routine, POLY_XLU_DISP -- and
+    the Matrix_Translate(500, 300, 0) rev16 left out (the routine's start
+    point is D_801260C8 = (-500, -100, 0), which vanilla cancels at every one
+    of its own call sites). Three sites now: bow/slingshot, hookshot/longshot
+    (ungated in VR -- a wearer never enters func_8002DD78's aim mode) and the
+    boomerang.
+  * THE BOOMERANG THREW ON THE RELEASE, through vanilla's hold-to-aim, which
+    in a headset is a Z-target-like chirp, a letterbox and a delay. The pull
+    synthesises the release when the aim ray answers; func_80834F2C never
+    enters func_80834EB8; and Player_SetParallel -- NA_SE_SY_ATTENTION_ON, the
+    chirp itself -- is skipped for a VR-aimed throw.
+  * THE GAUNTLET PLATES AND BOOTS FLOATED. Player_DrawImpl emits them after
+    SkelAnime_DrawFlexLod, from the matrices the skeleton left behind, so
+    nulling *dList in the limb override never reached them.
+  * THE WORLD NOW TURNS WITH LINK when the GAME turns him (ladder, ledge,
+    hang). The facing pin stands down in those states by design; nothing
+    followed the 0x8000 snap a descent writes, so the wearer climbed down
+    facing away from the ladder. One writer publishes a delta and a sequence
+    number and the shell eases its own world yaw by it.
+
+rev2 (VR R3, 2026-09-03). the user's 1.0.1.3 verdict was that R2b had moved the
+viewpoint to Link's face and stopped: "if i turn around, i can see a warped
+inside of my body... the only part of my body i should be seeing is probably my
+hands... what you've patch-worked here is basically 3rd person mode except the
+camera is in front of link's face." He is right, and the reason is that rev1
+took the donor's ANCHOR without the two things that make the anchor a first
+person: the body handling (gVrHideBody) and direct movement
+(gVrBodyFollowsHead). rev2 lands DONOR-MAP 3 and 4 whole.
+
+rev12 (VR R11 review fix, 2026-09-06). rev11 introduced Player_VrAttackVoice
+with a sohHard parameter and then passed a literal 0 at both of its call sites,
+so the HEAVY pair -- NA_SE_IT_SWORD_SWING_HARD and NA_SE_VO_LI_SWORD_L -- was
+unreachable through it. Vanilla plays that pair on the THIRD hit of a combo
+(func_80833A20's `unk_845 >= 3`), and the count that feeds it lives in
+func_80837948, inside the authored attack machine rev5 retires for a covered
+weapon. So VR had no combo escalation at all: every press and every arm swing
+was the light pair, forever.
+
+The count is kept in ONE place, Player_VrAttackCombo, which reproduces vanilla's
+own arithmetic (reset when the chain is broken or when the previous attack was
+already the third, then increment, heavy at >= 3) with "the animation differs"
+replaced by "the chain window has expired" -- seven game ticks, the same window
+the B stab already uses for its damage. It is advanced once per tick, consulted
+by the two voiced sites, and RESET both when motion combat stops covering the
+weapon and on a chop, which is what vanilla does too (the jump slash writes a
+different meleeWeaponAnimation, so it breaks the chain).
+
+The Z+A chop is deliberately NOT one of the voiced sites and does not pass
+hard=1: vanilla's own func_8083BA90 ends with
+Player_PlayVoiceSfx(NA_SE_VO_LI_SWORD_L) -- the heavy voice, already -- and it
+runs for every press that produces a chop. Calling Player_VrAttackVoice there
+would be a SECOND voice on one press, which is the thing rev11 was built to
+stop. One press, one voice, at every site.
+
+rev11 (VR R11 verdicts 3 and 5, 2026-09-06). Two of the user's 1.0.1.14 reports,
+both created by rev10, and both about the SAME press:
+
+  * "LINK NO LONGER MAKES THE YELL ON THE BUTTON ATTACK." rev10 let vanilla's
+    Z-target jump slash run again for its leap, and func_8083BA90 ->
+    func_80837948 writes this->meleeWeaponAnimation = PLAYER_MWA_JUMPSLASH_START
+    (17, or 19 on a combo). NOTHING in a VR session writes it back, because every
+    other writer lives inside the authored-attack machine rev5 retires for a
+    covered weapon -- and func_80833A20, the setter rev8 routed the swing sound
+    through, suppresses its VOICE for the whole FLIPSLASH_START..JUMPSLASH_FINISH
+    range (16..19). So from the first jump attack of a session onward, every B
+    press was a swish with no yell, for the rest of the session. A state setter
+    is not a sound trigger: Player_VrAttackVoice reproduces vanilla's SELECTION
+    of the light and heavy pair and drops its GATING, and it is called on the
+    PRESS, so every B press yells exactly once. Two latent edges R10's review
+    recorded go with it -- a press taken while meleeWeaponState was already 1 was
+    silent, and the deferred yell's pending flag could survive a coverage drop.
+
+  * "IN THE Z-TARGETING ATTACK (WHICH I DID HEAR YELLING), THE SWORD ISN'T
+    MOVING, ONLY THE SWISH." Two predicates for one move. The seam started the
+    chop on Player_VrZTargetActive -- a focusActor AND a converged reticle
+    (targetCtx.unk_4B != 0) -- while the leap he heard gates on vanilla's
+    Player_IsZTargeting, which is hostile lock-on OR friendly-or-PARALLEL. Hold Z
+    with nothing lockable, or press A during the reticle's convergence, and
+    vanilla leapt and yelled while the shell's envelope never started. The chop
+    counter and its damage window are set AT VANILLA'S OWN SITE now, one line
+    before func_8083BA90, so the envelope runs if and only if the leap does. That
+    also retires rev10's deferred yell arbiter outright: vanilla yells for every
+    press that produces a chop, so the chop's onset is the one branch that must
+    stay silent, and gSohVRChopYells is 0 by construction.
+
+rev9 (VR R9 part B review fix, 2026-09-05). rev8's shield stance shipped with
+one gate missing: the stop it added inside Player_UpdateCommon, and the neutral
+stick it reports out of Player_GetMovementSpeedAndYaw, both ran during blocking
+cutscenes. That matters because the stance is not something the wearer opts out
+of when a scene starts -- PLAYER_STATE1_SHIELDING is vanilla's own flag and can
+still be set as the scene begins, and the left grip is held or released entirely
+at his discretion -- so a cutscene that walks Link by script would have had its
+motion zeroed every tick and never reached its mark. Both consumers now carry
+!Player_InBlockingCsMode(play, this), which is the same exclusion the kinematic
+branch beside them and the facing pin below them already had; the predicate
+itself is unchanged, so the crouch (an eye height, not a motion) still follows
+the grip wherever it is held.
+
+rev8 (VR R9 part B, 2026-09-05). Three of the user's 1.0.1.12 rulings, and they
+are all the same shape -- a mechanism this overlay withdrew, whose vanilla side
+effects nobody replaced:
+
+  * "THE LEFT GRIP SHIELD CROUCH LOWERS YOUR HEIGHT BUT NOW YOU CAN MOVE
+    AROUND." Vanilla stops a shielding Link inside Player_Action_80843188
+    (Player_DecelerateToZero); overlay 0049 suppresses the handler that enters
+    it, for its own good reason. Player_VrShieldStance is the one predicate the
+    crouch flag and the two new stops all read: the kinematic override refuses to
+    run while it holds, and Player_GetMovementSpeedAndYaw reports a neutral stick
+    so no vanilla action can move him either.
+
+  * "LINK ISN'T MAKING THE ATTACK YELL." rev5 wrote meleeWeaponState directly and
+    bypassed func_80833A20, which is what plays NA_SE_IT_SWORD_SWING and the
+    voice. The write is now a call, with our own rising edge (the setter's own
+    edge test is meleeWeaponState == 0, and a real swing passes through ARMED on
+    its way to HOT, so a bare call would be silent exactly when it matters).
+
+  * "WHEN YOU HOLD Z AND DO A JUMP ATTACK I DO HEAR THE YELL BUT THE SWORD
+    DOESN'T MAKE THE ATTACK MOVEMENT." Because that yell was vanilla's:
+    Player_ActionHandler_10 calls func_8083BA90 directly and never consults
+    func_8083BB20, so rev5's withdrawal never covered it and every Z+A press ran
+    the authored jump slash (invisible on a pinned hand) alongside the chop. It
+    gets the same Player_VrMotionCombatCovered early-out handlers 8 and 11 carry.
+    (rev10 puts that action BACK, for its leap alone -- see below.)
+
+rev10 (VR R10, 2026-09-05). One ruling, and it is the shape of the whole round:
+
+  * "THE JUMP ATTACK WHEN Z-TARGETING, THE CAMERA SHOULD REFLECT A JUMP ATTACK
+    -- SOME VERTICAL MOVEMENT OF THE CAMERA. IT SHOULD MATCH VANILLA." rev8's
+    early-out in Player_ActionHandler_10 removed the authored jump slash, and
+    with it the LEAP: func_8083BA90 is what sets PLAYER_STATE3_MIDAIR and the
+    xz/y velocities of 5. The VR eye rides the actor root, so a Link who never
+    left the ground gives a wearer who never left the ground.
+
+    The action runs again. What rev8 was right about is preserved by three
+    mechanisms that were already there or are added here: the authored ARM
+    animation is invisible because the hand limb is pinned; the authored QUADS
+    never register because z_player_lib.c refuses vanilla's fattened AT quads
+    while motion combat covers the weapon (so the blade remains the only thing
+    that damages -- the R5 "two attacks per press" defect cannot return through
+    this door); and the VOICE is arbitrated, because func_8083BA90 ends with
+    Player_PlayVoiceSfx(NA_SE_VO_LI_SWORD_L) and the chop seam would otherwise
+    play a second one. The arbiter is a DEFERRED yell rather than a mute: the
+    action handlers run inside this->actionFunc, i.e. after the seam, so on the
+    press tick the seam cannot know whether vanilla's will fire -- it has its own
+    conditions. The seam stays silent, records the counter, and yells one tick
+    later only if the counter did not move.
+
+rev6 (VR R8, 2026-09-05). Two changes, both the user's rulings from the 1.0.1.10
+headset session:
+
+  * ITEM 9 -- "turn the world toward a Z-target" is REMOVED, not defaulted off.
+    gSohVRLockOn, Player_VrLockOnBody and sSohVRLockOnActive all go. R7 already
+    showed what the option cost: the facing pin's correctness exclusion had been
+    gated on it, so vanilla Z-targeting could not strafe, hop or flip while it
+    shipped off. Player_VrZTargetActive -- which takes no CVar and is what the
+    strafe/side-hop/backflip actually ride -- is untouched, and so is steering
+    case 3, which now tests that predicate alone. (Reading the brief's "remove
+    steering case 3" literally would have deleted the strafe R7 landed; the half
+    of case 3 that belonged to the comfort option is what is gone.)
+
+  * ITEM 8 -- the FORWARD ROLL is published for the roll camera, beside
+    gSohVRHopKind, plus the roll's own duration taken from the animation at
+    Player_SetupRoll. A camera that follows an authored move has to end when the
+    move ends, and a constant would drift the moment the play speed changed
+    (sWaterSpeedFactor halves it in water).
+
+------------------------------------------------------------------------------
+A. STEERING -- the four-case table (donor Player_GetSteeringYaw,
+   z_player.c:2072-2094), at EXACTLY two call sites,
+   Player_ProcessControlStick and Player_GetMovementSpeedAndYaw. The other
+   Camera_GetInputDirYaw sites in the file are not stick steering and are left
+   alone.
+
+  1. not VR / not first person / no head yaw yet -> vanilla.
+  2. CRAWLING or GRABBING_DYNAPOLY -> actor.shape.rot.y. Two recorded donor
+     bugs: head-relative steering in a crawlspace made the exit unreachable
+     when the head was off-axis, and pushing a block wandered wherever the
+     player gazed.
+  3. LOCK-ON FRAMING ACTIVE -> actor.shape.rot.y, the body, which vanilla keeps
+     aimed at the target.
+  4. otherwise -> the head yaw the shell publishes.
+
+  rev1 BUG, fixed here: rev1's case 3 was `focusActor != NULL`, which fires
+  whenever anything is targetable -- but the donor's case 3 is `sVrLockOnActive`,
+  i.e. Legaiaflame's Lock On, which ships DEFAULT OFF (DONOR-MAP 4d, spec
+  scope "lock-on framing default-OFF"). rev1 therefore silently handed steering
+  back to the body during ordinary Z-targeting, which is neither vanilla nor
+  the donor. rev2 reproduces Player_VrLockOnBody exactly, gated on
+  gSohVRLockOn (default 0), and LATCHES it once per player update so that
+  steering (read in Player_ProcessControlStick, which runs BEFORE the action
+  func) and the facing pin cannot disagree about the same tick -- that latch is
+  the donor's own recorded scar (z_player.c:2043-2058).
+
+------------------------------------------------------------------------------
+B. LINK'S BODY (donor Player_OverrideLimbDrawGameplayVRFirstPerson,
+   z_player_lib.c:1514-1611), selected in Player_Draw AHEAD of the vanilla
+   unk_6AD projected-head-position test (donor z_player.c:12761-12765) -- that
+   test projects the head through the THIRD-PERSON matrix and does not apply.
+
+  - HEAD and HAT always culled: the camera is inside Link's skull. rev1 had
+    this and stopped there, which is why turning around showed the inside of a
+    torso, backface-culled and stretched by the near plane. That is what the user
+    photographed.
+  - gSohVRHideBody (donor gVrHideBody, default 1) hides EVERY REMAINING LIMB
+    EXCEPT THE TWO HANDS. Held items ride the hand matrices, so sword and
+    shield stay visible for free -- that is a property of PostLimbDraw, not
+    something this function arranges.
+  - R3 SCOPE (honest): the donor pins the hand limbs to VR_GetHandMatrix (the
+    Sense controller pose) when gVrMotionHands is on, and with motion hands OFF
+    its gVrHideBody branch hides the hands too, because there they belong to
+    arms that are not there. We are one round short of hand poses (R4, Q-VR3
+    closed by the user: hands/motion combat ARE part of the minimum), so R3 keeps
+    the two hand limbs drawn AT THEIR ANIMATED POSITIONS and hides everything
+    else. The hook R4 needs is the marked block below: replace the two hand
+    limbs' matrices with the controller pose and delete nothing else.
+
+  - rev3 (VR R4) TAKES THAT HOOK. With gSohVRMotionHands on and the hand
+    TRACKED, the limb's matrix is replaced outright with the controller pose
+    the shell publishes (Matrix_Put, donor z_player_lib.c:1594), pos and rot
+    zeroed so the base skeleton contributes nothing, and the SHOULDERS and
+    FOREARMS hidden -- a floating hand attached to an arm that is not there is
+    worse than no arm. HELD ITEMS RIDE THE HAND MATRICES FOR FREE: sword,
+    shield, bow, hookshot, bottle, ocarina and sticks all draw on this same
+    matrix in PostLimbDraw, so nothing item-specific appears here. Link's model
+    scale is folded back in after the Put, which is what makes child and adult
+    both work (the donor's VR_SetHandScale).
+
+    WHICH CONTROLLER DRIVES WHICH LIMB: Link is left-handed, so his L_HAND is
+    the SWORD hand and his R_HAND is the SHIELD hand. The player's RIGHT
+    controller drives the sword hand by default (gSohVRLeftHanded 0 swaps it).
+    Each controller therefore drives Link's OPPOSITE-side hand model, which is
+    why the donor mirrors the mesh per hand -- and mirrors PER HAND rather than
+    globally, because the reflection also mirrors held items' face designs: the
+    sword survives that, the shield's crest reads upside-down. A mirrored mesh
+    has reversed triangle winding, so G_EX_INVERT_CULLING is set for it and
+    CLEARED ON THE NEXT LIMB (the donor's sVrHandInvertCulling latch) -- clearing
+    it inline would clear it before the held item had drawn.
+
+    FALLBACK, and it is the whole no-Sense story: gSohVRHandValid[] is the only
+    test. No pair connected, tracking lost, or a hand out of view and that hand
+    falls back to R3's ANIMATED position on the very next frame, with the
+    shoulders and forearms coming back with it. Nothing else needs to know.
+
+------------------------------------------------------------------------------
+D. MOTION COMBAT (VR R4, DONOR-MAP 8), and the honest shape of it.
+
+  The donor drives damage from the PHYSICAL BLADE: its layer-0 solver stops the
+  sword at surfaces, and VrSwing.cpp turns each damaging sim contact into a
+  swept ColliderQuad poked 6 units inside the surface. That needs a collision
+  mesh, and both of its sources for one are out of scope this round (the
+  visual-mesh harvest is a renderer feature; the gVrPhysVisualMesh=0 path
+  harvests the game's own collision mesh at the tick). So R4 does NOT reproduce
+  the physical blade.
+
+  What it does instead is smaller and, for this round, better: A DETECTED SWING
+  PRESSES B FOR YOU. sUseHeldItem is the single static that means "use the held
+  item this frame" -- it is what Player_ProcessItemButtons sets from the B
+  press, and it is reset to 0 every frame immediately before actionFunc runs
+  (z_player.c:12055). Setting it there on a swing edge means the ENTIRE authored
+  attack path runs unchanged: the right animation for the state, combo chains,
+  the stab lunge, jump-slash when airborne (func_8083BB20 reads sUseHeldItem
+  itself), every enemy's own damage table and vulnerability set, the vanilla
+  swept quads, the SFX and the voice. Nothing is re-implemented, so nothing can
+  be re-implemented wrongly.
+
+  This is the OPPOSITE of the donor's choice, which SUPPRESSES that whole state
+  machine (func_8083BB20 -> return 0) precisely because it damages from the
+  blade instead. We keep it, so we must not suppress it -- and the honest cost
+  is stated plainly: the damage lands along LINK'S AUTHORED SWORD ARC, not where
+  your hand actually is. A swing to the left still attacks whatever Link is
+  facing. Recorded in docs/VR-R4-NOTES.md as the round's biggest parity gap.
+
+  ONE SWING, ONE ATTACK, across a 90/120 Hz producer and a 20 Hz consumer: the
+  shell bumps gSohVRSwingSeq once per rising edge into the HOT tier and never
+  otherwise; this side keeps its own last-seen value and fires on a difference.
+  A dropped frame cannot lose an edge and a slow tick cannot double one.
+
+  GATING: melee only (Player_GetMeleeWeaponHeld). A swing while the bow is out
+  must not fire the bow -- sUseHeldItem is the held item's button, not the
+  sword's, and that is the one way this seam can misfire.
+
+------------------------------------------------------------------------------
+E. THE ITEM TRIGGER (VR R4, DONOR-MAP 8 / HANDOFF-ITEM-TRIGGER.md).
+
+  The donor's killer detail, ported whole because it is nearly free: the hand
+  holding an item has its TRIGGER mirror that item's own N64 button as raw pad
+  STATE, not as a press. Press nocks the bow, hold keeps it drawn, release
+  looses it; ammo, magic, bottles and aim-and-throw all apply with nothing
+  re-implemented, because the game is simply seeing its own button held.
+
+  All this side does is publish WHICH button that is -- sItemButtons[
+  heldItemButton], the same table Player_ProcessItemButtons reads -- into
+  gSohVRItemTriggerMask. Overlay 0047 ORs it into the pad from padmgr while the
+  trigger is down, and reserves that trigger from the generic binding table so
+  one physical input cannot mean two things. Published as 0 whenever a MELEE
+  weapon is held, because there the swing IS the attack and the trigger has
+  nothing to do (the donor's VrCombat_MeleeCovered).
+
+------------------------------------------------------------------------------
+C. DIRECT MOVEMENT (donor gVrBodyFollowsHead, default 1). Four surgical
+   overrides plus the facing pin. Without these, Link's body keeps vanilla's
+   camera-relative turn easing while the camera sits at his eyes -- which is
+   exactly "third person with the camera in front of his face".
+
+  1. func_8083C484 -> return 0 (donor :6693). No pivot brake: reversing the
+     stick just moves the other way. The body does not turn with movement in
+     VR, so there is nothing to pivot.
+  2. func_8083DF68 (donor :7286): this->yaw = arg2 before Math_ScaledStepToS --
+     velocity goes exactly where the stick points, never bent by turn easing.
+  3. func_8083DFE0 (donor :7305): same for the air/jump variant, and no
+     reversal brake.
+  4. The KINEMATIC OVERRIDE in Player_UpdateCommon (donor :12106-12123), placed
+     immediately before Actor_UpdateVelocityXZGravity so it overrides whatever
+     the later-running action func eased in: while in a neutral locomotion
+     action, grounded, and not in a blocking cutscene, velocity IS the stick.
+     No acceleration ramp, no start-step latency, no stop-slide.
+     Player_VrIsNeutralLocomotion whitelists exactly the donor's seven action
+     functions; rolls, attacks, jumps and knockbacks keep their authored motion.
+  5. The FACING PIN (donor :12340-12356), the LAST facing writer in the update
+     loop, immediately after Player_UpdateShapeYaw: shape.rot.y = head yaw.
+     Velocity is built from this->yaw, not shape.rot.y, so pinning never
+     redirects movement -- it only turns the body to face where you look, which
+     is what makes "turn around and you cannot see your own back" true.
+     Skipped in cutscenes, on horse, on ladders, ledge-climb, hanging,
+     crawling, dynapoly-grab, and lock-on -- every state where the game
+     choreographs Link's facing.
+
+------------------------------------------------------------------------------
+Gating. Every branch is gated on gSohVRFpActive, which overlay 0041 only ever
+raises inside VR gameplay; the flat window, the 3D panel and every iPhone build
+see vanilla plus one integer test. __IOS__-only; the macOS build compiles none
+of it (gSohVRFpActive is a weak zero there).
+
+Kept file-static on purpose -- a file-static wrapper over the exported default
+limb draw adds no cross-file surface, where the donor's new exported function
+needed a functions.h change too.
+
+--- a/soh/src/overlays/actors/ovl_player_actor/z_player.c
++++ b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+@@ -2009,34 +2009,1111 @@
+ 
+ void Player_AnimReplacePlayOnce(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
+     Player_AnimReplacePlayOnceSetSpeed(play, this, anim, flags, 1.0f);
++}
++
++void Player_AnimReplacePlayOnceAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
++    Player_AnimReplacePlayOnceSetSpeed(play, this, anim, flags, PLAYER_ANIM_ADJUSTED_SPEED);
++}
++
++void Player_AnimReplaceNormalPlayOnceAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim) {
++    Player_AnimReplacePlayOnceAdjusted(play, this, anim, 0x1C);
++}
++
++void Player_AnimReplacePlayLoopSetSpeed(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags,
++                                        f32 playbackSpeed) {
++    LinkAnimation_PlayLoopSetSpeed(play, &this->skelAnime, anim, playbackSpeed);
++    Player_StartAnimMovement(play, this, flags);
++}
++
++void Player_AnimReplacePlayLoop(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
++    Player_AnimReplacePlayLoopSetSpeed(play, this, anim, flags, 1.0f);
++}
++
++void Player_AnimReplacePlayLoopAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
++    Player_AnimReplacePlayLoopSetSpeed(play, this, anim, flags, PLAYER_ANIM_ADJUSTED_SPEED);
++}
++
++void Player_AnimReplaceNormalPlayLoopAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim) {
++    Player_AnimReplacePlayLoopAdjusted(play, this, anim, 0x1C);
++}
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0042 rev2, VR-spec D4/D6 / VR-DONOR-MAP 3+4).
++ * Shell-published VR state. gSohVRFpActive is raised by overlay 0041 only
++ * inside VR gameplay with the first-person anchor actually in force. */
++extern volatile int gSohVRFpActive;
++extern volatile int gSohVRHeadingValid;
++extern volatile int gSohVRHeadingYaw;
++extern volatile int gSohVRHideBody;        /* donor gVrHideBody, default 1 */
++extern volatile int gSohVRBodyFollowsHead; /* donor gVrBodyFollowsHead, default 1 */
++extern volatile int gSohVRZTarget;         /* rev5: vanilla lock-on engaged now */
++extern volatile int gSohVRHopKind;         /* rev5: -1 none, else 0 fwd/1 L/2 back/3 R */
++/* rev6 (VR R8 item 8): the FORWARD ROLL, for the roll camera. Two
++ * values, because a camera that follows an authored move needs both
++ * whether it is running and how long the move itself lasts. */
++extern volatile int gSohVRRollActive;
++extern volatile float gSohVRRollSeconds;
++/* Diagnostics for `vr fp` -- proving on device that the pin and the
++ * kinematic override actually ran, rather than inferring it from feel. */
++extern volatile int gSohVRPinnedYaw;
++extern volatile int gSohVRDirectTicks;
++extern volatile int gSohVRKinematicTicks;
++/* rev3 (VR R4, DONOR-MAP 3 + 8): the motion hands and the swing detector. */
++extern volatile int gSohVRMotionHands;      /* donor gVrMotionHands, default 1 */
++extern volatile int gSohVRLeftHanded;       /* donor gVrLeftHanded, default 0 */
++extern volatile int gSohVRHandMirrorSword;  /* donor gVrHandMirrorSword, default 1 */
++extern volatile int gSohVRHandMirrorShield; /* donor gVrHandMirrorShield, default 1 */
++extern volatile int gSohVRHandValid[2];     /* 0 = LEFT controller, 1 = RIGHT */
++extern volatile float gSohVRHandMat[2][2][16]; /* [slot][hand], row-vector, game units */
++extern volatile int gSohVRPairSlot;         /* the slot latched for this frame's pair */
++extern volatile int gSohVRHandMtxTag;       /* overlay 0050: 0 = none, hand + 1 */
++extern volatile int gSohVRHandMtxCount[2];
++extern volatile float gSohVRHandRecMat[2][16];
++extern volatile int gSohVRHandRecValid[2];
++extern volatile int gSohVRBladeDamage;
++/* rev5 (VR R7 verdict 4): the authored-attack suppression counter, the
++ * button-stab window and its count. All shell-defined (SohIosShell.m). */
++extern volatile int gSohVRAuthoredSuppressed;
++extern volatile int gSohVRStabTicks;
++extern volatile int gSohVRChopTicks;    /* rev7: the Z-target overhead chop */
++extern volatile int gSohVRChops;
++extern volatile int gSohVRCrouch;       /* rev7: shield stance -> lower the eye */
++extern volatile int gSohVRStabs;
++/* rev5: 1 while motion combat covers the held weapon. Published for
++ * z_player_lib.c, which cannot see the file-static predicate. */
++extern volatile int gSohVRMotionCovered;
++/* rev6: how many times coverage fell away and the field was handed back. */
++extern volatile int gSohVRCoverDrops;
++extern volatile int gSohVRSwingTier[2];
++extern volatile unsigned int gSohVRSwingSeq[2];
++extern volatile int gSohVRSwingJump[2];
++extern volatile unsigned short gSohVRItemTriggerMask[2];
++/* rev19 (VR R18 item 2): 1 while the item in hand is one that BOTH
++ * triggers drive -- see Player_VrTriggerItem below. Overlay 0047 reads
++ * it and mirrors the item mask onto both triggers instead of one. */
++extern volatile int gSohVRItemTriggerBoth;
++/* rev19 (VR R18 item 1): how many equip presses were denied vanilla
++ * after-change auto-use. A boomerang select that no longer throws is
++ * this counter rising with gSohVRBoomDirectThrows standing still. */
++extern volatile unsigned int gSohVREquipNoUse;
++/* rev13 (VR R12 item 4): the per-item hand correction. Keyed by
++ * PLAYER_MODELTYPE_* (0..15) and by configuration; see the block beside
++ * gSohVRItemRotDeg in app/ios/SohIosShell.m. */
++#define SOHVR_ITEMCAL_N 16
++extern volatile int gSohVRItemCal;
++extern volatile float gSohVRItemRotDeg[SOHVR_ITEMCAL_N][2][3];
++extern volatile float gSohVRItemOffU[SOHVR_ITEMCAL_N][2][3];
++extern volatile int gSohVRHeldModel[2];
++/* rev13 (VR R12 item 6, Q-VR26): the harness's one-shot "put a sword on
++ * B". Ships 0; the block below clears it the tick it acts on it. */
++extern volatile int gSohVRForceSword;
++extern volatile int gSohVRForcedSwords;
++/* rev20 (VR R19 item 1): THE MEGATON HAMMER'S OWN ENVELOPE.
++ *
++ * gSohVRHammers is bumped once per hammer swing STARTED, at vanilla's own
++ * site (func_80837948, the single function that installs a melee
++ * animation), and the shell runs its hammer chop off the counter exactly
++ * as it runs the sword's slash off gSohVRStabs. gSohVRHammerHits counts
++ * vanilla's own ground hit (func_80842A28: the quake, the rumble and
++ * NA_SE_IT_HAMMER_HIT), so "the head landed and the ground answered" is
++ * two numbers rising together rather than a wearer's impression. */
++extern volatile int gSohVRHammers;
++extern volatile int gSohVRHammerHits;
++/* rev21 (VR R20 item 1c): GAME UNITS the hammer's ground line test reaches
++ * PAST meleeWeaponInfo[0].tip. R20 took the envelope's grip drop to zero --
++ * the hand stays where the controller is and only the head rotates down --
++ * so a chop made at waist height finishes with the head above the floor and
++ * vanilla's probe, which stops AT the tip, sweeps nothing. Defined in the
++ * shell (SohIosShell.m, 15.0 = 0.44 m at 34 units/m); 0 restores vanilla's
++ * reach exactly. */
++extern volatile float gSohVRHammerProbe;
++extern volatile int gSohVRSwingsTaken; /* diagnostic: swings this side acted on */
++extern volatile int gSohVRHandPins;    /* diagnostic: limb pins performed */
++extern volatile int gSohVRHeldAction, gSohVRBItem; /* diagnostics: the melee gate */
++/* rev8 (VR R9 part B): the shield stance stopped Link walking; the swing
++ * setter shim's count; and Link's own velocity/position, so "he did not
++ * move" is two numbers rather than a screenshot. */
++extern volatile int gSohVRMode;         /* rev8: the shield stance is VR-only */
++extern volatile int gSohVRShieldStops;
++extern volatile int gSohVRShieldStanceForce;
++extern volatile int gSohVRSwingSfx;
++/* rev10 (VR R10 verdict 4): vanilla's Z-target jump slash RUNS again, for
++ * its body; these two count who yelled so that a press yields exactly one
++ * voice. */
++extern volatile int gSohVRJumpSlashVanilla;
++extern volatile int gSohVRChopYells;
++extern volatile float gSohVRLinkVel;
++extern volatile float gSohVRLinkPos[3];
++extern volatile int gSohVRMeleeAnim;
++/* rev14 (VR R13, Q-VR28): THE AIM. Shell-owned; the reasoning and the
++ * arithmetic that retires R12's mirror prediction are beside gSohVRAim in
++ * app/ios/SohIosShell.m. Basis is COLUMNS, un-reflected: [hand][frame]
++ * 0..2 = the world image of the hand frame's local +X, 3..5 of +Y,
++ * 6..8 of +Z. frame 0 = the calibrated hand, 1 = item-corrected. */
++#define SOHVR_AIMFRAME_N 2
++extern volatile int gSohVRAim;
++extern volatile int gSohVRAimFrame;
++extern volatile int gSohVRAimHandFixOn;
++extern volatile float gSohVRAimSpawnU;
++/* rev15 (VR R14): the trims are PER ITEM and PER CONFIGURATION, because
++ * the settings sheet has sliders for them now and one pair of numbers
++ * could not tell the slingshot from the hookshot. [model][config][yaw,
++ * pitch]. */
++/* rev18 (VR R17 item 4): THE BOW AND THE SLINGSHOT NEED DIFFERENT
++ * NUMBERS, and they share mesh slot 11/12 (Q-VR30) -- so a table keyed by
++ * the MESH cannot hold both. One extra row past the mesh slots is the
++ * slingshot's, chosen by the held item ACTION rather than by the model,
++ * and published as gSohVRAimTrimRow so `vr aim` and `vr set aimyaw` write
++ * the row the game is actually reading. Nothing else is keyed this way:
++ * the mesh is the right key for a POSE, and only the aim needs to tell
++ * two items apart inside one mesh. */
++#define SOHVR_AIMTRIM_SLINGSHOT SOHVR_ITEMCAL_N
++#define SOHVR_AIMTRIM_N (SOHVR_ITEMCAL_N + 1)
++extern volatile float gSohVRAimTrimDeg[SOHVR_AIMTRIM_N][2][2];
++extern volatile int gSohVRAimTrimRow;
++/* rev18 (VR R17 item 2): the crosshair's size multiplier, 0.5 shipped. */
++extern volatile float gSohVRAimReticleScale;
++/* rev15: C_hand^-1 * C_sword, published by the shell, row-major 3x3 --
++ * identity for the sword hand. The axis table is expressed in the SWORD
++ * hand's calibrated frame (that is the fist the calibration was dialled
++ * against); this carries it into whichever hand actually holds the bow. */
++extern volatile float gSohVRAimHandFix[2][9];
++/* rev15: which path the LAST nocked-seed frame took, and one count per
++ * RELEASED projectile, so the settings sheet can say `Aim: hand (N shots)`
++ * rather than leaving the user to infer it. */
++extern volatile int gSohVRAimPath;
++extern volatile unsigned int gSohVRAimShots;
++extern volatile unsigned int gSohVRAimVanillaShots;
++extern volatile float gSohVRAimAxis[SOHVR_ITEMCAL_N][3];
++/* rev16 (VR R15): THE CONTROLLER'S OWN AIM RAY. Published by the shell
++ * from the accessory's aim location (ar_accessory_location_name_aim),
++ * seated through the same transform as the hand and NOT through the hand
++ * calibration -- a frame dialled for how a mesh looks is not a pointing
++ * direction, which is what R13 and R14 both learned the hard way. Unit
++ * direction and origin in game world space, per VR hand. gSohVRAimFrame
++ * == 2 selects it and ships; a hand the runtime has not answered for
++ * falls back to the basis below. */
++extern volatile int gSohVRAimRayValid[2];
++extern volatile float gSohVRAimRayDir[2][3];
++extern volatile float gSohVRAimRayOrg[2][3];
++extern volatile int gSohVRAimValid[2];
++extern volatile float gSohVRAimBasis[2][SOHVR_AIMFRAME_N][9];
++extern volatile float gSohVRAimOrigin[2][3];
++extern volatile float gSohVRAimDirW[3];
++extern volatile float gSohVRAimFwdW[3];
++extern volatile float gSohVRAimPosW[3];
++extern volatile int gSohVRAimModel;
++extern volatile int gSohVRAimHandUsed;
++extern volatile int gSohVRAimSite;
++extern volatile unsigned int gSohVRAimHits;
++/* rev17 (VR R16 item 2): THE BOOMERANG THROWS ON THE PULL. Overlay
++ * 0047 mirrors the trigger STATE onto the item's C button, so vanilla
++ * saw a HELD button and entered its hold-to-aim -- first person, the
++ * camera zoom sound, the HUD fade and a throw that waited for the
++ * release. With a real aim ray there is nothing to aim WITH the
++ * hold, so the release is synthesised on the same tick. 0 restores
++ * vanilla's hold (`vr set boomdirect 0`). */
++extern volatile int gSohVRBoomDirect;
++extern volatile unsigned int gSohVRBoomDirectThrows;
++/* rev17 (VR R16 item 4): THE WORLD TURNS WITH LINK when the GAME turns
++ * him. The facing pin stands down in every choreographed state, so a
++ * ladder descent (which snaps shape.rot.y by 0x8000) left the wearer
++ * climbing down facing away from the ladder. One writer, a delta and a
++ * sequence number; the shell eases its own yaw by the delta. */
++extern volatile int gSohVRBodyYawSnapDelta;
++extern volatile int gSohVRBodyYawSnapSeq;
++
++/* SOH_IOS (overlay 0049, z_player_lib.c): the physical shield's held
++ * predicate. Forward-declared HERE as well as at its own site, because this
++ * helper block sits at Player_ProcessControlStick (~2388) and 0049 declares
++ * it at func_80834758 (~3098) -- seven hundred lines too late for us. */
++s32 Player_VrShieldHeld(Player* this);
++
++/* SOH_IOS (overlay 0042 rev19, VR R18 items 1, 2 and 3): IS THE ITEM IN
++ * HAND ONE THE VR TRIGGER DRIVES?
++ *
++ * the user, wearing 1.0.1.22: "while holding an item, either trigger performs
++ * the action -- it's counterintuitive to use the RIGHT trigger when the
++ * slingshot is in the LEFT hand"; and "the boomerang throws itself as soon
++ * as you select it"; and the hammer does nothing on either trigger. All
++ * three answers need the same question asked once: is the thing in hand an
++ * item whose ACTION is a trigger pull?
++ *
++ * IT IS NOT gSohVRItemTriggerMask != 0. That mask is every non-sword C
++ * item -- a bottle, a mask, the ocarina, a bomb -- because the mask's job
++ * is "which button does the held item live on", which is a different
++ * question and a broader one. Widening the both-triggers rule to it would
++ * take Z and B away from a Link holding a bottle, and take the ocarina's
++ * own note bindings off the sword trigger.
++ *
++ * THE LIST, and why each member is on it:
++ *   BOW .. BOW_0E, SLINGSHOT, HOOKSHOT, LONGSHOT -- hold to aim, release
++ *     to loose. The trigger IS the draw.
++ *   BOOMERANG -- a pull throws it (rev17's direct throw).
++ *   HAMMER, DEKU_STICK -- their swing is a press of the item's own button
++ *     (func_8083BB20 reads sUseHeldItem; its BTN_B branch is gated on
++ *     actor.category != ACTORCAT_PLAYER and so never runs for the player),
++ *     and neither is covered by the physical blade (overlay 0048 covers
++ *     melee weapons 1..3, the three swords). Without the trigger they have
++ *     no attack at all in VR, which is exactly what the user reported.
++ *
++ * DELIBERATELY NOT ON IT: bombs and bombchus (their C press pulls one out
++ * and A/B throws it -- taking those away would leave a lit bomb in the
++ * hand), deku nuts, the ocarina, bottles, masks, the magic spells and the
++ * lens. They keep the classic profile: the sword-hand trigger mirrors the
++ * item, the off-hand trigger stays Z. */
++static s32 Player_VrTriggerItem(s32 sohAction) {
++    if ((sohAction >= PLAYER_IA_BOW) && (sohAction <= PLAYER_IA_BOW_0E)) {
++        return 1;
++    }
++    switch (sohAction) {
++        case PLAYER_IA_SLINGSHOT:
++        case PLAYER_IA_HOOKSHOT:
++        case PLAYER_IA_LONGSHOT:
++        case PLAYER_IA_BOOMERANG:
++        case PLAYER_IA_HAMMER:
++        case PLAYER_IA_DEKU_STICK:
++            return 1;
++        default:
++            return 0;
++    }
++}
++
++/* SOH_IOS (overlay 0042 rev19, VR R18 item 1): THE EQUIP PRESS MUST NOT USE
++ * THE ITEM.
++ *
++ * the user: "as soon as you select the boomerang, it throws once, every
++ * time." The cause is vanilla, and it is not the direct throw itself.
++ * Player_UpperAction_ChangeHeldItem sets sUseHeldItem through
++ * VB_USE_HELD_ITEM_AFTER_CHANGE the moment the item-change animation has
++ * swapped the model -- on an N64 that is the whole point (you are still
++ * holding the C button you pressed, so the bow draws and the boomerang
++ * enters its aim), and it arrives here as a use that NOBODY asked for,
++ * because in VR the press came from the item compass or from one tick of a
++ * C button and the trigger is not down at all. rev17's synthesised release
++ * then turns that free use into a free throw.
++ *
++ * Suppressing the auto-use is the honest fix, and it is deliberately not
++ * boomerang-only: the same free use makes a bow SELECT loose an arrow a few
++ * ticks later (func_808351D4's fire test is `unk_836 > 0 &&
++ * !sHeldItemButtonIsHeldDown`, and after a select the button is not held),
++ * which costs ammo for nothing. With it suppressed the equip press does
++ * exactly one thing -- it puts the item in the hand -- and every use comes
++ * from the trigger afterwards, which is the rule the whole VR profile is
++ * built on.
++ *
++ * GATED ON THERE BEING A TRIGGER TO USE IT WITH: gSohVRFpActive and
++ * gSohVRMotionHands, the same pair that gates the mask publish below. In
++ * the flat window, on iPhone and with no hands the auto-use is vanilla's
++ * and stays. */
++static s32 Player_VrEquipNoAutoUse(Player* sohThis) {
++    if ((sohThis == NULL) || (gSohVRFpActive == 0) || (gSohVRMotionHands == 0)) {
++        return 0;
++    }
++    if (!Player_VrTriggerItem(sohThis->heldItemAction)) {
++        return 0;
++    }
++    gSohVREquipNoUse = gSohVREquipNoUse + 1;
++    return 1;
++}
++
++/* SOH_IOS (overlay 0042 rev8, VR R9 part B): THE VR SHIELD STANCE.
++ *
++ * the user, on 1.0.1.12: "The left grip shield crouch lowers your height but
++ * now you can move around, which you're not supposed to."
++ *
++ * He is right and the cause is a gap between two overlays that are each
++ * correct. Vanilla stops a shielding Link inside Player_Action_80843188,
++ * which calls Player_DecelerateToZero every tick -- and overlay 0049
++ * suppresses Player_ActionHandler_11 for the physical shield, so that action
++ * is never entered (deliberately: it sets the itemAction = -1
++ * diverged-models marker outside the lifecycle that repairs it, which is the
++ * bug 0049 exists to avoid). Nothing else stops him, and rev2's kinematic
++ * override then writes the stick straight onto linearVelocity every tick.
++ *
++ * So the stance gets its own predicate, and it is the SAME two halves the
++ * crouch flag already used: vanilla's own flag, OR R held with a shield 0049
++ * says is on the arm. One definition, two consumers, so the eye that drops
++ * and the feet that stop can never disagree. */
++static s32 Player_VrShieldStance(Player* sohThis) {
++    if (sohThis == NULL) {
++        return 0;
++    }
++    /* VR FIRST PERSON ONLY. Every consumer below is a VR behaviour, and
++     * vanilla already stops a shielding Link its own way in the flat window
++     * and on iPhone -- where Player_ActionHandler_11 is not suppressed. */
++    if ((gSohVRMode == 0) || (gSohVRFpActive == 0)) {
++        return 0;
++    }
++    /* Harness override (`vr shieldstance 0|1|auto`), -1 = follow the game.
++     * The STANCE depends on owning a shield, having it on the arm and
++     * standing somewhere it can be raised -- none of which a simulator can
++     * promise -- while the two things this round fixes (he stops walking,
++     * and only then) are properties of the code either way. */
++    if (gSohVRShieldStanceForce >= 0) {
++        return (gSohVRShieldStanceForce != 0);
++    }
++    if (sohThis->stateFlags1 & PLAYER_STATE1_SHIELDING) {
++        return 1;
++    }
++    if ((sControlInput != NULL) && CHECK_BTN_ALL(sControlInput->cur.button, BTN_R) &&
++        Player_VrShieldHeld(sohThis)) {
++        return 1;
++    }
++    return 0;
++}
++
++/* SOH_IOS: direct movement (donor Player_VrDirectMovement, z_player.c:6693
++ * region). Link's body always faces the headset and the stick is a movement
++ * VECTOR in that frame -- exact direction, no turn easing, no pivot brake.
++ * The action state machine stays authoritative for everything else. */
++static s32 Player_VrDirectMovement(Player* sohThis) {
++    (void)sohThis;
++    return (gSohVRFpActive != 0) && (gSohVRHeadingValid != 0) && (gSohVRBodyFollowsHead != 0);
++}
++
++/* SOH_IOS: the neutral ground-locomotion actions -- idle, walk, run, the two
++ * strafes, turn-around. ONLY in these does the kinematic stick override
++ * drive velocity directly; rolls, attacks, jumps and knockbacks keep their
++ * authored motion untouched. The donor's exact seven (:2065-2071). */
++static s32 Player_VrIsNeutralLocomotion(Player* sohThis) {
++    return (sohThis->actionFunc == Player_Action_Idle) || (sohThis->actionFunc == Player_Action_80840DE4) ||
++           (sohThis->actionFunc == Player_Action_80842180) || (sohThis->actionFunc == Player_Action_8084227C) ||
++           (sohThis->actionFunc == Player_Action_808414F8) || (sohThis->actionFunc == Player_Action_8084193C) ||
++           (sohThis->actionFunc == Player_Action_808423EC);
++}
++
++/* rev6 (VR R8 item 9): sSohVRLockOnActive and Player_VrLockOnBody are
++ * GONE, with the comfort option they were gated on. "Turn the world
++ * toward a Z-target" rotated the player's view for them; the user's ruling
++ * is that it should not exist rather than ship off. What survives is the
++ * predicate below, which is about VANILLA's lock-on and takes no CVar --
++ * R7 verdict 5's whole point, and the thing the strafe, the side-hop and
++ * the backflip all ride.
++ *
++ * LATCHED once per player update: Player_ProcessControlStick
++ * runs BEFORE the action func, which is where the DISABLE_ROTATION flags
++ * get set, so sampling the live predicate twice would read it from
++ * opposite sides of the same tick. */
++static s32 sSohVRZTargetActive = 0;
++
++/* SOH_IOS (0042 rev5, VR R7 verdict 5): IS VANILLA LOCK-ON ENGAGED RIGHT
++ * NOW? -- which is a different question from "should the world rotate
++ * toward the target", and conflating the two is what broke Z-targeting.
++ *
++ * the user, 2026-09-04: Z-targeting on the left trigger did not work -- no
++ * lock-on strafe, no side-hop, no backflip. The binding was never the
++ * problem: overlay 0047 has bound the left trigger to BTN_Z since R4 and
++ * the press reaches the game. What broke was everything Z is FOR.
++ *
++ * Vanilla's lock-on works by aiming Link's BODY at the target every tick
++ * (Player_UpdateShapeYaw), and then reading the stick in that body frame:
++ * forward closes, left and right circle, back-and-jump is the backflip,
++ * sideways-and-jump is the side-hop. R3's facing pin is the LAST writer of
++ * actor.shape.rot.y in the tick, so it overwrote that aim with the head's
++ * yaw on every single tick of every lock-on. The body never faced the
++ * target, so vanilla never produced a strafe, a hop or a flip -- and from
++ * the headset that reads exactly as "Z does nothing".
++ *
++ * The exclusion for it already existed and was gated on the WRONG thing.
++ * gSohVRLockOn was the comfort option "turn the world toward a Z-target",
++ * which shipped OFF by design (rotating the player's view for them is the
++ * classic sickness trigger, DONOR-MAP 4d) -- so with the shipped default
++ * the exclusion never fired and the pin ran through every lock-on.
++ *
++ * This predicate asks only whether vanilla's own lock-on branch will aim
++ * the body this frame, takes no CVar at all, and gates the FACING PIN and
++ * the steering frame -- so Z-targeting behaves as vanilla, always. rev6
++ * (VR R8 item 9) retires the comfort option and Player_VrLockOnBody with
++ * it; this one is not a preference and never was. */
++/* SOH_IOS (0042 rev11, VR R11 verdict 3): THE ATTACK VOICE, PLAYED
++ * DIRECTLY -- because a state setter is not a sound trigger.
++ *
++ * the user, on 1.0.1.14: "Link no longer makes the YELL on the button
++ * attack." rev8 routed the sound through vanilla's own func_80833A20,
++ * which is the right instinct (its selection of the light and heavy swing
++ * SFX is vanilla's, and duplicating it would drift) and carries two guards
++ * that have nothing to do with a VR press:
++ *
++ *   1. it plays nothing unless meleeWeaponState is currently 0, and
++ *   2. it plays no VOICE while meleeWeaponAnimation is in 16..19
++ *      (FLIPSLASH_START .. JUMPSLASH_FINISH).
++ *
++ * rev10 let vanilla's Z-target jump slash run again, and that writes
++ * meleeWeaponAnimation = PLAYER_MWA_JUMPSLASH_START. Nothing writes it
++ * back, because every other writer lives inside the authored attack machine
++ * rev5 retires for a covered weapon. So from the first jump attack of a
++ * session, guard 2 was permanently true and every B press was a swish with
++ * no voice -- for the rest of the session.
++ *
++ * This reproduces func_80833A20's SELECTION (the part that is vanilla's
++ * judgement) and drops its GATING (the part that is about vanilla's own
++ * animation state machine, which is exactly what VR does not have). The
++ * caller sets meleeWeaponState itself, separately, so state and sound stop
++ * being able to veto each other. sohHard picks the heavy pair, which is
++ * unk_845 >= 3 in vanilla: NA_SE_IT_SWORD_SWING_HARD and
++ * NA_SE_VO_LI_SWORD_L, the loud yell the user asked to keep. */
++static void Player_VrAttackVoice(Player* sohThis, s32 sohHard) {
++    u16 sohItemSfx;
++    u16 sohVoiceSfx;
++
++    if (sohThis->heldItemAction == PLAYER_IA_HAMMER) {
++        sohItemSfx = NA_SE_IT_HAMMER_SWING;
++    } else if ((sohThis->heldItemAction == PLAYER_IA_SWORD_BIGGORON) && (gSaveContext.swordHealth > 0.0f)) {
++        sohItemSfx = NA_SE_IT_HAMMER_SWING;
++    } else {
++        sohItemSfx = sohHard ? NA_SE_IT_SWORD_SWING_HARD : NA_SE_IT_SWORD_SWING;
++    }
++    sohVoiceSfx = sohHard ? NA_SE_VO_LI_SWORD_L : NA_SE_VO_LI_SWORD_N;
++
++    if (sohItemSfx != 0) {
++        func_808328EC(sohThis, sohItemSfx);
++    }
++    Player_PlayVoiceSfx(sohThis, sohVoiceSfx);
++
++    if ((sohThis->heldItemAction >= PLAYER_IA_SWORD_MASTER) &&
++        (sohThis->heldItemAction <= PLAYER_IA_SWORD_BIGGORON)) {
++        gSaveContext.ship.stats.count[COUNT_SWORD_SWINGS]++;
++    }
++}
++
++/* SOH_IOS (0042 rev12, VR R11 review fix): VANILLA'S COMBO ESCALATION,
++ * COUNTED IN ONE PLACE.
++ *
++ * func_80833A20 plays the HEAVY pair when this->unk_845 >= 3 -- the third
++ * hit of a chain -- and unk_845 is maintained by func_80837948, which is
++ * inside the authored attack machine rev5 retires for a covered weapon. So
++ * in VR that field never advances and rev11's sohHard was a literal 0 at
++ * both call sites: the heavy pair could not play at all.
++ *
++ * This is vanilla's arithmetic, unchanged --
++ *
++ *     if ((arg2 != meleeWeaponAnimation) || !(unk_845 < 3)) unk_845 = 0;
++ *     unk_845++;                     ... heavy at unk_845 >= 3
++ *
++ * -- with vanilla's chain test "the animation differs" replaced by the only
++ * test VR can make, "the chain window has expired". The window is seven
++ * game ticks, the same one the B stab already opens for its damage: attacks
++ * closer together than about a third of a second chain, and the third of a
++ * chain is heavy, exactly as vanilla. The fourth starts a new chain and is
++ * light again, also exactly as vanilla.
++ *
++ * sohMode: 0 advances the window one tick, 1 takes an ATTACK and returns
++ * whether it is a heavy one, negative RESETS. It is reset when motion combat
++ * stops covering the weapon (a chain must not survive a coverage drop -- the
++ * staleness rev11 removed from the yell arbiter) and on a chop, because
++ * vanilla breaks the chain there too: func_8083BA90 -> func_80837948 writes
++ * a different meleeWeaponAnimation, which is vanilla's own reset condition.
++ *
++ * The chop is NOT a caller of Player_VrAttackVoice and does not ask for the
++ * heavy pair here: func_8083BA90 already ends with
++ * Player_PlayVoiceSfx(NA_SE_VO_LI_SWORD_L), the heavy voice, for every press
++ * that produces one. A second call would be a second voice on one press. */
++static s32 Player_VrAttackCombo(s32 sohMode) {
++    static s32 sohComboN = 0;
++    static s32 sohChainTicks = 0;
++
++    if (sohMode < 0) {
++        sohComboN = 0;
++        sohChainTicks = 0;
++        return 0;
++    }
++    if (sohMode == 0) {
++        if (sohChainTicks > 0) {
++            sohChainTicks = sohChainTicks - 1;
++        }
++        return 0;
++    }
++    if ((sohChainTicks == 0) || (sohComboN >= 3)) {
++        sohComboN = 0;
++    }
++    sohComboN = sohComboN + 1;
++    sohChainTicks = 7;
++    return (sohComboN >= 3);
++}
++
++static s32 Player_VrZTargetActive(Player* sohThis, PlayState* play) {
++    if ((gSohVRFpActive == 0) || (gSohVRHeadingValid == 0)) {
++        return 0;
++    }
++    if (sohThis->stateFlags2 & (PLAYER_STATE2_DISABLE_ROTATION_Z_TARGET | PLAYER_STATE2_DISABLE_ROTATION_ALWAYS)) {
++        return 0;
++    }
++    return (sohThis->focusActor != NULL) &&
++           ((play->actorCtx.targetCtx.unk_4B != 0) || (sohThis->actor.category != ACTORCAT_PLAYER));
++}
++
++/* SOH_IOS (0042 rev5, VR R7 verdict 4): MOTION COMBAT COVERS THIS WEAPON.
++ * Donor VrCombat_MeleeCovered (VrSwing.cpp:1007-1015), and it is the gate
++ * on the whole authored-attack suppression below.
++ *
++ * the user, 2026-09-04, wearing it: "i swung my arm but it didn't do a true
++ * attack with the sword... the animation when you attack doesn't show the
++ * sword actually attacking forward, it just shows a swish wind animation
++ * while the sword is FIXED to your hand."
++ *
++ * That is a precise description of two correct mechanisms running at once.
++ * R5's physical blade (overlay 0048) damages from where the hand actually
++ * is, and R4's swing-presses-B path still ran the AUTHORED attack: the
++ * animation swept Link's arm along its scripted arc while the hand limb
++ * stayed pinned to the controller, so what a headset sees is the trail
++ * flying off along an arc the visible sword never travels. Two attacks per
++ * swing, and the one you can see is the one that is not yours.
++ *
++ * The donor made this choice first and made it at the root: with a covered
++ * weapon its func_8083BB20 returns 0, which retires the entire authored
++ * attack state machine -- combo chains, root motion, the stab lunge -- in
++ * one line, precisely BECAUSE the damage comes from the blade instead.
++ * R4 shipped the opposite on purpose (its notes say so plainly: nothing is
++ * re-implemented, so nothing can be re-implemented wrongly) and that was
++ * the right call for a round with no physical blade. R5 built the blade and
++ * did not withdraw the other half. This is that withdrawal.
++ *
++ * COVERED is deliberately narrow, exactly as the donor's is: the three
++ * swords (Master 1, Kokiri 2, Biggoron/Giant's Knife 3). The Deku stick and
++ * the hammer keep their vanilla attacks whole, because nothing physical has
++ * been built for them and an unattackable hammer is worse than an authored
++ * one. It also requires a TRACKED hand and gSohVRBladeDamage: if the Sense
++ * pair drops out mid-fight the authored attack returns on the very next
++ * tick rather than leaving the player with no attack at all.
++ *
++ * And it requires the weapon to be IN HAND. With the sword sheathed
++ * Player_GetMeleeWeaponHeld is 0, so this is false, so the R4 path below
++ * still fires the authored draw-and-slash -- which is how the sword gets
++ * out of its scabbard in the first place. Suppressing that too would leave
++ * a swing with nothing to swing. */
++static s32 Player_VrMotionCombatCovered(Player* sohThis) {
++    s32 sohHeld;
++
++    if ((gSohVRFpActive == 0) || (gSohVRMotionHands == 0) || (gSohVRBladeDamage == 0)) {
++        return 0;
++    }
++    if (gSohVRHandValid[(gSohVRLeftHanded != 0) ? 0 : 1] == 0) {
++        return 0;
++    }
++    if (sohThis->actor.category != ACTORCAT_PLAYER) {
++        return 0;
++    }
++    sohHeld = Player_GetMeleeWeaponHeld(sohThis);
++    return (sohHeld == 1) || (sohHeld == 2) || (sohHeld == 3);
++}
++
++/* SOH_IOS: the four-case steering table. See the patch header, part A. */
++static s16 Player_GetSteeringYaw(PlayState* play, Player* sohThis) {
++    if ((gSohVRFpActive == 0) || (gSohVRHeadingValid == 0) || (sohThis == NULL)) {
++        return Camera_GetInputDirYaw(GET_ACTIVE_CAM(play)); /* case 1 */
++    }
++    if (sohThis->stateFlags2 & (PLAYER_STATE2_CRAWLING | PLAYER_STATE2_GRABBING_DYNAPOLY)) {
++        return sohThis->actor.shape.rot.y; /* case 2 */
++    }
++    if (sSohVRZTargetActive) {
++        /* rev5 (VR R7 verdict 5): case 3 fires on vanilla lock-on itself.
++         * rev6 (VR R8 item 9) removed the comfort-framing half of this
++         * test with the option; what is left is the one that matters and
++         * is the STRAFE. This is the
++         * STRAFE: read in the body frame, forward closes on the target and
++         * left/right circle it, exactly as flat play. */
++        return sohThis->actor.shape.rot.y; /* case 3 */
++    }
++    return (s16)gSohVRHeadingYaw; /* case 4 */
++}
++
++/* SOH_IOS: Link's body in first person (donor
++ * Player_OverrideLimbDrawGameplayVRFirstPerson, z_player_lib.c:1514-1611).
++ * See the patch header, part B -- in particular why the two hand limbs
++ * survive gSohVRHideBody in R3 and what R4 does to them. */
++/* SOH_IOS (0042 rev3): the mirrored hand's culling flip is cleared on the
++ * NEXT limb, not inline, so the hand mesh AND the held item that draws on
++ * the same matrix in PostLimbDraw are both covered by it (donor
++ * sVrHandInvertCulling, z_player_lib.c:1516). */
++static s32 sSohVrHandInvertCulling = 0;
++
++/* rev15 (VR R14): PUBLISH BOTH AIM BASES, ONCE, BEFORE ANY HAND IS DRAWN.
++ *
++ * rev14 published each hand's basis from inside that hand's own
++ * OverrideLimbDraw and cleared both at limb 1. That is a draw-ORDER bug and
++ * it made the whole mechanism dead for the one item it was written for.
++ * PLAYER_LIMB_L_HAND is 0x10 and PLAYER_LIMB_R_HAND is 0x13; SkelAnime
++ * walks the limbs in index order; and the nocked arrow/slingshot seed is
++ * positioned from the L_HAND branch of Player_PostLimbDrawGameplay while
++ * the bow itself is in the R_HAND. So post(L_HAND) ran three limbs BEFORE
++ * override(R_HAND) published the basis it needed, gSohVRAimValid[off hand]
++ * was zero at that site on every frame in BOTH configurations, and
++ * Player_VrAimHeld fell straight back to vanilla. the user: "I see no
++ * change." He was reading the code correctly.
++ *
++ * The composition owes NOTHING to the limb walk -- the pin REPLACES the
++ * limb matrix with gSohVRHandMat rather than composing onto it -- so doing
++ * it once at limb 1 is not an approximation of the old site, it is the same
++ * arithmetic run somewhere the order cannot break it. */
++static void Player_VrPublishAimBases(Player* sohThis) {
++    s32 sohSwordHandVr = (gSohVRLeftHanded != 0) ? 0 : 1;
++    s32 sohAimCfg = (gSohVRLeftHanded != 0) ? 1 : 0;
++    s32 sohSlot = gSohVRPairSlot;
++    s32 sohLimb;
++
++    gSohVRAimValid[0] = gSohVRAimValid[1] = 0;
++    if ((gSohVRMode == 0) || (gSohVRMotionHands == 0)) {
++        return;
++    }
++    if ((sohSlot < 0) || (sohSlot > 1)) {
++        sohSlot = 0;
++    }
++    for (sohLimb = 0; sohLimb < 2; sohLimb++) {
++        /* sohLimb 0 = Link's L_HAND (his sword hand), 1 = his R_HAND. */
++        s32 sohVrHand = (sohLimb == 0) ? sohSwordHandVr : (sohSwordHandVr ^ 1);
++        s32 sohAimModel = (sohLimb == 0) ? sohThis->leftHandType : sohThis->rightHandType;
++        MtxF sohHandMtx;
++        MtxF sohAimMtx;
++        s32 sohI;
++        s32 sohJ;
++        s32 sohF;
++
++        /* A hand that is not tracked this frame has NO basis. A stale one
++         * would keep firing along wherever the controller was when tracking
++         * was last good, which is worse than falling back to vanilla. */
++        if (gSohVRHandValid[sohVrHand] == 0) {
++            continue;
++        }
++        for (sohI = 0; sohI < 4; sohI++) {
++            for (sohJ = 0; sohJ < 4; sohJ++) {
++                sohHandMtx.mf[sohI][sohJ] = gSohVRHandMat[sohSlot][sohVrHand][(sohI * 4) + sohJ];
++            }
++        }
++        Matrix_Push();
++        Matrix_Put(&sohHandMtx);
++        for (sohF = 0; sohF < SOHVR_AIMFRAME_N; sohF++) {
++            if ((sohF == 1) && (gSohVRItemCal != 0) && (sohAimModel >= 0) &&
++                (sohAimModel < SOHVR_ITEMCAL_N)) {
++                Matrix_RotateZYX((s16)(gSohVRItemRotDeg[sohAimModel][sohAimCfg][1] * 182.04f),
++                                 (s16)(gSohVRItemRotDeg[sohAimModel][sohAimCfg][0] * 182.04f),
++                                 (s16)(gSohVRItemRotDeg[sohAimModel][sohAimCfg][2] * 182.04f), MTXMODE_APPLY);
++            }
++            Matrix_Get(&sohAimMtx);
++            gSohVRAimBasis[sohVrHand][sohF][0] = sohAimMtx.xx;
++            gSohVRAimBasis[sohVrHand][sohF][1] = sohAimMtx.yx;
++            gSohVRAimBasis[sohVrHand][sohF][2] = sohAimMtx.zx;
++            gSohVRAimBasis[sohVrHand][sohF][3] = sohAimMtx.xy;
++            gSohVRAimBasis[sohVrHand][sohF][4] = sohAimMtx.yy;
++            gSohVRAimBasis[sohVrHand][sohF][5] = sohAimMtx.zy;
++            gSohVRAimBasis[sohVrHand][sohF][6] = sohAimMtx.xz;
++            gSohVRAimBasis[sohVrHand][sohF][7] = sohAimMtx.yz;
++            gSohVRAimBasis[sohVrHand][sohF][8] = sohAimMtx.zz;
++        }
++        gSohVRAimOrigin[sohVrHand][0] = sohAimMtx.xw;
++        gSohVRAimOrigin[sohVrHand][1] = sohAimMtx.yw;
++        gSohVRAimOrigin[sohVrHand][2] = sohAimMtx.zw;
++        Matrix_Pop();
++        gSohVRAimValid[sohVrHand] = 1;
++    }
++}
++
++static s32 Player_OverrideLimbDrawGameplayVRFirstPerson(PlayState* play, s32 limbIndex, Gfx** dList, Vec3f* pos,
++                                                        Vec3s* rot, void* thisx) {
++    Player* sohThis = (Player*)thisx;
++    s32 sohRet = Player_OverrideLimbDrawGameplayDefault(play, limbIndex, dList, pos, rot, thisx);
++    s32 sohIsHand;
++    s32 sohMotion;
++    s32 sohSwordHandVr;
++    s32 sohVrHand;
++
++    /* rev4 (VR R5, overlay 0050): clear the hand-matrix TAG on the NEXT
++     * limb. The span it must cover is [this limb's own Mtx .. this limb's
++     * PostLimbDraw item Mtx], and SkelAnime_DrawFlexLimbOpa's order is
++     * override -> MATRIX_TOMTX -> postLimbDraw -> the child limb's override,
++     * so clearing HERE is exactly that span and nothing more. Same shape,
++     * and the same reason, as the culling flip below. */
++    gSohVRHandMtxTag = 0;
++
++    if (sSohVrHandInvertCulling) {
++        OPEN_DISPS(play->state.gfxCtx);
++        gSPClearExtraGeometryMode(POLY_OPA_DISP++, G_EX_INVERT_CULLING);
++        CLOSE_DISPS(play->state.gfxCtx);
++        sSohVrHandInvertCulling = 0;
++    }
++
++    /* rev4 (VR R5): the registration table is per FRAME, and limb 1 is the
++     * first override call of each draw. Resetting the COUNT is enough --
++     * stale pointers past it are never read. */
++    if (limbIndex == 1) {
++        gSohVRHandMtxCount[0] = gSohVRHandMtxCount[1] = 0;
++        gSohVRHandRecValid[0] = gSohVRHandRecValid[1] = 0;
++        /* rev13: and the published model types, so a hand that stops being
++         * pinned reports "nothing" rather than the last thing it held. */
++        gSohVRHeldModel[0] = gSohVRHeldModel[1] = -1;
++        /* rev15 (VR R14): BOTH bases, here, before any hand is drawn. See
++         * Player_VrPublishAimBases -- rev14 published them per hand inside
++         * the pin, and the bow's site runs three limbs earlier than the
++         * hand that holds it. */
++        Player_VrPublishAimBases(sohThis);
++    }
++
++    /* The camera sits inside Link's skull. Always. */
++    if ((limbIndex == PLAYER_LIMB_HEAD) || (limbIndex == PLAYER_LIMB_HAT)) {
++        *dList = NULL;
++        return sohRet;
++    }
++
++    sohIsHand = (limbIndex == PLAYER_LIMB_L_HAND) || (limbIndex == PLAYER_LIMB_R_HAND);
++    sohMotion = (gSohVRMotionHands != 0);
++    /* Link is LEFT-handed: his L_HAND holds the sword, his R_HAND the
++     * shield. The player's RIGHT controller drives the sword hand unless
++     * gSohVRLeftHanded. Each controller therefore drives Link's
++     * OPPOSITE-side hand model, which is why the mesh is mirrored below. */
++    sohSwordHandVr = (gSohVRLeftHanded != 0) ? 0 : 1;
++    sohVrHand = (limbIndex == PLAYER_LIMB_L_HAND) ? sohSwordHandVr : (sohSwordHandVr ^ 1);
++
++    if (gSohVRHideBody != 0) {
++        if (!sohIsHand) {
++            *dList = NULL;
++            return sohRet;
++        }
++    } else if (sohMotion) {
++        /* A floating hand on the end of an arm that is not there is worse
++         * than no arm at all (donor z_player_lib.c:1550-1556). */
++        if ((limbIndex == PLAYER_LIMB_L_SHOULDER) || (limbIndex == PLAYER_LIMB_L_FOREARM) ||
++            (limbIndex == PLAYER_LIMB_R_SHOULDER) || (limbIndex == PLAYER_LIMB_R_FOREARM)) {
++            *dList = NULL;
++            return sohRet;
++        }
++    }
++
++    /* THE PIN. gSohVRHandValid is the ONLY test: no Sense pair, tracking
++     * lost, or a hand out of view and this falls back to R3's ANIMATED hand
++     * on the very next frame, with nothing else needing to know. */
++    if (sohIsHand && sohMotion && (gSohVRHandValid[sohVrHand] != 0)) {
++        gSohVRHandPins = gSohVRHandPins + 1;
++        MtxF sohHandMtx;
++        s32 sohSlot = gSohVRPairSlot; /* the slot latched for THIS frame's pair */
++        s32 sohMirror;
++        s32 sohI;
++        s32 sohJ;
++        f32 sohScale = sohThis->actor.scale.x;
++        if ((sohSlot < 0) || (sohSlot > 1)) {
++            sohSlot = 0;
++        }
++        for (sohI = 0; sohI < 4; sohI++) {
++            for (sohJ = 0; sohJ < 4; sohJ++) {
++                sohHandMtx.mf[sohI][sohJ] = gSohVRHandMat[sohSlot][sohVrHand][(sohI * 4) + sohJ];
++            }
++        }
++        /* Replace the limb matrix outright, then fold Link's model scale
++         * back in -- which is what makes child and adult both work without
++         * the shell knowing anything about Link (donor VR_SetHandScale). */
++        /* rev4 (VR R5, overlay 0050): publish the matrix we are ABOUT to
++         * install as this hand's RECORD pose, and tag the Mtx allocations
++         * that follow. The interpreter re-seats them onto the live pose of
++         * each compositor frame with D = inverse(record) * live, which is
++         * what turns 20 Hz interpolated hands into headset-rate ones. Note
++         * this is the matrix BEFORE the scale and the mirror: those are the
++         * local part L, and (L * record) * D == L * live is the identity the
++         * whole mechanism rests on. */
++        for (sohI = 0; sohI < 4; sohI++) {
++            for (sohJ = 0; sohJ < 4; sohJ++) {
++                gSohVRHandRecMat[sohVrHand][(sohI * 4) + sohJ] = sohHandMtx.mf[sohI][sohJ];
++            }
++        }
++        gSohVRHandRecValid[sohVrHand] = 1;
++        gSohVRHandMtxTag = sohVrHand + 1;
++
++        Matrix_Put(&sohHandMtx);
++        Matrix_Scale(sohScale, sohScale, sohScale, MTXMODE_APPLY);
++        /* Mirroring is PER HAND, not global: the reflection that flips a
++         * mesh's handedness also mirrors held items' face designs. The sword
++         * survives that; the shield's crest reads upside-down. */
++        sohMirror = (gSohVRLeftHanded == 0) &&
++                    (((limbIndex == PLAYER_LIMB_L_HAND) ? gSohVRHandMirrorSword : gSohVRHandMirrorShield) != 0);
++        if (sohMirror) {
++            Matrix_Scale(-1.0f, 1.0f, 1.0f, MTXMODE_APPLY);
++            /* A reflection reverses triangle winding, so the hand and its
++             * held item would render inside-out. Cleared on the next limb. */
++            OPEN_DISPS(play->state.gfxCtx);
++            gSPSetExtraGeometryMode(POLY_OPA_DISP++, G_EX_INVERT_CULLING);
++            CLOSE_DISPS(play->state.gfxCtx);
++            sSohVrHandInvertCulling = 1;
++        }
++        /* rev13 (VR R12 item 4): THE HELD ITEM'S OWN SEAT.
++         *
++         * the user, on 1.0.1.15: the slingshot is about 90 degrees off and
++         * aimed sideways, and the ocarina is held upright with its
++         * mouthpiece pointing away. Both are the same thing, and it is
++         * structural rather than a bad number: vanilla does not attach an
++         * item to a generic hand -- the hand AND the item are one display
++         * list, picked by leftHandType / rightHandType, and each was
++         * modelled with the fist in whatever pose that item wants. The pin
++         * above installs ONE calibration, dialled against the SWORD's fist,
++         * so every other mesh inherits the sword's seat and comes out
++         * turned by the difference between its authored fist and the
++         * sword's.
++         *
++         * The correction is therefore keyed by the MODEL TYPE, which is the
++         * thing that names the mesh -- and names the hand with it, because
++         * PLAYER_MODELTYPE_LH_* is Link's sword hand and _RH_* his off
++         * hand. The second key is the CONFIGURATION, because the mirror
++         * above is applied only in right-handed play and a reflection flips
++         * the sign of two of the three angles.
++         *
++         * It is applied to the LIMB because there is nothing else to apply
++         * it to, and that is the right outcome: the wearer's own hands are
++         * hidden and what he is looking at is the item. It goes AFTER the
++         * record matrix is published, so it is part of the local L in
++         * overlay 0050's (L * record) * D == L * live identity and the
++         * headset-rate re-seat keeps working untouched. */
++        {
++            s32 sohModel = (limbIndex == PLAYER_LIMB_L_HAND) ? sohThis->leftHandType : sohThis->rightHandType;
++            if ((sohModel >= 0) && (sohModel < SOHVR_ITEMCAL_N)) {
++                s32 sohCfg = (gSohVRLeftHanded != 0) ? 1 : 0;
++                gSohVRHeldModel[sohVrHand] = sohModel;
++                if (gSohVRItemCal != 0) {
++                    /* Rotate about the grip first, then offset along the
++                     * corrected item's own axes -- which is the order a
++                     * human dials in: get it pointing right, then slide it
++                     * into the fist. 182.04 is 0x10000/360, the binang the
++                     * whole file uses. */
++                    Matrix_RotateZYX((s16)(gSohVRItemRotDeg[sohModel][sohCfg][1] * 182.04f),
++                                     (s16)(gSohVRItemRotDeg[sohModel][sohCfg][0] * 182.04f),
++                                     (s16)(gSohVRItemRotDeg[sohModel][sohCfg][2] * 182.04f), MTXMODE_APPLY);
++                    Matrix_Translate(gSohVRItemOffU[sohModel][sohCfg][0], gSohVRItemOffU[sohModel][sohCfg][1],
++                                     gSohVRItemOffU[sohModel][sohCfg][2], MTXMODE_APPLY);
++                }
++            } else {
++                gSohVRHeldModel[sohVrHand] = -1;
++            }
++        }
++        /* The caller applies Matrix_TranslateRotateZYX(pos, rot) next; zero
++         * both so the base skeleton contributes nothing on top of the pose
++         * we just installed (z_skelanime.c:406-407). */
++        pos->x = pos->y = pos->z = 0.0f;
++        rot->x = rot->y = rot->z = 0;
++    }
++
++    return sohRet;
++}
++
++/* SOH_IOS (overlay 0042 rev14, VR R13, Q-VR28): WHERE A PROJECTILE GOES.
++ *
++ * the user, on 1.0.1.16: "I can fire now, but it shoots way up HIGH and to
++ * the RIGHT (sword on right) / HIGH and to the LEFT (sword on left). It
++ * needs to follow where my aiming is."
++ *
++ * R12 predicted the mesh MIRROR: a rotation Euler-extracted from a
++ * reflected matrix is not the rotation of the un-reflected frame. THAT IS
++ * NOT THE CAUSE, and retiring it is half of this round.
++ * Matrix_MtxFToYXZRotS reads yaw = atan2(mf->xz, mf->zz) and pitch =
++ * atan2(-mf->yz, hypot(mf->xz, mf->zz)) -- the THIRD COLUMN and nothing
++ * else -- and Actor_SetProjectileSpeed flies the actor along exactly that
++ * column, while Matrix_Scale(-1, 1, 1) negates column ZERO. Vanilla's aim
++ * extraction is reflection-safe by construction; only the ROLL it also
++ * writes is corrupted, and roll is the arrow's cosmetic spin.
++ *
++ * The cause is the fixed authored correction that sits between the limb
++ * matrix and that extraction. Player_PostLimbDrawGameplay's L_HAND branch
++ * applies Matrix_RotateZYX(0x69E8, -0x5708, 0x458E) first, which carries the
++ * arrow's axis to (0.413, 0.787, 0.459) in the limb frame -- 42 degrees to
++ * the RIGHT of and 52 degrees ABOVE the limb's own +Z. It is authored for
++ * the ANIMATED bow-draw pose; in VR the limb matrix IS the controller, so
++ * those two numbers land on the controller. "High, and to the right." And
++ * the mirror does explain the FLIP after all, one layer down: the fixed
++ * correction mixes 0.413 of column ZERO into the composed third column, and
++ * the mirror negates column zero in right-handed play only.
++ *
++ * So: the direction is the held item's own forward axis carried through the
++ * pinned, calibrated hand pose as a VECTOR, and vanilla's fixed correction
++ * is not applied at all. The axis, the frame and two angular trims are
++ * console-tunable (`vr aim`, `vr set aimaxis|aimpitch|aimyaw|aimframe`)
++ * because a sign error here has to be correctable from a headset.
++ *
++ * Which hand: the one HOLDING the aimable item. PLAYER_MODELTYPE_RH_* is
++ * Link's off hand and _LH_* his sword hand, so the bow/slingshot and the
++ * hookshot aim from the off hand even though the arrow is nocked in the
++ * sword hand, and the boomerang aims from the sword hand. */
++static s32 Player_VrAimAimable(s32 sohModel) {
++    return (sohModel == PLAYER_MODELTYPE_RH_BOW_SLINGSHOT) ||
++           (sohModel == PLAYER_MODELTYPE_RH_BOW_SLINGSHOT_2) ||
++           (sohModel == PLAYER_MODELTYPE_RH_HOOKSHOT) || (sohModel == PLAYER_MODELTYPE_LH_BOOMERANG);
++}
++
++s32 Player_VrAimHeld(Player* sohThis, s32 sohSite, Vec3f* sohPosOut, Vec3s* sohRotOut, MtxF* sohFrameOut) {
++    s32 sohModel = -1;
++    s32 sohTrimRow;
++    s32 sohVrHand = -1;
++    s32 sohSwordHandVr;
++    s32 sohCfg = (gSohVRLeftHanded != 0) ? 1 : 0;
++    s32 sohF;
++    f32 sohAx, sohAy, sohAz;
++    f32 sohDx, sohDy, sohDz, sohLen, sohFlat;
++    s16 sohYaw, sohPitch;
++    volatile float* sohB;
++    s32 sohRay;
++    f32 sohOx, sohOy, sohOz;
++
++    if ((gSohVRMode == 0) || (gSohVRAim == 0) || (gSohVRMotionHands == 0)) {
++        return 0;
++    }
++    sohSwordHandVr = (gSohVRLeftHanded != 0) ? 0 : 1;
++    if (Player_VrAimAimable(sohThis->rightHandType)) {
++        sohModel = sohThis->rightHandType;
++        sohVrHand = sohSwordHandVr ^ 1;
++    } else if (Player_VrAimAimable(sohThis->leftHandType)) {
++        sohModel = sohThis->leftHandType;
++        sohVrHand = sohSwordHandVr;
++    }
++    if ((sohModel < 0) || (sohModel >= SOHVR_ITEMCAL_N) || (sohVrHand < 0) || (sohVrHand > 1)) {
++        return 0;
++    }
++    /* rev18 (VR R17 item 4): the trim row. The bow and the slingshot are
++     * ONE mesh slot and two different numbers -- the user dialled +25 of yaw
++     * for the bow in the off hand and 0 for the slingshot -- so the row is
++     * chosen by heldItemAction, which is the only thing in the game that
++     * can tell them apart. Every arrow variant (fire, ice, light, and the
++     * three unused ones) is a BOW and takes the bow's row; only
++     * PLAYER_IA_SLINGSHOT takes the extra one. */
++    sohTrimRow = sohModel;
++    if (((sohModel == PLAYER_MODELTYPE_RH_BOW_SLINGSHOT) ||
++         (sohModel == PLAYER_MODELTYPE_RH_BOW_SLINGSHOT_2)) &&
++        (sohThis->heldItemAction == PLAYER_IA_SLINGSHOT)) {
++        sohTrimRow = SOHVR_AIMTRIM_SLINGSHOT;
++    }
++    /* rev16 (VR R15): the controller's own aim ray, when the shell has one
++     * for this hand. It is already a unit direction in game world space;
++     * the axis table and the hand fix are about the MESH frame and do not
++     * apply to it. The trims below still do. */
++    sohRay = ((gSohVRAimFrame == 2) && (gSohVRAimRayValid[sohVrHand] != 0)) ? 1 : 0;
++    if ((sohRay == 0) && (gSohVRAimValid[sohVrHand] == 0)) {
++        return 0;
++    }
++    if (sohRay != 0) {
++        sohAx = 0.0f;
++        sohAy = 0.0f;
++        sohAz = 0.0f;
++        sohDx = gSohVRAimRayDir[sohVrHand][0];
++        sohDy = gSohVRAimRayDir[sohVrHand][1];
++        sohDz = gSohVRAimRayDir[sohVrHand][2];
++        sohOx = gSohVRAimRayOrg[sohVrHand][0];
++        sohOy = gSohVRAimRayOrg[sohVrHand][1];
++        sohOz = gSohVRAimRayOrg[sohVrHand][2];
++    } else {
++        sohOx = gSohVRAimOrigin[sohVrHand][0];
++        sohOy = gSohVRAimOrigin[sohVrHand][1];
++        sohOz = gSohVRAimOrigin[sohVrHand][2];
++        sohF = (gSohVRAimFrame == 1) ? 1 : 0;
++        sohB = (volatile float*)gSohVRAimBasis[sohVrHand][sohF];
++        sohAx = gSohVRAimAxis[sohModel][0];
++        sohAy = gSohVRAimAxis[sohModel][1];
++        sohAz = gSohVRAimAxis[sohModel][2];
++        /* rev15 (VR R14): the axis table is expressed in the SWORD hand's
++         * calibrated frame, because that is the fist the whole calibration was
++         * dialled against and the reason (1, 0, 0) is the default at all -- the
++         * blade runs along the L_HAND limb's +X. The bow is in the OTHER hand,
++         * whose calibration differs by as much as ninety degrees of yaw, so the
++         * same local axis there points somewhere else entirely. This carries it
++         * across. Identity for the sword hand by construction; `vr set
++         * aimhandfix 0` is the A/B. */
++        if (gSohVRAimHandFixOn != 0) {
++            volatile float* sohFix = (volatile float*)gSohVRAimHandFix[sohVrHand];
++            f32 sohFx = (sohFix[0] * sohAx) + (sohFix[1] * sohAy) + (sohFix[2] * sohAz);
++            f32 sohFy = (sohFix[3] * sohAx) + (sohFix[4] * sohAy) + (sohFix[5] * sohAz);
++            f32 sohFz = (sohFix[6] * sohAx) + (sohFix[7] * sohAy) + (sohFix[8] * sohAz);
++            sohAx = sohFx;
++            sohAy = sohFy;
++            sohAz = sohFz;
++        }
++        sohDx = (sohAx * sohB[0]) + (sohAy * sohB[3]) + (sohAz * sohB[6]);
++        sohDy = (sohAx * sohB[1]) + (sohAy * sohB[4]) + (sohAz * sohB[7]);
++        sohDz = (sohAx * sohB[2]) + (sohAy * sohB[5]) + (sohAz * sohB[8]);
++    }
++    sohLen = sqrtf((sohDx * sohDx) + (sohDy * sohDy) + (sohDz * sohDz));
++    if (sohLen < 0.000001f) {
++        return 0;
++    }
++    sohDx /= sohLen;
++    sohDy /= sohLen;
++    sohDz /= sohLen;
++
++    /* The same two atan2s Matrix_MtxFToYXZRotS would have run on this
++     * column, plus the trims -- so the pair we hand back is exactly the pair
++     * Actor_SetProjectileSpeed will fly along. */
++    sohFlat = sqrtf((sohDx * sohDx) + (sohDz * sohDz));
++    sohYaw = (s16)(Math_FAtan2F(sohDx, sohDz) * (0x8000 / M_PI)) +
++             (s16)(gSohVRAimTrimDeg[sohTrimRow][sohCfg][0] * 182.04f);
++    sohPitch = (s16)(Math_FAtan2F(-sohDy, sohFlat) * (0x8000 / M_PI)) +
++               (s16)(gSohVRAimTrimDeg[sohTrimRow][sohCfg][1] * 182.04f);
++    /* Re-derive the direction FROM the trimmed pair, so `vr aim` reports the
++     * vector the projectile actually gets rather than the one before trim. */
++    sohDx = Math_SinS(sohYaw) * Math_CosS(sohPitch);
++    sohDy = -Math_SinS(sohPitch);
++    sohDz = Math_CosS(sohYaw) * Math_CosS(sohPitch);
++
++    if (sohRotOut != NULL) {
++        sohRotOut->x = sohPitch;
++        sohRotOut->y = sohYaw;
++        sohRotOut->z = 0;
++    }
++    if (sohPosOut != NULL) {
++        sohPosOut->x = sohOx + (sohDx * gSohVRAimSpawnU);
++        sohPosOut->y = sohOy + (sohDy * gSohVRAimSpawnU);
++        sohPosOut->z = sohOz + (sohDz * gSohVRAimSpawnU);
++    }
++    /* An orthonormal frame with +Z along the aim, at Link's model scale, for
++     * the one consumer that needs a MATRIX rather than a pose: vanilla's
++     * hookshot reticle casts along the current matrix's +Z. */
++    if (sohFrameOut != NULL) {
++        f32 sohUx = 0.0f, sohUy = 1.0f, sohUz = 0.0f;
++        f32 sohXx, sohXy, sohXz, sohYx, sohYy, sohYz, sohS;
++        if (sohFlat < 0.05f) {
++            sohUx = 0.0f;
++            sohUy = 0.0f;
++            sohUz = 1.0f;
++        }
++        sohXx = (sohUy * sohDz) - (sohUz * sohDy);
++        sohXy = (sohUz * sohDx) - (sohUx * sohDz);
++        sohXz = (sohUx * sohDy) - (sohUy * sohDx);
++        sohLen = sqrtf((sohXx * sohXx) + (sohXy * sohXy) + (sohXz * sohXz));
++        if (sohLen < 0.000001f) {
++            return 0;
++        }
++        sohXx /= sohLen;
++        sohXy /= sohLen;
++        sohXz /= sohLen;
++        sohYx = (sohDy * sohXz) - (sohDz * sohXy);
++        sohYy = (sohDz * sohXx) - (sohDx * sohXz);
++        sohYz = (sohDx * sohXy) - (sohDy * sohXx);
++        sohS = sohThis->actor.scale.x;
++        Matrix_MtxFCopy(sohFrameOut, &gMtxFClear);
++        sohFrameOut->xx = sohXx * sohS;
++        sohFrameOut->yx = sohXy * sohS;
++        sohFrameOut->zx = sohXz * sohS;
++        sohFrameOut->xy = sohYx * sohS;
++        sohFrameOut->yy = sohYy * sohS;
++        sohFrameOut->zy = sohYz * sohS;
++        sohFrameOut->xz = sohDx * sohS;
++        sohFrameOut->yz = sohDy * sohS;
++        sohFrameOut->zz = sohDz * sohS;
++        sohFrameOut->xw = sohOx;
++        sohFrameOut->yw = sohOy;
++        sohFrameOut->zw = sohOz;
++    }
++
++    gSohVRAimDirW[0] = sohDx;
++    gSohVRAimDirW[1] = sohDy;
++    gSohVRAimDirW[2] = sohDz;
++    gSohVRAimFwdW[0] = gSohVRAimBasis[sohVrHand][0][0];
++    gSohVRAimFwdW[1] = gSohVRAimBasis[sohVrHand][0][1];
++    gSohVRAimFwdW[2] = gSohVRAimBasis[sohVrHand][0][2];
++    gSohVRAimPosW[0] = sohOx;
++    gSohVRAimPosW[1] = sohOy;
++    gSohVRAimPosW[2] = sohOz;
++    gSohVRAimModel = sohModel;
++    gSohVRAimTrimRow = sohTrimRow;
++    gSohVRAimHandUsed = sohVrHand;
++    gSohVRAimSite = sohSite;
++    gSohVRAimHits = gSohVRAimHits + 1;
++    /* rev16: 2 = the controller's aim ray, 1 = the hand basis. The nocked
++     * site publishes this as gSohVRAimPath so the sheet can say which. */
++    return (sohRay != 0) ? 2 : 1;
+ }
++#endif
+ 
+-void Player_AnimReplacePlayOnceAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
+-    Player_AnimReplacePlayOnceSetSpeed(play, this, anim, flags, PLAYER_ANIM_ADJUSTED_SPEED);
+-}
+-
+-void Player_AnimReplaceNormalPlayOnceAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim) {
+-    Player_AnimReplacePlayOnceAdjusted(play, this, anim, 0x1C);
+-}
+-
+-void Player_AnimReplacePlayLoopSetSpeed(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags,
+-                                        f32 playbackSpeed) {
+-    LinkAnimation_PlayLoopSetSpeed(play, &this->skelAnime, anim, playbackSpeed);
+-    Player_StartAnimMovement(play, this, flags);
+-}
+-
+-void Player_AnimReplacePlayLoop(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
+-    Player_AnimReplacePlayLoopSetSpeed(play, this, anim, flags, 1.0f);
+-}
+-
+-void Player_AnimReplacePlayLoopAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim, s32 flags) {
+-    Player_AnimReplacePlayLoopSetSpeed(play, this, anim, flags, PLAYER_ANIM_ADJUSTED_SPEED);
+-}
+-
+-void Player_AnimReplaceNormalPlayLoopAdjusted(PlayState* play, Player* this, LinkAnimationHeader* anim) {
+-    Player_AnimReplacePlayLoopAdjusted(play, this, anim, 0x1C);
+-}
+-
+ void Player_ProcessControlStick(PlayState* play, Player* this) {
+     s8 spinAngle;
+     s8 direction;
+@@ -2046,7 +3123,11 @@
+ 
+     func_80077D10(&sControlStickMagnitude, &sControlStickAngle, sControlInput);
+ 
++#ifdef __IOS__
++    sControlStickWorldYaw = Player_GetSteeringYaw(play, this) + sControlStickAngle;
++#else
+     sControlStickWorldYaw = Camera_GetInputDirYaw(GET_ACTIVE_CAM(play)) + sControlStickAngle;
++#endif
+ 
+     this->controlStickDataIndex = (this->controlStickDataIndex + 1) % 4;
+ 
+@@ -2346,6 +3427,12 @@
+         }
+ 
+         if (itemSfx != 0) {
++#ifdef __IOS__
++            {
++                extern volatile int gSohVRSwingSfx;
++                gSohVRSwingSfx = gSohVRSwingSfx + 1;
++            }
++#endif
+             func_808328EC(this, itemSfx);
+         }
+ 
+@@ -2815,7 +3902,15 @@
+     if (LinkAnimation_Update(play, &this->upperSkelAnime) ||
+         ((Player_ItemToItemAction(this->heldItemId) == this->heldItemAction) &&
+          (sUseHeldItem = (sUseHeldItem || GameInteractor_Should(VB_USE_HELD_ITEM_AFTER_CHANGE,
+-                                                                ((this->modelAnimType != PLAYER_ANIMTYPE_3) &&
++                                                                (
++#ifdef __IOS__
++                                                                 /* SOH_IOS (overlay 0042 rev19, VR
++                                                                  * R18 item 1): the equip press
++                                                                  * DRAWS the item and nothing else.
++                                                                  * See Player_VrEquipNoAutoUse. */
++                                                                 !Player_VrEquipNoAutoUse(this) &&
++#endif
++                                                                 (this->modelAnimType != PLAYER_ANIMTYPE_3) &&
+                                                                  (play->shootingGalleryStatus == 0)),
+                                                                 this))))) {
+         Player_SetUpperActionFunc(this, sItemActionUpdateFuncs[this->heldItemAction]);
+@@ -2880,10 +3975,42 @@
+     }
+ 
+     return true;
++}
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0042 rev17, VR R16 item 2): can the VR aim ray drive
++ * the boomerang on this tick? Deliberately narrow -- it asks the same
++ * question the throw site asks (Player_VrAimHeld with the boomerang in
++ * hand), so the tick that skips the hold is the tick whose throw will be
++ * aimed. It is a one-shot: func_80834D2C is only reached from
++ * func_80834F2C while the boomerang's idle upper action is running, and
++ * it replaces that action before returning. */
++static s32 sSohVRBoomThrowNow = 0;
++
++static s32 Player_VrBoomerangDirect(Player* sohThis, PlayState* sohPlay) {
++    Vec3f sohPos;
++    Vec3s sohRot;
++
++    (void)sohPlay;
++    if ((gSohVRFpActive == 0) || (gSohVRBoomDirect == 0)) {
++        return 0;
++    }
++    if (sohThis->heldItemAction != PLAYER_IA_BOOMERANG) {
++        return 0;
++    }
++    /* vanilla's own guard: one boomerang in the air at a time. */
++    if (sohThis->stateFlags1 & PLAYER_STATE1_BOOMERANG_THROWN) {
++        return 0;
++    }
++    return (Player_VrAimHeld(sohThis, 3, &sohPos, &sohRot, NULL) != 0);
+ }
++#endif
+ 
+ s32 func_80834D2C(Player* this, PlayState* play) {
+     LinkAnimationHeader* anim;
++#ifdef __IOS__
++    sSohVRBoomThrowNow = 0;
++#endif
+ 
+     if (this->heldItemAction != PLAYER_IA_BOOMERANG) {
+         if (!func_8083442C(this, play)) {
+@@ -2897,9 +4024,27 @@
+         }
+         LinkAnimation_PlayOnce(play, &this->upperSkelAnime, anim);
+     } else {
+-        Player_SetUpperActionFunc(this, func_80835884);
+-        this->unk_834 = 10;
+-        LinkAnimation_PlayOnce(play, &this->upperSkelAnime, &gPlayerAnim_link_boom_throw_wait2waitR);
++#ifdef __IOS__
++        /* SOH_IOS (0042 rev17, VR R16 item 2): synthesise the release. The
++         * upper action goes straight to the THROW, with vanilla's own
++         * throw animation chosen the way func_808358F0 chooses it, and
++         * unk_834 keeps vanilla's 10 because func_808359FC is the thing
++         * that zeroes it when the animation ends. */
++        sSohVRBoomThrowNow = Player_VrBoomerangDirect(this, play);
++        if (sSohVRBoomThrowNow) {
++            Player_SetUpperActionFunc(this, func_808359FC);
++            this->unk_834 = 10;
++            LinkAnimation_PlayOnce(play, &this->upperSkelAnime,
++                                   (this->unk_870 < 0.5f) ? &gPlayerAnim_link_boom_throwR
++                                                          : &gPlayerAnim_link_boom_throwL);
++            gSohVRBoomDirectThrows = gSohVRBoomDirectThrows + 1;
++        } else
++#endif
++        {
++            Player_SetUpperActionFunc(this, func_80835884);
++            this->unk_834 = 10;
++            LinkAnimation_PlayOnce(play, &this->upperSkelAnime, &gPlayerAnim_link_boom_throw_wait2waitR);
++        }
+     }
+ 
+     if (this->stateFlags1 & PLAYER_STATE1_ON_HORSE) {
+@@ -2939,6 +4084,19 @@
+     if ((this->doorType == PLAYER_DOORTYPE_NONE) && !(this->stateFlags1 & PLAYER_STATE1_BOOMERANG_THROWN)) {
+         if (sUseHeldItem || func_80834E44(play)) {
+             if (func_80834D2C(this, play)) {
++#ifdef __IOS__
++                /* SOH_IOS (0042 rev17, VR R16 item 2): func_80834EB8 is what
++                 * raises unk_6AD = 2 -- first person, CAM_MODE_BOOMERANG, the
++                 * zoom sound, the HUD fade and the stereo flatten. A throw
++                 * that has already been synthesised must not enter it. The
++                 * bow and the hookshot come through the same line and are
++                 * unaffected: sSohVRBoomThrowNow is only ever set by the
++                 * boomerang branch above, and cleared on entry. */
++                if (sSohVRBoomThrowNow) {
++                    sSohVRBoomThrowNow = 0;
++                    return 0;
++                }
++#endif
+                 return func_80834EB8(this, play);
+             }
+         }
+@@ -3007,6 +4165,15 @@
+         }
+ 
+         this->unk_A73 = 4;
++#ifdef __IOS__
++        if (!Player_HoldsHookshot(this)) {
++            if (gSohVRAimPath >= 1) {
++                gSohVRAimShots = gSohVRAimShots + 1;
++            } else {
++                gSohVRAimVanillaShots = gSohVRAimVanillaShots + 1;
++            }
++        }
++#endif
+         this->heldActor->parent = NULL;
+         this->actor.child = NULL;
+         this->heldActor = NULL;
+@@ -3244,9 +4411,32 @@
+         f32 posX = (Math_SinS(this->actor.shape.rot.y) * 10.0f) + this->actor.world.pos.x;
+         f32 posZ = (Math_CosS(this->actor.shape.rot.y) * 10.0f) + this->actor.world.pos.z;
+         s32 yaw = (this->focusActor != NULL) ? this->actor.shape.rot.y + 14000 : this->actor.shape.rot.y;
++#ifdef __IOS__
++        f32 posY = this->actor.world.pos.y + 30.0f;
++        s32 pitch = this->actor.focus.rot.x;
++        Vec3f sohAimPos;
++        Vec3s sohAimRot;
++        s32 sohAimed;
++        EnBoom* boomerang;
++
++        /* SOH_IOS (0042 rev14, VR R13): thrown along the hand, not the body.
++         * The lock-on lead of 14000 binang is deliberately dropped with the
++         * body yaw -- a wearer who is pointing somewhere is not asking the
++         * game to lead a target for him. */
++        sohAimed = Player_VrAimHeld(this, 3, &sohAimPos, &sohAimRot, NULL);
++        if (sohAimed) {
++            posX = sohAimPos.x;
++            posY = sohAimPos.y;
++            posZ = sohAimPos.z;
++            yaw = sohAimRot.y;
++            pitch = sohAimRot.x;
++        }
++        boomerang = (EnBoom*)Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOOM, posX, posY, posZ, pitch, yaw, 0, 0);
++#else
+         EnBoom* boomerang =
+             (EnBoom*)Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOOM, posX, this->actor.world.pos.y + 30.0f, posZ,
+                                  this->actor.focus.rot.x, yaw, 0, 0);
++#endif
+ 
+         this->boomerangActor = &boomerang->actor;
+ 
+@@ -3256,7 +4446,12 @@
+             this->stateFlags1 |= PLAYER_STATE1_BOOMERANG_THROWN;
+ 
+             if (!Player_CheckHostileLockOn(this)) {
+-                Player_SetParallel(this);
++#ifdef __IOS__
++                if (!sohAimed)
++#endif
++                {
++                    Player_SetParallel(this);
++                }
+             }
+ 
+             this->unk_A73 = 4;
+@@ -4014,6 +5209,34 @@
+  */
+ s32 Player_GetMovementSpeedAndYaw(Player* this, f32* outSpeedTarget, s16* outYawTarget, f32 speedMode,
+                                   PlayState* play) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev8, VR R9 part B): A RAISED SHIELD IS A
++     * NEUTRAL STICK. the user: "the left grip shield crouch lowers your height
++     * but now you can move around, which you're not supposed to."
++     *
++     * The kinematic override below is stopped at its own gate, but stopping
++     * it there alone would only stop OUR walk: every vanilla locomotion
++     * action asks this function where the player wants to go, and any of
++     * them can move him. Reporting "the stick is neutral" -- which is
++     * exactly what `return false` means here -- stops all of them at once,
++     * in the words the caller already understands, without touching a single
++     * action func. The head and the turn stick are untouched: neither goes
++     * through this function.
++     *
++     * rev9 (VR R9 part B review fix): A CUTSCENE MUST NEVER SEE THE
++     * STANCE. This is vanilla's function, and the cutscene locomotion
++     * paths ask it where the player wants to go exactly as the free
++     * ones do. Reporting a neutral stick to a blocking cutscene would
++     * freeze Link mid-script for as long as the grip stayed down (or
++     * for as long as vanilla left PLAYER_STATE1_SHIELDING set, which is
++     * not ours to time). Player_InBlockingCsMode is the same predicate
++     * the facing pin and the kinematic override both stand down for. */
++    if (Player_VrShieldStance(this) && !Player_InBlockingCsMode(play, this)) {
++        *outSpeedTarget = 0.0f;
++        *outYawTarget = this->actor.shape.rot.y;
++        return false;
++    }
++#endif
+     if (!Player_CalcSpeedAndYawFromControlStick(play, this, outSpeedTarget, outYawTarget, speedMode)) {
+         *outYawTarget = this->actor.shape.rot.y;
+ 
+@@ -4029,7 +5252,11 @@
+ 
+         return false;
+     } else {
++#ifdef __IOS__
++        *outYawTarget += Player_GetSteeringYaw(play, this);
++#else
+         *outYawTarget += Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
++#endif
+         return true;
+     }
+ }
+@@ -4422,6 +5649,45 @@
+     }
+ 
+     this->meleeWeaponAnimation = arg2;
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev20, VR R19 item 1): ONE HAMMER SWING, ONE
++     * ENVELOPE, counted at the single site that knows one started.
++     *
++     * func_80837948 is the ONLY function in the game that installs a melee
++     * animation, so BOTH VR routes into a hammer swing arrive here and
++     * neither can be missed or double-counted: a TRIGGER press (rev19's
++     * item mask publishes the hammer's own C button, overlay 0047 mirrors
++     * it onto both triggers, Player_UseItem -> sUseHeldItem ->
++     * func_8083BB20 -> func_80837818 -> here) and a PHYSICAL HAND SWING
++     * (the seq seam above sets sUseHeldItem for a melee weapon the blade
++     * does not cover, which lands in exactly the same place). The counter
++     * therefore inherits the "one swing, one attack" property of
++     * gSohVRSwingSeq without a second edge detector.
++     *
++     * Which animations: the forward and the side chop, plus the jumpslash
++     * FINISH, which is the ground pound a Z+A leap lands into while the
++     * hammer is held -- Player_Action_808502D0 fires the shockwave for
++     * both of those and for neither of the others. The hammer never
++     * combos (func_80837818 zeroes unk_845 for it), so testing arg2 AFTER
++     * the +2 combo bump loses nothing.
++     *
++     * Everything else stays vanilla's and is deliberately untouched: the
++     * animation, NA_SE_IT_HAMMER_SWING, the melee AT quads (motion combat
++     * does not cover weapon 5, so z_player_lib.c registers vanilla's own),
++     * the frame-7 shockwave and func_80842DF4's ground line test. The last
++     * two both read meleeWeaponInfo[0].tip, which vanilla computes through
++     * the L_HAND limb matrix -- i.e. through the controller, and now
++     * through the envelope -- so the damage and the ground hit follow the
++     * head of the hammer the wearer can actually see, with nothing
++     * reimplemented. heldItemAction is the test vanilla itself uses for
++     * the hammer at every one of its own sites. */
++    if ((gSohVRFpActive != 0) && (gSohVRMotionHands != 0) &&
++        (this->heldItemAction == PLAYER_IA_HAMMER) &&
++        ((arg2 == PLAYER_MWA_HAMMER_FORWARD) || (arg2 == PLAYER_MWA_HAMMER_SIDE) ||
++         (arg2 == PLAYER_MWA_JUMPSLASH_FINISH))) {
++        gSohVRHammers = gSohVRHammers + 1;
++    }
++#endif
+ 
+     Player_AnimPlayOnceAdjusted(play, this, D_80854190[arg2].unk_00);
+     if ((arg2 != PLAYER_MWA_FLIPSLASH_START) && (arg2 != PLAYER_MWA_JUMPSLASH_START)) {
+@@ -6275,6 +7541,24 @@
+ }
+ 
+ s32 func_8083BB20(Player* this) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev5, VR R7 verdict 4, donor z_player.c:6416-6423).
++     * EVERY authored B attack originates here, so one return retires the
++     * whole state machine -- the animation, the combo chain, the root motion
++     * and the stab lunge -- for a weapon motion combat covers. The damage
++     * does not go away with it: overlay 0048 registers OoT's own AT quads
++     * along the real blade, through every enemy's own damage table, so what
++     * is removed is the SECOND attack, the one that swept an arc the visible
++     * sword never travelled. Uncovered weapons and every non-VR build reach
++     * the vanilla body one line below, unchanged. */
++    {
++        extern volatile int gSohVRAuthoredSuppressed;
++        if (Player_VrMotionCombatCovered(this)) {
++            gSohVRAuthoredSuppressed = gSohVRAuthoredSuppressed + 1;
++            return 0;
++        }
++    }
++#endif
+     if (!(this->stateFlags1 & PLAYER_STATE1_SHIELDING) && (Player_GetMeleeWeaponHeld(this) != 0)) {
+         if (sUseHeldItem ||
+             ((this->actor.category != ACTORCAT_PLAYER) && CHECK_BTN_ALL(sControlInput->press.button, BTN_B))) {
+@@ -6299,6 +7583,25 @@
+     LinkAnimation_PlayOnceSetSpeed(play, &this->skelAnime,
+                                    GET_PLAYER_ANIM(PLAYER_ANIMGROUP_landing_roll, this->modelAnimType),
+                                    1.25f * sWaterSpeedFactor);
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev6, VR R8 item 8): tell the VR roll camera how
++     * long THIS roll lasts, from the animation itself. */
++    {
++        f32 sohRollSpeed = this->skelAnime.playSpeed;
++        f32 sohRollSecs;
++        if (sohRollSpeed < 0.05f) {
++            sohRollSpeed = 0.05f;
++        }
++        sohRollSecs = (this->skelAnime.endFrame - this->skelAnime.startFrame) / (sohRollSpeed * 20.0f);
++        if (sohRollSecs < 0.20f) {
++            sohRollSecs = 0.20f;
++        }
++        if (sohRollSecs > 2.00f) {
++            sohRollSecs = 2.00f;
++        }
++        gSohVRRollSeconds = sohRollSecs;
++    }
++#endif
+     gSaveContext.ship.stats.count[COUNT_ROLLS]++;
+ }
+ 
+@@ -6347,6 +7650,65 @@
+                     }
+                 } else {
+                     if ((Player_GetMeleeWeaponHeld(this) != 0) && Player_CanUpdateItems(this)) {
++#ifdef __IOS__
++                        /* SOH_IOS (overlay 0042 rev10, VR R10 verdict 4):
++                         * THE LEAP IS VANILLA'S AND HAS TO BE.
++                         *
++                         * the user, on 1.0.1.13: "the jump attack when
++                         * Z-targeting, the camera should reflect a JUMP
++                         * attack -- some vertical movement of the camera. It
++                         * should match vanilla." rev8 returned 1 here, which
++                         * consumed the press and skipped func_8083BA90 --
++                         * and func_8083BA90 IS the leap: it sets
++                         * PLAYER_STATE3_MIDAIR, an xz velocity of 5 and a y
++                         * velocity of 5, and the VR eye is anchored on the
++                         * actor root, so with no leap there is nothing for
++                         * the eye to follow. No camera trick can substitute:
++                         * the wearer is standing where Link is standing, and
++                         * in vanilla Link is briefly in the air.
++                         *
++                         * What rev8 was RIGHT about is kept by other means,
++                         * which is why this is not a revert:
++                         *   * the authored sword ANIMATION is invisible --
++                         *     the hand limb is pinned to the controller pose
++                         *     by this same overlay, whatever the animation
++                         *     asks the arm to do;
++                         *   * its melee QUADS never register -- z_player_lib.c
++                         *     refuses vanilla's fattened AT quads for the
++                         *     whole time motion combat covers the weapon, so
++                         *     the only thing that damages is the blade;
++                         *   * and the VOICE is counted here, so the shell's
++                         *     chop path can decline to play a second one.
++                         *     func_8083BA90 ends with
++                         *     Player_PlayVoiceSfx(NA_SE_VO_LI_SWORD_L) --
++                         *     the loud yell the user already hears and asked
++                         *     to keep -- and one press must be one voice. */
++                        if (Player_VrMotionCombatCovered(this)) {
++                            gSohVRJumpSlashVanilla = gSohVRJumpSlashVanilla + 1;
++                            /* rev11 (VR R11 verdict 5): AND THE CHOP STARTS
++                             * HERE. the user, on 1.0.1.14: "in the Z-targeting
++                             * attack (which I DID hear yelling), the sword
++                             * isn't moving, only the swish." The seam in
++                             * Player_UpdateCommon started the chop on
++                             * Player_VrZTargetActive -- focusActor non-NULL
++                             * AND targetCtx.unk_4B != 0, i.e. a CONVERGED
++                             * reticle -- while the leap he was hearing gates
++                             * on this handler's Player_IsZTargeting, which is
++                             * hostile lock-on OR friendly-or-PARALLEL. Hold Z
++                             * with nothing lockable, or press A during the
++                             * reticle's own convergence, and vanilla leapt
++                             * and yelled while the envelope never started.
++                             *
++                             * One move must have ONE trigger, and this is the
++                             * site that owns it: the counter the shell reads
++                             * and the damage window are now set on exactly
++                             * the ticks the leap happens. Ten ticks is the
++                             * envelope's 0.5 s plus a compositor frame of
++                             * slack; the seam decrements it. */
++                            gSohVRChopTicks = 10;
++                            gSohVRChops = gSohVRChops + 1;
++                        }
++#endif
+                         func_8083BA90(play, this, PLAYER_MWA_JUMPSLASH_START, 5.0f, 5.0f);
+                     } else {
+                         Player_SetupRoll(this, play);
+@@ -6508,6 +7870,16 @@
+ s32 func_8083C484(Player* this, f32* arg1, s16* arg2) {
+     s16 yaw = this->yaw - *arg2;
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev2, donor z_player.c:6693): VR direct
++     * movement has no pivot brake. Reversing the stick just moves the other
++     * way immediately -- the body does not turn with movement in VR, so
++     * there is nothing to pivot. */
++    if (Player_VrDirectMovement(this)) {
++        return 0;
++    }
++#endif
++
+     if (ABS(yaw) > 0x6000) {
+         if (Player_DecelerateToZero(this)) {
+             *arg1 = 0.0f;
+@@ -6527,6 +7899,16 @@
+ }
+ 
+ s32 Player_ActionHandler_8(Player* this, PlayState* play) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev5, donor z_player.c:6690-6695): no held-B spin
++     * charge for a covered weapon. Holding B is how the chord in VR R7
++     * verdict 4's stab works, and a held B that silently charges a spin is a
++     * second meaning for the same press. The spin returns as a gesture when
++     * there is a gesture to return it as. */
++    if (Player_VrMotionCombatCovered(this)) {
++        return 0;
++    }
++#endif
+     if (CHECK_BTN_ALL(sControlInput->cur.button, BTN_B)) {
+         if (!(this->stateFlags1 & PLAYER_STATE1_SHIELDING) && (Player_GetMeleeWeaponHeld(this) != 0) &&
+             (this->unk_844 == 1) && (this->heldItemAction != PLAYER_IA_DEKU_STICK)) {
+@@ -7115,6 +8497,15 @@
+ 
+ void func_8083DF68(Player* this, f32 arg1, s16 arg2) {
+     Math_AsymStepToF(&this->linearVelocity, arg1, REG(19) / 100.0f, 1.5f);
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev2, donor z_player.c:7286): the stick's world
++     * direction is used verbatim -- velocity goes exactly where the stick
++     * points relative to the headset, never bent by turn easing. */
++    if (Player_VrDirectMovement(this)) {
++        this->yaw = arg2;
++        return;
++    }
++#endif
+     Math_ScaledStepToS(&this->yaw, arg2, REG(27));
+ }
+ 
+@@ -7128,6 +8519,17 @@
+         }
+     }
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev2, donor z_player.c:7305): same exact-
++     * direction rule in the air, and no reversal brake -- air control
++     * follows the stick immediately. */
++    if (Player_VrDirectMovement(this)) {
++        Math_AsymStepToF(&this->linearVelocity, *arg1, 0.05f, 0.1f);
++        this->yaw = *arg2;
++        return;
++    }
++#endif
++
+     if (ABS(yawDiff) > 0x6000) {
+         if (Math_StepToF(&this->linearVelocity, 0.0f, 1.0f)) {
+             this->yaw = *arg2;
+@@ -9043,6 +10445,17 @@
+ }
+ 
+ void func_80842A28(PlayState* play, Player* this) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0042 rev20, VR R19 item 1b): the hammer's ground
++     * hit, counted and otherwise untouched. Both of vanilla's callers
++     * reach it from the tip that the VR envelope moves -- the frame-7
++     * shockwave in Player_Action_808502D0 (which additionally requires
++     * the floor to be within 40 units of Link's own feet) and
++     * func_80842DF4's line test from just beyond meleeWeaponInfo[0].tip
++     * back to it. gSohVRHammers rising and this NOT rising is a swing
++     * whose head never reached the ground. */
++    gSohVRHammerHits = gSohVRHammerHits + 1;
++#endif
+     Player_RequestQuake(play, 27767, 7, 20);
+     play->actorCtx.unk_02 = 4;
+     Player_RequestRumble(this, 255, 20, 150, 0);
+@@ -9147,6 +10560,42 @@
+                     sp68.y = this->meleeWeaponInfo[0].tip.y + (sp50.y * phi_f2);
+                     sp68.z = this->meleeWeaponInfo[0].tip.z + (sp50.z * phi_f2);
+ 
++#ifdef __IOS__
++                    /* SOH_IOS (overlay 0042 rev21, VR R20 item 1c): the VR
++                     * hammer's probe reaches BEYOND the tip. See
++                     * gSohVRHammerProbe above. */
++                    if ((gSohVRFpActive != 0) && (gSohVRMotionHands != 0) &&
++                        (this->heldItemAction == PLAYER_IA_HAMMER) && (gSohVRHammerProbe > 0.0f)) {
++                        Vec3f sohProbeDir;
++                        Vec3f sohProbeEnd;
++                        Vec3f sohProbeHit;
++                        CollisionPoly* sohProbePoly;
++                        s32 sohProbeBg;
++                        f32 sohProbeLen = Math_Vec3f_DistXYZAndStoreDiff(&this->meleeWeaponInfo[0].base,
++                                                                         &this->meleeWeaponInfo[0].tip,
++                                                                         &sohProbeDir);
++
++                        if (sohProbeLen > 0.001f) {
++                            f32 sohProbeK = gSohVRHammerProbe / sohProbeLen;
++
++                            sohProbeEnd.x = this->meleeWeaponInfo[0].tip.x + (sohProbeDir.x * sohProbeK);
++                            sohProbeEnd.y = this->meleeWeaponInfo[0].tip.y + (sohProbeDir.y * sohProbeK);
++                            sohProbeEnd.z = this->meleeWeaponInfo[0].tip.z + (sohProbeDir.z * sohProbeK);
++
++                            if (BgCheck_EntityLineTest1(&play->colCtx, &this->meleeWeaponInfo[0].tip, &sohProbeEnd,
++                                                        &sohProbeHit, &sohProbePoly, true, false, false, true,
++                                                        &sohProbeBg) &&
++                                !SurfaceType_IsIgnoredByEntities(&play->colCtx, sohProbePoly, sohProbeBg) &&
++                                (SurfaceType_GetFloorType(&play->colCtx, sohProbePoly, sohProbeBg) != 6) &&
++                                (func_8002F9EC(play, &this->actor, sohProbePoly, sohProbeBg, &sohProbeHit) == 0)) {
++                                func_80832630(play);
++                                func_80842A28(play, this);
++                                func_80842D20(play, this);
++                                return 1;
++                            }
++                        }
++                    }
++#endif
+                     if (BgCheck_EntityLineTest1(&play->colCtx, &sp68, &this->meleeWeaponInfo[0].tip, &sp5C, &sp78, true,
+                                                 false, false, true, &sp74) &&
+                         !SurfaceType_IsIgnoredByEntities(&play->colCtx, sp78, sp74) &&
+@@ -11908,6 +13357,59 @@
+                 this->actor.world.rot.y = this->yaw;
+             }
+ 
++#ifdef __IOS__
++            /* SOH_IOS (overlay 0042 rev2, donor z_player.c:12106-12123):
++             * KINEMATIC STICK MOVEMENT. While in a neutral locomotion
++             * action, velocity is the stick and nothing else -- direction
++             * exact, speed linear with deflection, applied the same frame.
++             * No acceleration ramp, no start-step latency, no stop-slide.
++             * This deliberately overrides whatever the later-running action
++             * func eased into linearVelocity/yaw, so animations follow
++             * movement instead of gating it, and it must sit HERE, before
++             * Actor_UpdateVelocityXZGravity. Grounded only -- leaving a
++             * ledge keeps momentum until the air action takes over, which
++             * has its own VR steering (func_8083DFE0 above). */
++            /* rev8 (VR R9 part B): AND NOT WHILE THE SHIELD IS UP.
++             *
++             * Overlay 0049 suppresses Player_ActionHandler_11 for the
++             * physical shield, so Link never enters Player_Action_80843188 --
++             * which is where vanilla calls Player_DecelerateToZero and is the
++             * only reason a shielding Link stands still. Re-enabling that
++             * action is NOT the fix: it sets the itemAction = -1
++             * diverged-models marker outside the lifecycle that repairs it,
++             * which is precisely the bug 0049 exists to avoid. So the stop
++             * happens here, at the one gate that was moving him, and the
++             * stick is separately taken away in Player_GetMovementSpeedAndYaw
++             * so nothing ELSE can move him either. Turning the head and the
++             * turn stick are untouched: neither passes through here.
++             *
++             * rev9 (VR R9 part B review fix): AND NOT IN A BLOCKING
++             * CUTSCENE -- the same exclusion the kinematic branch beside
++             * it and the facing pin below both carry. A cutscene walks
++             * Link by script; PLAYER_STATE1_SHIELDING can still be set
++             * when one starts, and whether the wearer is holding the grip
++             * is entirely his business -- so without this the stance would
++             * zero the scripted motion every tick and the scene would
++             * never reach its mark. */
++            if (Player_VrDirectMovement(this) && Player_VrShieldStance(this) &&
++                !Player_InBlockingCsMode(play, this) && (this->actor.bgCheckFlags & 1)) {
++                this->linearVelocity = 0.0f;
++                this->actor.speedXZ = 0.0f;
++                gSohVRShieldStops = gSohVRShieldStops + 1;
++            } else if (Player_VrDirectMovement(this) && Player_VrIsNeutralLocomotion(this) &&
++                !Player_InBlockingCsMode(play, this) && (this->actor.bgCheckFlags & 1)) {
++                f32 sohVrSpeedTarget;
++                s16 sohVrYawTarget;
++
++                Player_GetMovementSpeedAndYaw(this, &sohVrSpeedTarget, &sohVrYawTarget, SPEED_MODE_LINEAR, play);
++                this->linearVelocity = sohVrSpeedTarget;
++                this->yaw = sohVrYawTarget;
++                this->actor.speedXZ = sohVrSpeedTarget;
++                this->actor.world.rot.y = sohVrYawTarget;
++                gSohVRKinematicTicks = gSohVRKinematicTicks + 1;
++            }
++#endif
++
+             Actor_UpdateVelocityXZGravity(&this->actor);
+ 
+             if ((this->pushedSpeed != 0.0f) && !Player_InCsMode(play) &&
+@@ -12053,6 +13555,475 @@
+ 
+         sInvWaterSpeedFactor = 1.0f / sWaterSpeedFactor;
+         sUseHeldItem = sHeldItemButtonIsHeldDown = 0;
++#ifdef __IOS__
++        /* rev8 (VR R9 part B): Link's own velocity, position and melee
++         * animation index, published every tick. They exist for assertions
++         * that could otherwise only be made by eye: "the shield stance
++         * stopped him" is linearVelocity 0 with an unchanged position, and
++         * "no vanilla jump slash ran alongside the envelope" is an
++         * animation index outside the JUMPSLASH range. */
++        gSohVRLinkVel = this->linearVelocity;
++        gSohVRLinkPos[0] = this->actor.world.pos.x;
++        gSohVRLinkPos[1] = this->actor.world.pos.y;
++        gSohVRLinkPos[2] = this->actor.world.pos.z;
++        gSohVRMeleeAnim = this->meleeWeaponAnimation;
++        /* SOH_IOS (overlay 0042 rev3, VR-DONOR-MAP 8). See the patch
++         * header, parts D and E. sUseHeldItem is the single static that
++         * means "use the held item this frame"; setting it here runs the
++         * ENTIRE authored attack path -- animation, combo chains, the stab
++         * lunge, jump-slash when airborne, every enemy's own damage table,
++         * the vanilla swept quads, the SFX and the voice -- with nothing
++         * re-implemented. */
++        /* rev13 (VR R12 item 6, Q-VR26): PUT A SWORD BACK ON B.
++         *
++         * Two rounds of assertions have been lost to `covered` = 0 at
++         * S21.5, and the cause is not a VR mechanism: buttonItems[0]
++         * has stopped being a sword by the time the suite gets there,
++         * and B equips whatever is ON B -- so neither the item wheel's
++         * UP flick (which presses B) nor any number of B presses can
++         * bring the sword back. A wearer fixes that in the pause menu
++         * and a simulator cannot, which is exactly the situation
++         * gSohVROcarinaForce already exists for.
++         *
++         * ONE SHOT, and cleared before the work so a failure cannot
++         * retry forever. It ships 0 and nothing in a wearer's session
++         * can set it. */
++        if (gSohVRForceSword != 0) {
++            s32 sohWantSword = LINK_IS_ADULT ? ITEM_SWORD_MASTER : ITEM_SWORD_KOKIRI;
++            gSohVRForceSword = 0;
++            gSaveContext.equips.buttonItems[0] = (u8)sohWantSword;
++            Player_UseItem(play, this, sohWantSword);
++            gSohVRForcedSwords = gSohVRForcedSwords + 1;
++        }
++        if ((gSohVRFpActive != 0) && (gSohVRMotionHands != 0)) {
++            /* rev4 (VR R5): the PHYSICAL BLADE (overlay 0048) is the
++             * default and it damages from the blade, so this path must NOT
++             * also press B -- that would land two attacks per swing, one
++             * where the hand is and one along the authored arc. It stays
++             * whole behind gSohVRBladeDamage == 0, and it is also what runs
++             * when 0048 is compiled out or the shell reports no hands, so
++             * turning the blade off is a complete return to R4 rather than
++             * a return to no combat at all. */
++            /* ...and the THIRD case, which the simulator found: with the
++             * sword SHEATHED there is no blade to damage with, and the
++             * physical path draws nothing. Vanilla's own rule is that B with
++             * a sheathed sword draws it AND slashes, so the first swing of a
++             * session is the authored one and every swing after it is
++             * physical. That is also exactly what the donor's item selector
++             * does for its UP sector -- EmulateButtonPress(BTN_B) only when
++             * Player_GetMeleeWeaponHeld is 0. Without this the blade is
++             * perfect and invisible, and from a headset it reads as
++             * "swinging does nothing". */
++            s32 sohVrAuthored = (gSohVRBladeDamage == 0) ||
++                                (gSohVRHandValid[(gSohVRLeftHanded != 0) ? 0 : 1] == 0) ||
++                                (Player_GetMeleeWeaponHeld(this) == 0);
++            s32 sohSwordHandVr = (gSohVRLeftHanded != 0) ? 0 : 1;
++            /* "Would pressing B right now swing a melee weapon?" --
++             * which is the honest question, because that is exactly what
++             * setting sUseHeldItem does. Player_GetMeleeWeaponHeld alone
++             * reads heldItemAction, i.e. what is ALREADY IN HAND, and with
++             * the sword sheathed that is zero -- so gating on it alone made
++             * the swing unable to draw the sword it was trying to swing.
++             * Measured, not guessed: the R4 suite's S3 caught it as
++             * swings_taken staying 0 while the detector fired correctly. */
++            s32 sohBItem = gSaveContext.equips.buttonItems[0];
++            s32 sohMelee = (Player_GetMeleeWeaponHeld(this) != 0) ||
++                           ((sohBItem < ITEM_NONE_FE) &&
++                            (Player_ActionToMeleeWeapon(Player_ItemToItemAction(sohBItem)) != 0));
++            /* rev13 (VR R12 item 5): A SECOND, NARROWER MELEE QUESTION.
++             * sohMelee above answers "would pressing B right now swing a
++             * melee weapon", which deliberately says YES for a SHEATHED
++             * sword -- that is what lets the first swing of a session draw
++             * it. The item trigger below needs the OTHER question, "is a
++             * melee weapon in hand right now", and rev3 reused sohMelee for
++             * it. Link's B slot holds a sword for the whole game, so
++             * sohMelee is TRUE at every moment of a normal save -- which
++             * made gSohVRItemTriggerMask permanently zero and is exactly
++             * the user's "I select the slingshot, I can aim it, but how do I
++             * FIRE a nut?". Nothing was ever reserved, so his trigger stayed
++             * plain B and B is not the slingshot's button. */
++            /* rev19 (VR R18 item 3): ...AND IT IS THE SWORDS, NOT EVERY
++             * MELEE WEAPON. Player_GetMeleeWeaponHeld returns 1..3 for the
++             * three swords, 4 for a Deku stick and 5 for the Megaton
++             * hammer, and only 1..3 are covered by motion combat
++             * (Player_VrMotionCombatCovered, overlay 0048). Reading it as
++             * a bare != 0 published a zero mask for the hammer and the
++             * stick -- so their trigger stayed plain B, and B is not their
++             * button: func_8083BB20 fires an authored swing from
++             * sUseHeldItem (the item's OWN button) or from BTN_B only when
++             * actor.category != ACTORCAT_PLAYER, which never holds for the
++             * player. the user: "I equip the hammer, hit either trigger,
++             * nothing happens." Nothing could. */
++            s32 sohHeldWeapon = Player_GetMeleeWeaponHeld(this);
++            s32 sohHeldMelee = (sohHeldWeapon >= 1) && (sohHeldWeapon <= 3);
++            gSohVRHeldAction = this->heldItemAction;
++            gSohVRBItem = sohBItem;
++            /* ONE SWING, ONE ATTACK across a 90/120 Hz producer and this
++             * 20 Hz consumer: the shell bumps the seq once per rising edge
++             * into HOT and never otherwise, and we keep our own last-seen
++             * value. A dropped frame cannot lose an edge; a slow tick
++             * cannot double one. */
++            static unsigned int sohVrSwingSeen[2] = { 0, 0 };
++            unsigned int sohVrSeq = gSohVRSwingSeq[sohSwordHandVr];
++            if (sohVrSeq != sohVrSwingSeen[sohSwordHandVr]) {
++                sohVrSwingSeen[sohSwordHandVr] = sohVrSeq;
++                /* Melee ONLY. sUseHeldItem is the HELD item's button, not
++                 * the sword's, so a swing with the bow out would fire the
++                 * bow -- the one way this seam can misfire. */
++                /* rev19 (VR R18 item 3b): ...OR IT IS A MELEE WEAPON THE
++                 * PHYSICAL BLADE DOES NOT COVER. sohVrAuthored asks
++                 * whether the AUTHORED path is what should run, and for
++                 * the Deku stick (4) and the Megaton hammer (5) the
++                 * answer is always yes: overlay 0048 only ever builds a
++                 * blade for melee weapons 1..3, so with bladedamage on
++                 * and a valid hand a physical hammer swing reached
++                 * neither path and did nothing at all. Here it runs
++                 * vanilla's own hammer attack -- func_80837818 picks
++                 * PLAYER_MWA_HAMMER_FORWARD/SIDE off the control stick,
++                 * func_80837948 plays it with the swing SFX, the quake
++                 * and the ground effect, and the melee collider is
++                 * vanilla's. The honest cost, the same one R4 recorded
++                 * for the sword: the hammer's damage lands along the
++                 * AUTHORED arc, not along the hand. One swing per rising
++                 * edge, through the same seq the sword uses. */
++                if (sohMelee && (sohVrAuthored || (sohHeldWeapon >= 4))) {
++                    sUseHeldItem = true;
++                    gSohVRSwingsTaken = gSohVRSwingsTaken + 1;
++                }
++            }
++            /* The other hand's seq is tracked too, so switching hands mid
++             * session cannot replay a stale edge as an attack. */
++            sohVrSwingSeen[sohSwordHandVr ^ 1] = gSohVRSwingSeq[sohSwordHandVr ^ 1];
++            /* rev5 (VR R7 verdict 4): with the authored machine retired,
++             * TWO things it used to provide have to come from the swing
++             * instead, and they are the two the user will notice.
++             *
++             * (1) meleeWeaponState. Half the bestiary reads it -- Stalfos,
++             *     Gerudo, Wolfos and Dark Link all watch for a windup, and
++             *     the Ganondorf final blow REQUIRES it nonzero -- and with
++             *     no authored attack nothing was setting it, so enemies
++             *     would have stopped reacting to a sword that was in fact
++             *     hitting them. It is mirrored from the shell's swing tier:
++             *     HOT is 1 (a live attack), ARMED is -1 (a windup), IDLE is
++             *     0. Same three values vanilla uses, driven by real hand
++             *     speed instead of an animation frame -- the donor's
++             *     VrCombat_SetMeleeWeaponState, at the same point in the
++             *     tick.
++             *
++             *     It also restores the SWORD TRAIL, and restores it CORRECT:
++             *     vanilla's Player_PostLimbDrawGameplay draws the trail
++             *     while meleeWeaponState is nonzero, computing tip and base
++             *     through the hand limb's matrix -- which in VR is the
++             *     controller pose. So the trail now follows the blade you
++             *     are actually holding, which is precisely the thing the user
++             *     said it did not do.
++             *
++             *     The honest gap, recorded rather than hidden: the vanilla
++             *     setter func_80833A20 also plays the swing SFX and the
++             *     voice grunt on the 0 -> nonzero edge, and it is file-local
++             *     with no shim. Writing the field directly gets the state
++             *     and the trail and loses the swing sound. A shim is a
++             *     one-line patch and is listed in the notes as the next
++             *     thing to add.
++             *
++             * (2) THE BUTTON ATTACK. the user asked for both: an arm swing IS
++             *     the attack, AND the button still does something. With the
++             *     authored path gone, a B press becomes a STAB DRIVEN BY THE
++             *     BLADE POSE -- it opens a short damaging window during
++             *     which overlay 0048 registers the blade's cross-section
++             *     quad at wherever the sword currently is. Point the sword
++             *     and press, and it stabs where it points. Six ticks is
++             *     about 0.3 s, long enough to connect and short enough that
++             *     holding B is not a permanent hitbox. */
++            gSohVRMotionCovered = Player_VrMotionCombatCovered(this);
++            if (gSohVRMotionCovered) {
++                s32 sohVrTier = gSohVRSwingTier[sohSwordHandVr];
++                s32 sohVrStabNow = 0;
++                s32 sohVrChopOnset;
++                s32 sohVrWant;
++                /* rev13 (VR R12 item 1): is an AUTHORED attack action
++                 * running this tick? While one is, vanilla owns
++                 * meleeWeaponState and this seam writes nothing. */
++                s32 sohVrVanillaAtk;
++                static s32 sohVrChopsSeen = 0;
++                /* rev11 (VR R11 verdicts 3 and 5): THE ARBITER IS GONE AND
++                 * THE CHOP IS TRIGGERED WHERE THE LEAP IS.
++                 *
++                 * the user, on 1.0.1.14: "Link no longer makes the YELL on the
++                 * button attack" and "in the Z-targeting attack (which I DID
++                 * hear yelling), the sword isn't moving, only the swish."
++                 * Two reports, two causes, both created by rev10.
++                 *
++                 * (1) THE B YELL. rev10 let vanilla's jump slash run again,
++                 *     and func_8083BA90 -> func_80837948 writes
++                 *     this->meleeWeaponAnimation = PLAYER_MWA_JUMPSLASH_START
++                 *     (17, or 19 on a combo). Nothing ever writes it back:
++                 *     every OTHER writer is inside the authored attack
++                 *     machine, which rev5 retires for a covered weapon. And
++                 *     func_80833A20 -- the setter this seam calls for its
++                 *     sound -- guards its voice with
++                 *
++                 *       if (!((meleeWeaponAnimation >= FLIPSLASH_START) &&
++                 *             (meleeWeaponAnimation <= JUMPSLASH_FINISH)))
++                 *
++                 *     i.e. 16..19. So from the FIRST Z-target jump attack of
++                 *     a session onward, every B press played the swing SFX
++                 *     and no voice, for the rest of the session. That is
++                 *     the user's sentence exactly, and it is why it is a
++                 *     REGRESSION rather than something that never worked.
++                 *
++                 *     Two more edges were latent in the same block and are
++                 *     closed with it: the yell rode the meleeWeaponState
++                 *     0 -> 1 edge, so a press taken while the state was
++                 *     ALREADY 1 (a swing still hot, a stab window still
++                 *     open) was silent; and the pending flag could survive a
++                 *     coverage drop and fire against a later press.
++                 *
++                 *     The fix is to stop asking a state setter to be a sound
++                 *     trigger. Player_VrAttackVoice plays the swing SFX and
++                 *     the voice DIRECTLY, on the press, with no edge and no
++                 *     animation guard, so every B press yells exactly once.
++                 *     meleeWeaponState is still set -- enemy AI reads it and
++                 *     the trail draws from it -- it is simply no longer the
++                 *     thing that decides whether a sound happens.
++                 *
++                 * (2) THE Z+A CHOP THAT MADE NO MOVEMENT. This seam gated the
++                 *     chop on Player_VrZTargetActive, which requires a
++                 *     focusActor AND a CONVERGED reticle
++                 *     (targetCtx.unk_4B != 0). Vanilla's own jump slash, in
++                 *     Player_ActionHandler_10, gates on Player_IsZTargeting,
++                 *     which is hostile lock-on OR friendly-or-PARALLEL --
++                 *     so holding Z with nothing to lock onto, or pressing A
++                 *     before the reticle finishes converging, ran vanilla's
++                 *     leap and its yell while our envelope never started.
++                 *     "I did hear yelling... the sword isn't moving" is that
++                 *     divergence, stated from the wearer's side.
++                 *
++                 *     Two predicates for one move cannot be kept in step by
++                 *     being careful, so there is now one: gSohVRChops and
++                 *     gSohVRChopTicks are set AT VANILLA'S OWN SITE, beside
++                 *     gSohVRJumpSlashVanilla, one line before func_8083BA90.
++                 *     The chop envelope now runs if and only if the leap
++                 *     does -- "these two should mirror each other", which is
++                 *     how the user put it two rounds ago.
++                 *
++                 *     And that retires the deferred yell outright: vanilla's
++                 *     jump slash ends with Player_PlayVoiceSfx and it now
++                 *     runs in every case that produces a chop, so the chop's
++                 *     own onset is the ONE place in this block that must
++                 *     stay silent. gSohVRChopYells therefore stays 0 by
++                 *     construction and the counter is kept only so the dump
++                 *     and the suite keep their shape. */
++                /* rev13 (VR R12 item 1): WHILE VANILLA IS SWINGING, THIS
++                 * SEAM DOES NOT TOUCH meleeWeaponState.
++                 *
++                 * the user, on 1.0.1.15: "the sword swish sound is duplicated
++                 * on the Z-target jump attack." rev11 moved the chop onto
++                 * vanilla's own jump-slash site, which was right -- and it
++                 * put TWO writers on one field. Vanilla's jump slash plays
++                 * its swish from func_8084285C -> func_80833A20, and that
++                 * setter plays a sound only on a 0 -> nonzero edge. This
++                 * seam runs a few lines ABOVE this->actionFunc(this, play)
++                 * and wrote the field every tick: for the ten ticks of the
++                 * chop window it wrote 1 (suppressing vanilla's own swish),
++                 * and from the eleventh tick to the landing it wrote 0 --
++                 * handing func_80833A20 a fresh zero on EVERY remaining
++                 * frame of the animation. Each of those frames is a swish.
++                 * One press, one leap, several swishes, and the count is
++                 * however long Link stayed in the air.
++                 *
++                 * The rule is ownership, not arithmetic: while an authored
++                 * attack action is running, vanilla owns meleeWeaponState
++                 * and this seam stands down completely -- no state write, no
++                 * voice, no stab window opened. Player_Action_80844AF4 is
++                 * the airborne half of the jump slash and
++                 * Player_Action_808502D0 is the grounded attack action it
++                 * lands into (func_80837948 sets it), and with the authored
++                 * machine retired for a covered weapon the ONLY way into
++                 * either is the Z+A chop. Vanilla then ends the attack
++                 * through func_80832318, which zeroes the field, so the seam
++                 * resumes from a clean state with nothing to hand back.
++                 *
++                 * What the user should now hear per Z+A is exactly what
++                 * vanilla plays: ONE NA_SE_IT_SWORD_SWING from
++                 * func_80833A20 at animation frame 6, and ONE
++                 * NA_SE_VO_LI_SWORD_L from func_8083BA90 on the press. */
++                sohVrVanillaAtk = ((void*)this->actionFunc == (void*)Player_Action_80844AF4) ||
++                                  ((void*)this->actionFunc == (void*)Player_Action_808502D0);
++                sohVrChopOnset = (gSohVRChops != sohVrChopsSeen);
++                sohVrChopsSeen = gSohVRChops;
++                if (CHECK_BTN_ALL(sControlInput->press.button, BTN_B) && !sohVrVanillaAtk) {
++                    gSohVRStabTicks = 7;
++                    gSohVRStabs = gSohVRStabs + 1;
++                    sohVrStabNow = 1;
++                } else if (gSohVRStabTicks > 0) {
++                    gSohVRStabTicks = gSohVRStabTicks - 1;
++                }
++                if (gSohVRChopTicks > 0) {
++                    gSohVRChopTicks = gSohVRChopTicks - 1;
++                }
++                /* rev12: the combo chain window ages on the same clock. */
++                (void)Player_VrAttackCombo(0);
++                sohVrWant = ((sohVrTier == 2) || (gSohVRStabTicks > 0) || (gSohVRChopTicks > 0))
++                                ? 1
++                                : ((sohVrTier == 1) ? -1 : 0);
++                /* rev13: the chop's own combo break happens whether or not
++                 * the state machine below runs -- it is bookkeeping, not a
++                 * write to vanilla's field -- and vanilla breaks the chain
++                 * here too (func_80837948 resets unk_845 when the incoming
++                 * animation differs, and the jump slash's does). */
++                if (sohVrChopOnset) {
++                    (void)Player_VrAttackCombo(-1);
++                }
++                if (sohVrVanillaAtk) {
++                    /* Vanilla owns the field this tick. Nothing else. */
++                } else if (sohVrWant == 1) {
++                    if (sohVrStabNow) {
++                        /* EVERY B press, unconditionally. No state edge, no
++                         * animation guard -- those are the two things that
++                         * made it silent. rev12: and the pair is vanilla's,
++                         * light for a lone press, HEAVY for the third of a
++                         * chain -- exactly one voice either way. */
++                        this->meleeWeaponState = 1;
++                        Player_VrAttackVoice(this, Player_VrAttackCombo(1));
++                        gSohVRSwingSfx = gSohVRSwingSfx + 1;
++                    } else if (sohVrChopOnset && (gSohVRChopTicks > 0)) {
++                        /* rev13: reached only if a chop is somehow counted
++                         * without vanilla's action being installed. Kept as
++                         * the safe write it always was. */
++                        /* Vanilla's jump slash yelled for this press in the
++                         * same tick it started the chop -- and it yelled the
++                         * HEAVY voice, NA_SE_VO_LI_SWORD_L, which is why this
++                         * branch must not ask Player_VrAttackVoice for one.
++                         * Set the state and say nothing. rev12: and break the
++                         * combo chain, which is what vanilla does here too --
++                         * func_80837948 resets unk_845 whenever the incoming
++                         * animation differs, and the jump slash's does. */
++                        this->meleeWeaponState = 1;
++                        (void)Player_VrAttackCombo(-1);
++                    } else if (this->meleeWeaponState != 1) {
++                        /* An ARM SWING reaching HOT: its own rising edge is
++                         * the right trigger, because a swing has no press.
++                         * rev12: it feeds the same chain the presses do --
++                         * three fast swings escalate the way three fast
++                         * button attacks do in vanilla. */
++                        this->meleeWeaponState = 1;
++                        Player_VrAttackVoice(this, Player_VrAttackCombo(1));
++                        gSohVRSwingSfx = gSohVRSwingSfx + 1;
++                    }
++                } else {
++                    /* Direct for -1 and 0: a WINDUP is not an attack and
++                     * must not yell, and the 0 case is the handback R7's
++                     * review fix made a falling edge. */
++                    this->meleeWeaponState = (s8)sohVrWant;
++                }
++            } else {
++                gSohVRStabTicks = 0;
++                gSohVRChopTicks = 0;
++                /* rev12: a combo chain must not survive a coverage drop --
++                 * the same staleness rev11 removed from the yell arbiter. */
++                (void)Player_VrAttackCombo(-1);
++            }
++            /* rev7 (VR R8 part B): THE SHIELD CROUCH, published for the
++             * shell. the user: "you are crouching as well [in N64], so the
++             * perspective or camera should go down a little as if you're
++             * crouching." Vanilla's own shielding flag is the first half;
++             * the second is R held with a shield that overlay 0049 says is
++             * on the arm, which is the VR stance that does not raise
++             * PLAYER_STATE1_SHIELDING because the physical shield blocks
++             * without one. The EYE moves in the shell -- at compositor
++             * rate, on the seat -- and never here: the game-tick anchor is
++             * what world-scale and height calibration are measured against
++             * and moving it would move them too. */
++            /* rev8 (VR R9 part B): ONE predicate, shared with the thing that
++             * stops his feet. Identical arithmetic to rev7's, now written
++             * once -- an eye that drops while the feet keep walking is
++             * exactly the defect the user reported, and two copies of a test
++             * is how it happened. It is also evaluated OUTSIDE the
++             * gSohVRMotionCovered branch, so a Link carrying only a shield
++             * (no sword in hand, hence no coverage) still crouches. */
++            gSohVRCrouch = Player_VrShieldStance(this);
++            /* THE ITEM TRIGGER (HANDOFF-ITEM-TRIGGER.md): publish which N64
++             * button the held item lives on, so overlay 0047 can hold it as
++             * raw pad STATE from the item hand's trigger -- press nocks the
++             * bow, hold keeps it drawn, release looses. Zero while a melee
++             * weapon is held, because there the swing IS the attack (the
++             * donor's VrCombat_MeleeCovered). */
++            {
++                /* rev7 (VR R8 part B): THE SWORD HAND, not the off hand.
++                 * rev3 published onto the off hand -- the LEFT for a
++                 * right-hander -- and overlay 0047 read that as "drop this
++                 * hand's trigger binding", so equipping any C item took Z
++                 * away and gave nothing back (the mirror itself was never
++                 * written). the user's ruling is that the left trigger is Z
++                 * always; a two-handed item uses the right trigger. */
++                s32 sohItemHandVr = sohSwordHandVr;
++                u16 sohItemMask = 0;
++                if (!sohHeldMelee && (this->heldItemAction > PLAYER_IA_NONE) &&
++                    (this->heldItemButton >= 0) &&
++                    (this->heldItemButton < (s32)ARRAY_COUNT(sItemButtons))) {
++                    sohItemMask = sItemButtons[this->heldItemButton];
++                }
++                gSohVRItemTriggerMask[sohItemHandVr] = sohItemMask;
++                gSohVRItemTriggerMask[sohItemHandVr ^ 1] = 0;
++                /* rev19 (VR R18 item 2): ...AND WHETHER BOTH TRIGGERS
++                 * DRIVE IT. the user: "it is counterintuitive to use the
++                 * RIGHT trigger when the slingshot is in the LEFT hand."
++                 * The mask says which button; this says whether the OFF
++                 * hand's trigger may mirror it too (overlay 0047 rev7),
++                 * and it is narrower than the mask on purpose --
++                 * Player_VrTriggerItem is the whitelist, so a bottle or a
++                 * mask keeps Z on the off hand. */
++                gSohVRItemTriggerBoth =
++                    (sohItemMask != 0) && Player_VrTriggerItem(this->heldItemAction);
++            }
++        } else {
++            gSohVRItemTriggerMask[0] = gSohVRItemTriggerMask[1] = 0;
++            gSohVRItemTriggerBoth = 0;
++            gSohVRMotionCovered = 0;
++            gSohVRCrouch = 0;
++        }
++        /* rev6 (VR R7 review): HAND meleeWeaponState BACK CLEAN when motion
++         * combat stops covering the weapon.
++         *
++         * rev5 mirrors the field from the swing tier while covered and never
++         * cleared it on the way out, so any drop in coverage mid-swing left
++         * it stuck at 1 or -1 forever: the sword trail draws permanently and
++         * every enemy that reads a windup -- Stalfos, Gerudo, Wolfos, Dark
++         * Link -- sees Link mid-attack for the rest of the session, as does
++         * the Ganondorf final-blow check. Coverage drops for ordinary
++         * reasons: tracking lost, `vr set bladedamage 0`, the sword put
++         * away, or simply leaving VR.
++         *
++         * TWO THINGS THIS DELIBERATELY IS NOT.
++         *
++         * It is not a reset in the inner `else`. That branch is reached
++         * while still in VR with motion hands but WITHOUT coverage -- a
++         * sheathed sword, or a Deku stick or hammer, whose authored attacks
++         * this round deliberately leaves whole. There vanilla owns the
++         * field and sets it through func_80833A20; zeroing it every tick
++         * would silently break stick and hammer combat in VR, which is a
++         * worse bug than the one being fixed and a much quieter one.
++         *
++         * And it is not in either `else` alone, because there are TWO ways
++         * out of coverage: the inner one above, and the outer one that fires
++         * when first person or motion hands go away entirely -- which is
++         * what leaving VR mid-swing does. One edge test placed after the
++         * whole if/else covers both, and cannot be half-applied.
++         *
++         * So: a FALLING EDGE, once, handing ownership back in a known state.
++         * The next tick vanilla is in charge again, exactly as it is on
++         * iPhone and in the flat window. */
++        {
++            static s32 sohVrCoveredPrev = 0;
++
++            if ((sohVrCoveredPrev != 0) && (gSohVRMotionCovered == 0)) {
++                this->meleeWeaponState = 0;
++                gSohVRCoverDrops = gSohVRCoverDrops + 1;
++            }
++            sohVrCoveredPrev = gSohVRMotionCovered;
++        }
++#endif
+         sSavedCurrentMask = this->currentMask;
+ 
+         if (GameInteractor_Should(VB_EXECUTE_PLAYER_ACTION_FUNC, !(this->stateFlags3 & PLAYER_STATE3_PAUSE_ACTION_FUNC),
+@@ -12069,6 +14040,91 @@
+ 
+         Player_UpdateShapeYaw(this, play);
+ 
++#ifdef __IOS__
++        /* SOH_IOS (overlay 0042 rev2, donor z_player.c:12340-12356): THE
++         * FACING PIN. Pin Link's visual facing to the headset heading,
++         * overriding the ease-toward-movement rotation Player_UpdateShapeYaw
++         * just applied. This is the LAST facing writer in the update loop.
++         * Velocity is built from this->yaw, not shape.rot.y, so pinning
++         * never redirects movement -- it is what makes turning around turn
++         * LINK, so you can never look at your own back.
++         * Skipped in every state where the game choreographs Link's facing:
++         * blocking cutscenes, horse, ladder, ledge-climb, hanging, crawling,
++         * dynapoly-grab (the grab locks the body to the block, and pinning
++         * over that lock let the push direction wander with the gaze), and
++         * lock-on framing (there the body belongs to the target).
++         * The lock-on latch is taken HERE, once per update, so this and the
++         * steering table agree for the whole tick. */
++        /* rev5 (VR R7 verdict 5): the pin stands down for a real Z-target,
++         * whatever the comfort option says. See Player_VrZTargetActive. */
++        sSohVRZTargetActive = Player_VrZTargetActive(this, play);
++        gSohVRZTarget = sSohVRZTargetActive;
++        /* rev5 (VR R7 verdict 5): THE HOP, published for the flip camera.
++         * PLAYER_STATE2_HOPPING is raised by func_8083BCD0 for the whole
++         * lock-on hop family, and av1.actionVar1 is the direction it was
++         * started with -- 0 forward, 1 left, 2 BACKFLIP, 3 right. That is
++         * the only signal the shell needs: it says a flip is happening and
++         * which one, and it goes to zero the moment the action ends, so the
++         * camera's own timer never has to guess at duration. -1 = not
++         * hopping. */
++        gSohVRHopKind = (this->stateFlags2 & PLAYER_STATE2_HOPPING) ? (int)this->av1.actionVar1 : -1;
++        /* rev6 (VR R8 item 8): THE FORWARD ROLL, published the same way and
++         * for the same camera. The action func IS the state -- there is no
++         * stateFlag for a roll -- and it clears itself when the roll ends,
++         * so the camera's integrator never has to guess at the end either. */
++        gSohVRRollActive = (this->actionFunc == Player_Action_Roll);
++        if (Player_VrDirectMovement(this) && !Player_InBlockingCsMode(play, this) &&
++            !sSohVRZTargetActive &&
++            !(this->stateFlags1 & (PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CLIMBING_LADDER |
++                                   PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE)) &&
++            !(this->stateFlags2 & (PLAYER_STATE2_CRAWLING | PLAYER_STATE2_GRABBING_DYNAPOLY))) {
++            s16 sohVrPinnedYaw = (s16)gSohVRHeadingYaw;
++            this->unk_87C = sohVrPinnedYaw - this->actor.shape.rot.y;
++            this->actor.shape.rot.y = sohVrPinnedYaw;
++            gSohVRPinnedYaw = sohVrPinnedYaw;
++            gSohVRDirectTicks = gSohVRDirectTicks + 1;
++        }
++        /* rev17 (VR R16 item 4): WHEN THE GAME TURNS LINK, TURN THE WORLD.
++         *
++         * the user, on 1.0.1.20: going DOWN a ladder as child Link "the camera
++         * doesn't turn around", so he climbs down facing away from it. The
++         * pin above stands down in exactly the states where the game
++         * choreographs Link's facing -- and the descend-onto-ladder site
++         * turns him by 0x8000 in one tick (this->yaw += 0x8000). Nothing in
++         * the shell was following that, because VR world yaw has only ever
++         * been written by the right stick and by recenter.
++         *
++         * Read AFTER the pin so the previous sample is the value that was
++         * really in force last tick: on a pinned tick that is the head's own
++         * heading, so the delta published on the entry tick is exactly
++         * (choreographed body yaw - where the wearer is looking) and adding
++         * it to the shell's yaw lands the view on the body. s16 arithmetic
++         * wraps by construction; a 0x8000 turn arrives as -32768, which is
++         * the same rotation.
++         *
++         * Restricted to the ladder/ledge/hang family. CRAWLING and
++         * GRABBING_DYNAPOLY are deliberately NOT included: a block push locks
++         * the body to the block for as long as it is held, and turning the
++         * wearer's world under a sustained hold is a different (and much
++         * easier to get wrong) thing than a one-tick snap. */
++        {
++            static s16 sohVrBodyYawPrev = 0;
++            static s32 sohVrBodyYawSeen = 0;
++            s16 sohVrBodyYaw = this->actor.shape.rot.y;
++            s16 sohVrBodyYawDelta = sohVrBodyYaw - sohVrBodyYawPrev;
++
++            if ((gSohVRFpActive != 0) && (sohVrBodyYawSeen != 0) &&
++                ((sohVrBodyYawDelta > 0x4000) || (sohVrBodyYawDelta < -0x4000)) &&
++                (this->stateFlags1 & (PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_CLIMBING_LEDGE |
++                                      PLAYER_STATE1_HANGING_OFF_LEDGE))) {
++                gSohVRBodyYawSnapDelta = sohVrBodyYawDelta;
++                gSohVRBodyYawSnapSeq = gSohVRBodyYawSnapSeq + 1;
++            }
++            sohVrBodyYawPrev = sohVrBodyYaw;
++            sohVrBodyYawSeen = 1;
++        }
++#endif
++
+         if (CHECK_FLAG_ALL(this->actor.flags, ACTOR_FLAG_TALK)) {
+             this->talkActorDistance = 0.0f;
+         } else {
+@@ -12455,6 +14511,14 @@
+         func_8002EBCC(&this->actor, play, 0);
+         func_8002ED80(&this->actor, play, 0);
+ 
++#ifdef __IOS__
++        /* SOH_IOS (overlay 0042): ahead of the vanilla unk_6AD test, which
++         * projects the head through the THIRD-PERSON matrix and does not
++         * apply in VR (donor z_player.c:12761-12765). */
++        if (gSohVRFpActive != 0) {
++            overrideLimbDraw = Player_OverrideLimbDrawGameplayVRFirstPerson;
++        } else
++#endif
+         if (this->unk_6AD != 0) {
+             Vec3f projectedHeadPos;
+ 
+--- a/soh/src/code/z_player_lib.c
++++ b/soh/src/code/z_player_lib.c
+@@ -1032,6 +1032,18 @@
+     { gLinkAdultLeftIronBootDL, gLinkAdultRightIronBootDL },   // PLAYER_BOOTS_IRON
+     { gLinkAdultLeftHoverBootDL, gLinkAdultRightHoverBootDL }, // PLAYER_BOOTS_HOVER
+ };
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0042 rev17, VR R16 item 3): the VR body hide, asked
++ * from OUTSIDE the limb override. Declared here as well as in overlay
++ * 0049's block below because this site is eight hundred lines earlier. */
++extern volatile int gSohVRFpActive;
++extern volatile int gSohVRHideBody;
++
++static s32 Player_VrBodyHidden(void) {
++    return (gSohVRFpActive != 0) && (gSohVRHideBody != 0);
++}
++#endif
+ 
+ void Player_DrawImpl(PlayState* play, void** skeleton, Vec3s* jointTable, s32 dListCount, s32 lod, s32 tunic, s32 boots,
+                      s32 face, OverrideLimbDrawOpa overrideLimbDraw, PostLimbDrawOpa postLimbDraw, void* data) {
+@@ -1095,7 +1107,14 @@
+     if (((CVarGetInteger(CVAR_ENHANCEMENT("FirstPersonGauntlets"), 0) && LINK_IS_ADULT) ||
+          (overrideLimbDraw != Player_OverrideLimbDrawGameplayFirstPerson)) &&
+         (overrideLimbDraw != Player_OverrideLimbDrawGameplayCrawling) &&
+-        (gSaveContext.gameMode != GAMEMODE_END_CREDITS)) {
++        (gSaveContext.gameMode != GAMEMODE_END_CREDITS)
++#ifdef __IOS__
++        /* SOH_IOS (0042 rev17, VR R16 item 3): these display lists are
++         * emitted after the skeleton, on the arm and foot matrices it left
++         * behind, so nulling *dList in the override cannot reach them. */
++        && !Player_VrBodyHidden()
++#endif
++        ) {
+         if (LINK_IS_ADULT) {
+             s32 strengthUpgrade = CUR_UPG_VALUE(UPG_STRENGTH);
+ 
+@@ -1578,6 +1597,38 @@
+                               &this->meleeWeaponInfo[0].base);
+     }
+ 
++#ifdef __IOS__
++    /* Shell-owned (app/ios/SohIosShell.m), like every other gSohVR* word;
++     * zero in every non-VR build, which makes the branch below a no-op
++     * there. Declared locally rather than in a header because this is the
++     * only site in this file that needs them. */
++    extern volatile int gSohVRMotionCovered;
++    extern volatile int gSohVRVanillaQuadsSkipped;
++
++    /* SOH_IOS (overlay 0042 rev5, VR R7 verdict 4): THE OTHER HALF OF THE
++     * WITHDRAWAL, and without it the fix would have reintroduced the exact
++     * defect it removes.
++     *
++     * Retiring the authored attack left nothing setting meleeWeaponState, so
++     * it is now mirrored from the swing tier -- which enemy AI needs, and
++     * which restores the sword trail through vanilla's own code so the trail
++     * follows the real blade. But the SAME flag also gates the two lines
++     * below, which register vanilla's melee AT quads: a collider the donor
++     * describes as deliberately fattened, edge lines extended about 12 units
++     * past the tip with about 20 units of lateral spread, authored as
++     * animation-era forgiveness. Left running it would out-reach overlay
++     * 0048's physical blade and put damage back where the sword is not --
++     * two attacks per swing again, in a new shape.
++     *
++     * The trail above is untouched: its func_80090480 call passes NULL for
++     * the collider and only advances the tip/base history. So the visual
++     * comes back and the second hitbox does not. This is the donor's own
++     * partition -- its VrCombat_FeedMelee replaces this branch wholesale for
++     * a covered weapon and feeds the trail by hand for exactly this reason. */
++    if (gSohVRMotionCovered != 0) {
++        gSohVRVanillaQuadsSkipped = gSohVRVanillaQuadsSkipped + 1;
++    } else
++#endif
+     if ((this->meleeWeaponState > 0) &&
+         ((this->meleeWeaponAnimation < 0x18) || (this->stateFlags2 & PLAYER_STATE2_SPIN_ATTACKING))) {
+         func_80090480(play, &this->meleeWeaponQuads[0], &this->meleeWeaponInfo[1], &newTipPos[1], &newBasePos[1]);
+@@ -1730,6 +1781,99 @@
+     }
+ }
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0042 rev17, VR R16 item 1): Player_DrawHookshotReticle,
++ * into the WORLD's translucent list instead of the overlay buffer.
++ *
++ * Every line below is vanilla's, and deliberately so: the cast, the hit
++ * test, the distance scaling and the display list are a known-good draw
++ * and nothing here is trying to improve on them. The ONE difference is
++ * OVERLAY_DISP -> POLY_XLU_DISP, because overlay 0043 takes the overlay
++ * buffer out of the world list in VR gameplay and composites it as the
++ * flat HUD plane -- so a world-space draw left in it lands on a billboard
++ * in front of the wearer's face rather than on the ground he is aiming
++ * at. Both lists are drawn with the same view projection, so the reticle
++ * appears in exactly the place vanilla would have put it. */
++/* rev18 (VR R17 items 1 and 2): declared HERE rather than in the extern
++ * block below, because this routine is defined above that block and a
++ * declaration that arrives later is no declaration at all. */
++extern volatile float gSohVRAimReticleScale;
++void Player_VrDrawAimReticle(PlayState* play, Player* this, f32 hookshotRange) {
++    static Vec3f sSohVrReticleVec = { -500.0f, -100.0f, 0.0f };
++    /* rev18: initialised, because the MISS path below draws with them and
++     * BgCheck_AnyLineTest3 promises nothing about either on a miss. */
++    CollisionPoly* colPoly = NULL;
++    s32 bgId = BGCHECK_SCENE;
++    Vec3f hookshotStart;
++    Vec3f hookshotEnd;
++    Vec3f firstHit;
++    Vec3f sp68;
++    f32 sp64;
++
++    sSohVrReticleVec.z = 0.0f;
++    Matrix_MultVec3f(&sSohVrReticleVec, &hookshotStart);
++    sSohVrReticleVec.z = hookshotRange;
++    Matrix_MultVec3f(&sSohVrReticleVec, &hookshotEnd);
++
++    /* rev18 (VR R17 item 1). the user, on 1.0.1.21: 'when it crosses off
++     * into the distance, still show the red crosshair -- render it as far
++     * as it is allowed.' Vanilla draws NOTHING on a miss, because its
++     * reticle answers 'can the hookshot grab that', a question with no
++     * answer when the ray hits nothing. A wearer's crosshair answers a
++     * different one -- 'where am I pointing' -- and that always has an
++     * answer: the end of the probe, which is the item's own max range
++     * along the ray. So a miss is not a reason not to draw; it is a
++     * reason to draw at hookshotEnd with no poly.
++     *
++     * And with no poly the colour is right BY CONSTRUCTION: the only
++     * thing in this program that colours the reticle is SoH's
++     * HookshotReticle.cpp enhancement, whose branch is
++     * SurfaceType_IsHookshotSurface(colCtx, colPoly, bgId) -- and
++     * SurfaceType_GetData returns 0 for a NULL poly, so a miss takes the
++     * non-targetable colour, which is red (defaultNonTargetableColor =
++     * 255,0,0,255). With the enhancement unregistered (the default) the
++     * display list draws in its own colour, exactly as the hit case does.
++     * Either way the miss draw is never a NEW colour. */
++    if (!BgCheck_AnyLineTest3(&play->colCtx, &hookshotStart, &hookshotEnd, &firstHit, &colPoly, 1, 1, 1, 1,
++                              &bgId)) {
++        colPoly = NULL;
++        bgId = BGCHECK_SCENE;
++        firstHit = hookshotEnd;
++    }
++
++    {
++        OPEN_DISPS(play->state.gfxCtx);
++
++        POLY_XLU_DISP = Gfx_SetupDL(POLY_XLU_DISP, 0x07);
++
++        SkinMatrix_Vec3fMtxFMultXYZW(&play->viewProjectionMtxF, &firstHit, &sp68, &sp64);
++
++        {
++            /* rev18 (VR R17 item 2): 'make the crosshair half the size.'
++             * sp64 is the depth out of the view projection, so vanilla's
++             * term already grows the mark with distance to hold a roughly
++             * CONSTANT size on screen -- which is why the scale is a
++             * multiplier on the whole term and not a subtraction: at 0.5
++             * it is half the size at every distance and vanishes at none.
++             * `vr set aimreticlescale <f>`; the shell ships 0.5. */
++            const f32 sp60 =
++                ((sp64 < 200.0f) ? 0.08f : (sp64 / 200.0f) * 0.08f) * gSohVRAimReticleScale;
++
++            Matrix_Translate(firstHit.x, firstHit.y, firstHit.z, MTXMODE_NEW);
++            Matrix_Scale(sp60, sp60, sp60, MTXMODE_APPLY);
++        }
++
++        gSPMatrix(POLY_XLU_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++        if (GameInteractor_Should(VB_TARGETABLE_HOOKSHOT_RETICLE, true, colPoly, bgId)) {
++            gSPSegment(POLY_XLU_DISP++, 0x06, play->objectCtx.status[this->actor.objBankIndex].segment);
++            gSPDisplayList(POLY_XLU_DISP++, gLinkAdultHookshotReticleDL);
++        }
++
++        CLOSE_DISPS(play->state.gfxCtx);
++    }
++}
++#endif
++
+ Vec3f D_801260D4 = { 1100.0f, -700.0f, 0.0f };
+ 
+ f32 sMeleeWeaponLengths[] = {
+@@ -1781,6 +1925,25 @@
+     { 200.0f, 200.0f, 0.0f },
+ };
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0042 rev14, VR R13, Q-VR28): defined in z_player.c beside
++ * the limb pin that publishes the basis it reads. sohSite is a diagnostic
++ * only: 1 = the nocked arrow/seed, 2 = the hookshot's chain, 3 = the
++ * boomerang. Returns 0 whenever VR is not driving the hand, and every call
++ * site falls straight back to vanilla's own arithmetic when it does. */
++s32 Player_VrAimHeld(Player* sohThis, s32 sohSite, Vec3f* sohPosOut, Vec3s* sohRotOut, MtxF* sohFrameOut);
++/* rev15 (VR R14): 1 if the last nocked-seed frame aimed from the hand, 0 if
++ * it fell back to vanilla, -1 if no bow has been drawn this run. */
++extern volatile int gSohVRAimPath;
++/* rev16 (VR R15): the aim CROSSHAIR option -- the user: "is there any way to
++ * add an option to show a little crosshair x of where it will go?" The
++ * range is in the limb's model units (x0.01 in game units). */
++extern volatile int gSohVRAimReticle;
++extern volatile float gSohVRAimReticleRange;
++/* rev17 (VR R16 item 1): the world-list reticle, defined above. */
++void Player_VrDrawAimReticle(PlayState* play, Player* this, f32 hookshotRange);
++#endif
++
+ void Player_PostLimbDrawGameplay(PlayState* play, s32 limbIndex, Gfx** dList, Vec3s* rot, void* thisx) {
+     Player* this = (Player*)thisx;
+ 
+@@ -1845,14 +2008,62 @@
+             CLOSE_DISPS(play->state.gfxCtx);
+         }
+ 
++#ifdef __IOS__
++        /* SOH_IOS (0042 rev17, VR R16 item 1): the boomerang's crosshair.
++         * Same option, same routine, same frame -- the throw at
++         * func_808359FC takes its yaw and pitch from the same call. */
++        if ((gSohVRAimReticle != 0) && (this->actor.scale.y >= 0.0f) &&
++            (this->leftHandType == PLAYER_MODELTYPE_LH_BOOMERANG)) {
++            Vec3f sohBoomPos;
++            Vec3s sohBoomRot;
++            MtxF sohBoomFrame;
++
++            if (Player_VrAimHeld(this, 5, &sohBoomPos, &sohBoomRot, &sohBoomFrame)) {
++                Matrix_Push();
++                Matrix_Put(&sohBoomFrame);
++                Matrix_Translate(500.0f, 300.0f, 0.0f, MTXMODE_APPLY);
++                Player_VrDrawAimReticle(play, this, gSohVRAimReticleRange);
++                Matrix_Pop();
++            }
++        }
++#endif
+         if (this->actor.scale.y >= 0.0f) {
+             if (!Player_HoldsHookshot(this) && ((hookedActor = this->heldActor) != NULL)) {
+                 if (this->stateFlags1 & PLAYER_STATE1_READY_TO_FIRE) {
+-                    Matrix_MultVec3f(&sLeftHandArrowVec3, &hookedActor->world.pos);
+-                    Matrix_RotateZYX(0x69E8, -0x5708, 0x458E, MTXMODE_APPLY);
+-                    Matrix_Get(&sp14C);
+-                    Matrix_MtxFToYXZRotS(&sp14C, &hookedActor->world.rot, 0);
+-                    hookedActor->shape.rot = hookedActor->world.rot;
++#ifdef __IOS__
++                    Vec3f sohAimPos;
++                    Vec3s sohAimRot;
++                    s32 sohAimRet;
++
++                    /* SOH_IOS (0042 rev14, VR R13): the nut goes where the
++                     * slingshot points. The three lines below are authored
++                     * for the bow-draw ANIMATION -- the fixed rotation is 42
++                     * degrees right of and 52 above the limb's own +Z -- and
++                     * in VR the limb IS the controller, which is exactly the
++                     * "high and to the right" the user reported. */
++                    sohAimRet = Player_VrAimHeld(this, 1, &sohAimPos, &sohAimRot, NULL);
++                    if (sohAimRet != 0) {
++                        hookedActor->world.pos = sohAimPos;
++                        hookedActor->world.rot = sohAimRot;
++                        hookedActor->shape.rot = hookedActor->world.rot;
++                        /* rev15 (VR R14): WHICH PATH THIS NOCKED FRAME TOOK.
++                         * R13 shipped a mechanism that never ran and there
++                         * was no way to see that from inside the headset;
++                         * the settings sheet reads this and the two shot
++                         * counters and says so in one row. */
++                        gSohVRAimPath = sohAimRet; /* rev16: 1 = hand basis, 2 = aim ray */
++                    } else
++#endif
++                    {
++#ifdef __IOS__
++                        gSohVRAimPath = 0;
++#endif
++                        Matrix_MultVec3f(&sLeftHandArrowVec3, &hookedActor->world.pos);
++                        Matrix_RotateZYX(0x69E8, -0x5708, 0x458E, MTXMODE_APPLY);
++                        Matrix_Get(&sp14C);
++                        Matrix_MtxFToYXZRotS(&sp14C, &hookedActor->world.rot, 0);
++                        hookedActor->shape.rot = hookedActor->world.rot;
++                    }
+                 } else if (this->stateFlags1 & PLAYER_STATE1_CARRYING_ACTOR) {
+                     Vec3s spB8;
+ 
+@@ -1921,6 +2132,30 @@
+             Matrix_Pop();
+ 
+             CLOSE_DISPS(play->state.gfxCtx);
++#ifdef __IOS__
++            /* SOH_IOS (0042 rev16, VR R15): the aim crosshair. See the
++             * extern above; the reticle casts along the current matrix's
++             * +Z and Player_VrAimHeld's frame puts the aim there. */
++            if ((gSohVRAimReticle != 0) && (this->actor.scale.y >= 0.0f)) {
++                Vec3f sohRetPos;
++                Vec3s sohRetRot;
++                MtxF sohRetFrame;
++
++                if (Player_VrAimHeld(this, 4, &sohRetPos, &sohRetRot, &sohRetFrame)) {
++                    Matrix_Push();
++                    Matrix_Put(&sohRetFrame);
++                    /* rev17 (VR R16 item 1): the translate every vanilla
++                     * call site does and rev16 left out. The routine's
++                     * start point is D_801260C8 = (-500, -100, 0), so
++                     * without it the ray begins five game units to -X of
++                     * the aim origin and one below it -- enough to start
++                     * inside a wall the wearer is standing beside. */
++                    Matrix_Translate(500.0f, 300.0f, 0.0f, MTXMODE_APPLY);
++                    Player_VrDrawAimReticle(play, this, gSohVRAimReticleRange);
++                    Matrix_Pop();
++                }
++            }
++#endif
+         } else if ((this->actor.scale.y >= 0.0f) && (this->rightHandType == PLAYER_MODELTYPE_RH_SHIELD)) {
+             Matrix_Get(&this->shieldMf);
+             Player_UpdateShieldCollider(play, this, &this->shieldQuad, sRightHandLimbModelShieldQuadVertices);
+@@ -1936,13 +2171,49 @@
+                 if (heldActor != NULL) {
+                     MtxF sp44;
+                     s32 pad;
++#ifdef __IOS__
++                    Vec3f sohAimPos;
++                    Vec3s sohAimRot;
++                    MtxF sohAimFrame;
++                    s32 sohAimed;
+ 
+-                    Matrix_MultVec3f(&D_80126190, &heldActor->world.pos);
+-                    Matrix_RotateZYX(0, -0x4000, -0x4000, MTXMODE_APPLY);
+-                    Matrix_Get(&sp44);
+-                    Matrix_MtxFToYXZRotS(&sp44, &heldActor->world.rot, 0);
+-                    heldActor->shape.rot = heldActor->world.rot;
++                    /* SOH_IOS (0042 rev14, VR R13): the hookshot's chain flies
++                     * along the R_HAND limb's +Y in vanilla (D_80126190 is
++                     * 1640 units up it, and the fixed correction carries the
++                     * axis to exactly (0, 1, 0)) -- another pose authored for
++                     * an animation. The reticle is given the SAME vector as a
++                     * matrix, because it casts along the current matrix's +Z
++                     * and a reticle that disagrees with the shot is worse
++                     * than none. */
++                    sohAimed = Player_VrAimHeld(this, 2, &sohAimPos, &sohAimRot, &sohAimFrame);
++                    if (sohAimed) {
++                        heldActor->world.pos = sohAimPos;
++                        heldActor->world.rot = sohAimRot;
++                        heldActor->shape.rot = heldActor->world.rot;
++                        Matrix_Put(&sohAimFrame);
++                    } else
++#endif
++                    {
++                        Matrix_MultVec3f(&D_80126190, &heldActor->world.pos);
++                        Matrix_RotateZYX(0, -0x4000, -0x4000, MTXMODE_APPLY);
++                        Matrix_Get(&sp44);
++                        Matrix_MtxFToYXZRotS(&sp44, &heldActor->world.rot, 0);
++                        heldActor->shape.rot = heldActor->world.rot;
++                    }
+ 
++#ifdef __IOS__
++                    if (gSohVRFpActive != 0) {
++                        if (gSohVRAimReticle != 0) {
++                            Matrix_Push();
++                            Matrix_Translate(500.0f, 300.0f, 0.0f, MTXMODE_APPLY);
++                            Player_VrDrawAimReticle(
++                                play, this,
++                                ((this->heldItemAction == PLAYER_IA_HOOKSHOT) ? 38600.0f : 77600.0f) *
++                                    CVarGetFloat(CVAR_CHEAT("HookshotReachMultiplier"), 1.0f));
++                            Matrix_Pop();
++                        }
++                    } else
++#endif
+                     if (func_8002DD78(this) != 0) {
+                         Matrix_Translate(500.0f, 300.0f, 0.0f, MTXMODE_APPLY);
+                         Player_DrawHookshotReticle(

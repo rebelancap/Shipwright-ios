@@ -15,6 +15,12 @@ struct SDL_Window;
 // on-screen touch-control overlay.
 void SohIos_OnWindowCreated(struct SDL_Window* window);
 
+// R10 verdict 5: read the Sense pair's BUTTONS AND STICKS outside VR and publish
+// them into the gSohVRSense* words overlay 0047 merges from. Called once per pad
+// read from overlay 0047 (game thread); a no-op while the VR compositor loop is
+// running, and on every target that does not build SohSense.m.
+void SohVR_SenseFlatPump(void);
+
 #ifdef __cplusplus
 }
 #endif

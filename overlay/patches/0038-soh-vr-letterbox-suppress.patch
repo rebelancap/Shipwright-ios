@@ -1,0 +1,58 @@
+Overlay patch 0038: suppress the cinematic letterbox in VR (VR-spec D5,
+VR-DONOR-MAP §5 "shrink_window.c"). OoT shrinks the viewport with black bars
+for cutscenes and dialogue. On a flat screen that reads as cinematic; in a
+headset the bars are a pair of black slabs floating in front of the player's
+eyes that shrink the world -- the donor suppresses them outright
+(Letterbox_VrSuppressed(), OR'd into both existing DisableBlackBars gates).
+
+Ours is the same shape and the same two gates, gated on the shell's gSohVRMode
+so the flat and 3D-panel builds are byte-for-byte unaffected: those never set
+the flag. gSohIos.VrLetterbox (default 0) is the escape hatch for anyone who
+wants the bars back in VR.
+
+__IOS__-only; iPhone links resolve against SohIosShell.m's gSohVRMode, which
+never leaves 0 there, and the macOS build compiles none of it.
+
+--- a/soh/src/code/shrink_window.c
++++ b/soh/src/code/shrink_window.c
+@@ -1,11 +1,27 @@
+ #include "global.h"
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0038, VR-spec D5): black bars are meaningless in a
++ * headset -- they float in front of the eyes and shrink the world. Suppressed
++ * whenever VR is the active mode unless the user asks for them back. */
++static s32 SohIos_LetterboxVrSuppressed(void) {
++    extern volatile int gSohVRMode;
++    return (gSohVRMode != 0) && (CVarGetInteger("gSohIos.VrLetterbox", 0) == 0);
++}
++#endif
++
+ s32 D_8012CED0 = 0;
+ 
+ s32 sShrinkWindowVal = 0;
+ s32 sShrinkWindowCurrentVal = 0;
+ 
+ void ShrinkWindow_SetVal(s32 value) {
++#ifdef __IOS__
++    if (SohIos_LetterboxVrSuppressed()) {
++        sShrinkWindowVal = 0;
++        return;
++    }
++#endif
+     if (CVarGetInteger(CVAR_ENHANCEMENT("DisableBlackBars"), 0)) {
+         sShrinkWindowVal = 0;
+         return;
+@@ -21,6 +37,12 @@
+ }
+ 
+ void ShrinkWindow_SetCurrentVal(s32 currentVal) {
++#ifdef __IOS__
++    if (SohIos_LetterboxVrSuppressed()) {
++        sShrinkWindowCurrentVal = 0;
++        return;
++    }
++#endif
+     if (CVarGetInteger(CVAR_ENHANCEMENT("DisableBlackBars"), 0)) {
+         sShrinkWindowCurrentVal = 0;
+         return;

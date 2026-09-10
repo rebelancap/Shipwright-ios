@@ -9,10 +9,14 @@ Honest naming: BOTH metrics include in-present blocking (drawable
 back-pressure). wall≈eng means the frame interval is spent blocked inside
 the render+present call (GPU-bound or pacing), NOT CPU-bound game logic;
 wall>>eng means time goes to code outside the render call.
+rev5 (VR R0): adds a rolling 1 s sim-tick rate beside the existing rolling 1 s
+fps and exports both as SohIos_PacingStats — the engine-side two thirds of the
+VR pacing triple (spec D10); the present rate is measured in the compositor
+loop and joined there.
 
 --- a/soh/soh/OTRGlobals.cpp
 +++ b/soh/soh/OTRGlobals.cpp
-@@ -1792,6 +1792,89 @@
+@@ -1792,6 +1792,117 @@
  #endif
  }
  
@@ -41,6 +45,13 @@ wall>>eng means time goes to code outside the render call.
 +    uint32_t hudFrames = 0;
 +    float hudFps = 0.0f;
 +    std::chrono::steady_clock::time_point hudWindowStart = std::chrono::steady_clock::now();
++    // rev5 (VR R0, spec D10): a rolling 1 s SIM-TICK rate beside the 1 s
++    // fps, so the pacing triple (engine fps / tick tps / present rate) can be
++    // dumped on demand — the 10 s SOH_PERF line is far too coarse for a probe
++    // and the tick rate is the half-rate-bug detector.
++    uint32_t tickWindowCount = 0;
++    float hudTps = 0.0f;
++    std::chrono::steady_clock::time_point tickWindowStart = std::chrono::steady_clock::now();
 +    std::chrono::steady_clock::time_point lastFrame{};
 +    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 +    void OnFrame(double engineMs) {
@@ -62,6 +73,15 @@ wall>>eng means time goes to code outside the render call.
 +    void OnTick() {
 +        ticks++;
 +        auto now = std::chrono::steady_clock::now();
++        tickWindowCount++;
++        {
++            double tel = std::chrono::duration<double>(now - tickWindowStart).count();
++            if (tel >= 1.0) {
++                hudTps = (float)(tickWindowCount / tel);
++                tickWindowCount = 0;
++                tickWindowStart = now;
++            }
++        }
 +        double el = std::chrono::duration<double>(now - lastReport).count();
 +        if (el < 10.0 || frameMs.size() < 8 || engMs.size() < 8) {
 +            return;
@@ -97,12 +117,24 @@ wall>>eng means time goes to code outside the render call.
 +extern "C" void SohIos_HudStats(float* fps) {
 +    *fps = SohIosPerf::gPerfProbe.hudFps;
 +}
++
++// rev5: the pacing pair for the VR/3D diagnostics dump (spec D10). Rolling
++// 1 s windows; present rate is measured in the compositor loop and joined
++// there into the triple.
++extern "C" void SohIos_PacingStats(float* fps, float* tps) {
++    if (fps != nullptr) {
++        *fps = SohIosPerf::gPerfProbe.hudFps;
++    }
++    if (tps != nullptr) {
++        *tps = SohIosPerf::gPerfProbe.hudTps;
++    }
++}
 +#endif
 +
  void RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
      auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(OTRGlobals::Instance->context->GetWindow());
  
-@@ -1809,7 +1892,14 @@
+@@ -1809,7 +1920,14 @@
          static_cast<UIWidgets::Colors>(CVarGetInteger(CVAR_SETTING("Menu.Theme"), UIWidgets::Colors::LightBlue));
      ImGui::PushStyleColor(ImGuiCol_TitleBgActive, UIWidgets::ColorValues.at(themeColor));
      for (const auto& m : mtx_replacements) {
@@ -117,7 +149,7 @@ wall>>eng means time goes to code outside the render call.
          intp->mInterpolationIndex++;
      }
      ImGui::PopStyleColor();
-@@ -1865,6 +1955,9 @@
+@@ -1865,6 +1983,9 @@
      }
  
      RunCommands(commands, mtx_replacements);

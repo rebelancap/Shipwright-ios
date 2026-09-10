@@ -1,0 +1,412 @@
+Overlay patch 0049: THE PARAMETRIC PHYSICAL SHIELD (VR R5, VR-DONOR-MAP 8,
+donor `VrShield.cpp` plus its three widened vanilla gates).
+
+R4 shipped the FACING VETO (overlay 0046) and nothing else of the shield: the
+quad stayed vanilla's 60x60 square in its vanilla place, and the shield was
+raised with R. This patch is the rest of the donor's design.
+
+THE ONE THING TO UNDERSTAND FIRST, because it is not what the brief for this
+round assumed and it changes what "raise your shield" means:
+
+  THE DONOR HAS NO RAISE GESTURE. There is no height threshold, no forearm-vs-
+  chest dot product, no orientation test, nowhere in its 260 lines. The shield
+  is registered EVERY FRAME wherever the off-hand controller is, and "hold it up
+  and you block, hand at your side and you get hit" is EMERGENT from two things:
+  the quad IS the visible shield at the tracked hand, so an attack that misses
+  it misses it; and the 65-degree facing cone rejects a shield that is not
+  pointing at the attacker. We ship that, and we did not invent a gesture the
+  donor does not have. If a discrete raise is ever wanted it is new design, not
+  a port, and it is listed as such in docs/VR-R5-NOTES.md.
+
+  What DOES change from R4 is that the shield no longer needs R at all: it is up
+  because your arm is up, and the vanilla stance flag PLAYER_STATE1_SHIELDING is
+  never set by any of this.
+
+(A) THE HELD PREDICATE. `Player_VrShieldHeld` keys on `leftHandType` -- the
+SWORD's visibility -- rather than on the logical held item, exactly as the donor
+does after its own commit df594221 rewrote it. leftHandType is the OUTPUT of
+Player_SetModels' central derivation, so it IS what the player can see; keying
+on it means the shield leaves the arm the same frame the sword leaves the hand,
+including the visual-only stow cases (itemAction = -1) where heldItemAction
+still claims the sword. The donor's earlier heldItemAction version needed a
+deny-list and had to chase cases one at a time. The Deku stick is the one
+special case, and it is the donor's: the stick has no hand model of its own and
+renders over a closed fist, so LH_CLOSED counts as "visibly in hand" only while
+the held action really is the stick.
+
+Suspended in the hands-off states the donor lists: climbing a ladder, climbing
+or hanging off a ledge, in water, on horseback, carrying an actor, dead. Plus
+ours: no VR, not first person, motion hands off, the SHIELD hand not tracked.
+
+(B) THE THREE WIDENED GATES.
+
+  1. z_player_lib.c Player_SetModelsForHoldingShield -- the shield MODEL goes
+     into the off hand and comes off Link's back. Vanilla tests
+     PLAYER_STATE1_SHIELDING; we test that OR Player_VrShieldHeld.
+
+     And the non-obvious second half, which the donor learned the hard way and
+     documents at length: vanilla's unconditional `this->itemAction = -1` at the
+     bottom becomes STANCE-ONLY. That -1 is the "models diverged" marker, and
+     Player_UpdateItems only processes item buttons while
+     (itemAction == heldItemAction || SHIELDING). In the stance, the flag keeps
+     buttons alive despite the -1. Held physically FULL TIME with no flag, the
+     -1 would close that gate FOREVER: B could never draw the sword and C could
+     never use an item. This is the single most breakable line in the patch.
+
+  2. z_player_lib.c Player_UpdateShieldCollider -- whether the shield quad is
+     registered as a collider at all, and (ours, the parametric part) WHICH
+     vertices it gets. Same widening, plus: while physically held, the four
+     verts come from Player_VrShieldQuadVerts instead of vanilla's quadSrc.
+
+  3. z_player.c func_808382DC's bounce branch -- what a block DOES. While
+     physically held we keep the damage negation and the Deku-shield fire burn
+     and skip the stance reaction animation and the `linearVelocity = -18`
+     shove. The donor's reason, and it is the right one: the player's real arm
+     holds the line, so shoving Link backwards contradicts what the player just
+     did with their body.
+
+  Plus the two stance ENTRIES the donor suppresses, for a reason that is not
+  cosmetic: both of them set the itemAction = -1 marker outside the action
+  lifecycle that repairs it. Player_ActionHandler_11 is the R-button crouch
+  (the Sense GRIP is bound to R, so every firm squeeze mid-swing crouched Link),
+  and func_80834758 is the Z-target upper-body stance.
+
+(C) THE PARAMETRIC QUAD. Built from scratch in R_HAND MODEL space -- the same
+space vanilla's quadSrc lives in, and the space the limb matrix that overlay
+0042 pins to the controller transforms out of. A symmetric TRAPEZOID (top width,
+bottom width, height) so a Hylian taper is expressible, tilted by pitch/yaw/roll
+as R = Rz(roll) * Ry(yaw) * Rx(pitch).
+
+  The subtle part, and the donor says it cost them: THE SHIFTS ARE APPLIED IN
+  THE COLLIDER'S OWN TILTED FRAME. centre = axW*shiftX + axH*shiftY + axN*shiftZ
+  where axW/axH/axN are the rotated axes. Shifting in raw hand axes made "up/
+  down" slide sideways at any tilt, and no amount of rotation could fix it
+  because the offsets did not rotate with the quad.
+
+  Vertex order is vanilla's zigzag, which Collider_SetQuadVertices expects:
+  0 bottom-left, 1 bottom-right, 2 top-left, 3 top-right.
+
+  Nine numbers, the donor's shipped defaults, all live from `vr set`:
+  WidthTop 21.2 / WidthBottom 11.9 / Height 18 (FULL dimensions in game units,
+  halved into the x100 model space) / ShiftX -1.1 / ShiftY -0.8 / ShiftZ -2.5
+  (game units, x100) / Pitch -4 / Yaw 0 / Roll -90 (degrees). NONE of them has
+  been seen in a headset by anyone in this program; they are PCVR numbers tuned
+  against a different controller in a different hand, and the roll in particular
+  is the one most likely to be wrong for a Sense unit.
+
+(D) HOW IT MEETS 0046. 0046's facing veto already tests the same shell state
+this predicate wraps -- VR first person, motion hands on, shield hand tracked --
+inline, so the two cannot disagree about whether the shield is physical, and
+0046 keeps standing alone without a symbol from this patch. The veto stays the
+INNER condition exactly as R4 shipped it: a hit must first touch the quad, and
+only then is the cone consulted. What changes underneath it is WHERE the quad
+is: it is now the parametric trapezoid on the tracked hand rather than vanilla's
+square in its stance-era place.
+
+GATING. Every branch is `#ifdef __IOS__` and every one of them reduces to the
+vanilla predicate when gSohVRFpActive is 0. The flat window, the 3D panel, the
+macOS build and every iPhone build see this file's behaviour byte for byte as
+they do today.
+
+--- a/soh/src/code/z_player_lib.c
++++ b/soh/src/code/z_player_lib.c
+@@ -537,11 +537,157 @@
+         return PLAYER_MODELGROUP_CHILD_HYLIAN_SHIELD;
+     } else {
+         return modelGroup;
++    }
++}
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0049, VR R5): THE PHYSICAL SHIELD. See the patch header
++ * -- in particular the note that the donor has NO raise gesture, and that
++ * "hold it up to block" is emergent from the quad being where your hand is
++ * plus the 65-degree facing cone in overlay 0046. */
++extern volatile int gSohVRMode;
++extern volatile int gSohVRFpActive;
++extern volatile int gSohVRMotionHands;
++extern volatile int gSohVRLeftHanded;
++extern volatile int gSohVRHandValid[2];
++extern volatile int gSohVRShieldPhysical;
++extern volatile int gSohVRShieldBlocks;
++extern volatile float gSohVRShieldQuad[9];
++extern volatile int gSohVRShieldHeld;
++extern volatile int gSohVRShieldBlocks;
++
++s32 Player_VrShieldHeld(Player* this) {
++    s32 sohShieldHand;
++
++    if ((gSohVRMode == 0) || (gSohVRFpActive == 0) || (gSohVRMotionHands == 0) ||
++        (gSohVRShieldPhysical == 0)) {
++        return 0;
++    }
++    if (this == NULL) {
++        return 0;
++    }
++    /* The shield hand is the opposite of the sword hand, and the sword hand
++     * is the player's RIGHT controller unless left-handed. */
++    sohShieldHand = ((gSohVRLeftHanded != 0) ? 0 : 1) ^ 1;
++    if (gSohVRHandValid[sohShieldHand] == 0) {
++        return 0; /* not tracked: vanilla stance blocking, unchanged */
++    }
++    if (this->actor.category != ACTORCAT_PLAYER) {
++        return 0;
++    }
++    if (this->currentShield == PLAYER_SHIELD_NONE) {
++        return 0;
++    }
++    if (Player_IsChildWithHylianShield(this)) {
++        return 0; /* child carries the Hylian shield on his back */
++    }
++    if (Player_HoldsTwoHandedWeapon(this) &&
++        !(CVarGetInteger(CVAR_CHEAT("ShieldTwoHanded"), 0) &&
++          (this->heldItemAction != PLAYER_IA_DEKU_STICK))) {
++        return 0;
++    }
++    /* THE HELD TEST, donor VrShield.cpp:78-95: leftHandType is the SWORD'S
++     * VISIBILITY -- the output of Player_SetModels' own derivation -- not
++     * the logical held item. Keying on it means the shield leaves the arm
++     * the same frame the sword leaves the hand, including every visual-only
++     * stow where heldItemAction still claims the sword. */
++    switch (this->leftHandType) {
++        case PLAYER_MODELTYPE_LH_SWORD:
++        case PLAYER_MODELTYPE_LH_SWORD_2:
++        case PLAYER_MODELTYPE_LH_BGS:
++        case PLAYER_MODELTYPE_LH_HAMMER:
++            break;
++        case PLAYER_MODELTYPE_LH_CLOSED:
++            /* The Deku stick has no hand model of its own -- it renders over
++             * a closed fist -- so the fist PLUS the stick logically held is
++             * its "visibly in hand". */
++            if (this->heldItemAction != PLAYER_IA_DEKU_STICK) {
++                return 0;
++            }
++            break;
++        default:
++            return 0;
++    }
++    /* Hands-off states: both arms are doing something else. */
++    if (this->stateFlags1 &
++        (PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE |
++         PLAYER_STATE1_IN_WATER | PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_DEAD)) {
++        return 0;
++    }
++    gSohVRShieldHeld = 1;
++    return 1;
++}
++
++/* The parametric trapezoid, in R_HAND MODEL space (game units x100 -- the
++ * same space vanilla's quadSrc lives in). Donor
++ * VrCombat_ShieldQuadModelVerts, VrShield.cpp:107-150. */
++void Player_VrShieldQuadVerts(Vec3f* out) {
++    f32 halfWTop = gSohVRShieldQuad[0] * 50.0f;
++    f32 halfWBot = gSohVRShieldQuad[1] * 50.0f;
++    f32 halfH = gSohVRShieldQuad[2] * 50.0f;
++    f32 cx = gSohVRShieldQuad[3] * 100.0f;
++    f32 cy = gSohVRShieldQuad[4] * 100.0f;
++    f32 cz = gSohVRShieldQuad[5] * 100.0f;
++    f32 d2r = 3.14159265f / 180.0f;
++    f32 pitch = gSohVRShieldQuad[6] * d2r;
++    f32 yaw = gSohVRShieldQuad[7] * d2r;
++    f32 roll = gSohVRShieldQuad[8] * d2r;
++    f32 cp = cosf(pitch);
++    f32 sp = sinf(pitch);
++    f32 cyw = cosf(yaw);
++    f32 syw = sinf(yaw);
++    f32 cr = cosf(roll);
++    f32 sr = sinf(roll);
++    /* R = Rz(roll) * Ry(yaw) * Rx(pitch); axW is width, axH height, axN the
++     * outward normal. */
++    f32 axW[3];
++    f32 axH[3];
++    f32 axN[3];
++    f32 c3[3];
++    s32 axis;
++
++    axW[0] = cr * cyw;
++    axW[1] = sr * cyw;
++    axW[2] = -syw;
++    axH[0] = (cr * syw * sp) - (sr * cp);
++    axH[1] = (sr * syw * sp) + (cr * cp);
++    axH[2] = cyw * sp;
++    axN[0] = (cr * syw * cp) + (sr * sp);
++    axN[1] = (sr * syw * cp) - (cr * sp);
++    axN[2] = cyw * cp;
++    /* THE SHIFTS LIVE IN THE COLLIDER'S OWN TILTED FRAME -- across along its
++     * width axis, up along its height axis, out along its normal -- so they
++     * keep meaning what their names say at any tilt. Shifting in raw hand
++     * axes made up/down slide sideways, and no rotation could fix it because
++     * the offsets did not rotate with the quad. */
++    for (axis = 0; axis < 3; axis++) {
++        c3[axis] = (axW[axis] * cx) + (axH[axis] * cy) + (axN[axis] * cz);
+     }
++    /* Vanilla's zigzag vertex order, which Collider_SetQuadVertices expects:
++     * 0 bottom-left, 1 bottom-right, 2 top-left, 3 top-right. */
++    for (axis = 0; axis < 3; axis++) {
++        f32* v0 = (axis == 0) ? &out[0].x : ((axis == 1) ? &out[0].y : &out[0].z);
++        f32* v1 = (axis == 0) ? &out[1].x : ((axis == 1) ? &out[1].y : &out[1].z);
++        f32* v2 = (axis == 0) ? &out[2].x : ((axis == 1) ? &out[2].y : &out[2].z);
++        f32* v3 = (axis == 0) ? &out[3].x : ((axis == 1) ? &out[3].y : &out[3].z);
++
++        *v0 = c3[axis] - (axW[axis] * halfWBot) - (axH[axis] * halfH);
++        *v1 = c3[axis] + (axW[axis] * halfWBot) - (axH[axis] * halfH);
++        *v2 = c3[axis] - (axW[axis] * halfWTop) + (axH[axis] * halfH);
++        *v3 = c3[axis] + (axW[axis] * halfWTop) + (axH[axis] * halfH);
++    }
+ }
++#endif
+ 
+ void Player_SetModelsForHoldingShield(Player* this) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0049, gate 1, donor z_player_lib.c:546-550): the
++     * shield model rides the off hand whenever it is PHYSICALLY held -- no
++     * stance, no button. */
++    if (((this->stateFlags1 & PLAYER_STATE1_SHIELDING) || Player_VrShieldHeld(this)) &&
++#else
+     if ((this->stateFlags1 & PLAYER_STATE1_SHIELDING) &&
++#endif
+         ((this->itemAction < 0) || (this->itemAction == this->heldItemAction))) {
+         if ((CVarGetInteger(CVAR_CHEAT("ShieldTwoHanded"), 0) && (this->heldItemAction != PLAYER_IA_DEKU_STICK) ||
+              !Player_HoldsTwoHandedWeapon(this)) &&
+@@ -570,7 +716,21 @@
+                 this->sheathDLists = &sPlayerDListGroups[this->sheathType][1];
+             }
+             this->modelAnimType = PLAYER_ANIMTYPE_2;
++#ifdef __IOS__
++            /* SOH_IOS (overlay 0049): itemAction = -1 is vanilla's "models
++             * diverged" marker, and Player_UpdateItems only processes item
++             * buttons while (itemAction == heldItemAction || SHIELDING). In
++             * the STANCE the flag keeps buttons alive despite the -1. Held
++             * PHYSICALLY, full time, with no flag, the -1 would close that
++             * gate FOREVER: B could never draw the sword and C could never
++             * use an item. So the marker stays stance-only. This is the
++             * single most breakable line in the patch. */
++            if (this->stateFlags1 & PLAYER_STATE1_SHIELDING) {
++                this->itemAction = -1;
++            }
++#else
+             this->itemAction = -1;
++#endif
+         }
+     }
+ }
+@@ -1538,15 +1698,45 @@
+         COLTYPE_METAL,
+     };
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0049, gate 2, donor z_player_lib.c:1660): the quad
++     * registers whenever the shield is physically in hand. Its vertices come
++     * from THIS limb's matrix, which overlay 0042 pins to the off-hand
++     * controller -- so where you hold the shield IS where it blocks. */
++    if ((this->stateFlags1 & PLAYER_STATE1_SHIELDING) || Player_VrShieldHeld(this)) {
++#else
+     if (this->stateFlags1 & PLAYER_STATE1_SHIELDING) {
++#endif
+         Vec3f quadDest[4];
+ 
+         this->shieldQuad.base.colType = shieldColTypes[this->currentShield];
+ 
++#ifdef __IOS__
++        /* SOH_IOS (overlay 0049): the fully parametric trapezoid replaces
++         * vanilla's stance quad -- a 60x60 offset square authored as
++         * stance-era forgiveness, which lands nowhere near the visible
++         * shield on a controller-driven hand. Hits outside the configured
++         * quad do not block; they land on whatever was behind it. */
++        if (Player_VrShieldHeld(this)) {
++            Vec3f sohVrSrc[4];
++
++            Player_VrShieldQuadVerts(sohVrSrc);
++            Matrix_MultVec3f(&sohVrSrc[0], &quadDest[0]);
++            Matrix_MultVec3f(&sohVrSrc[1], &quadDest[1]);
++            Matrix_MultVec3f(&sohVrSrc[2], &quadDest[2]);
++            Matrix_MultVec3f(&sohVrSrc[3], &quadDest[3]);
++        } else {
++            Matrix_MultVec3f(&quadSrc[0], &quadDest[0]);
++            Matrix_MultVec3f(&quadSrc[1], &quadDest[1]);
++            Matrix_MultVec3f(&quadSrc[2], &quadDest[2]);
++            Matrix_MultVec3f(&quadSrc[3], &quadDest[3]);
++        }
++#else
+         Matrix_MultVec3f(&quadSrc[0], &quadDest[0]);
+         Matrix_MultVec3f(&quadSrc[1], &quadDest[1]);
+         Matrix_MultVec3f(&quadSrc[2], &quadDest[2]);
+         Matrix_MultVec3f(&quadSrc[3], &quadDest[3]);
++#endif
+         Collider_SetQuadVertices(collider, &quadDest[0], &quadDest[1], &quadDest[2], &quadDest[3]);
+ 
+         CollisionCheck_SetAC(play, &play->colChkCtx, &collider->base);
+--- a/soh/src/overlays/actors/ovl_player_actor/z_player.c
++++ b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+@@ -2736,10 +2736,27 @@
+     }
+ }
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0049, VR R5): the physical shield's held predicate,
++ * defined in z_player_lib.c. Declared here, at its earliest use. */
++s32 Player_VrShieldHeld(Player* this);
++extern volatile int gSohVRShieldBlocks;
++#endif
++
+ s32 func_80834758(PlayState* play, Player* this) {
+     LinkAnimationHeader* anim;
+     f32 frame;
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0049, donor z_player.c:2826-2835): the Z-target
++     * upper-body shield stance, suppressed at the root for the same reason
++     * as the crouch -- the block is wherever the physically held shield is,
++     * and this entry would set the diverged-models marker. */
++    if (Player_VrShieldHeld(this)) {
++        return 0;
++    }
++#endif
++
+     if (!(this->stateFlags1 & (PLAYER_STATE1_SHIELDING | PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_IN_CUTSCENE)) &&
+         (play->shootingGalleryStatus == 0) && (this->heldItemAction == this->itemAction) &&
+         (this->currentShield != PLAYER_SHIELD_NONE) && !Player_IsChildWithHylianShield(this) &&
+@@ -4790,6 +4807,25 @@
+ 
+                 Player_RequestRumble(this, 180, 20, 100, 0);
+ 
++#ifdef __IOS__
++                /* SOH_IOS (overlay 0049, gate 3, donor z_player.c:4914-4921).
++                 * A PHYSICAL block keeps the damage negation (this function
++                 * returning 0 IS the negation) and the Deku-shield fire burn,
++                 * and skips the stance reaction animation and the
++                 * linearVelocity = -18 shove: the player's real arm holds the
++                 * line, so shoving Link backwards contradicts what the player
++                 * just did with their body. Facing is already enforced inside
++                 * CollisionCheck (overlay 0046) -- a bad-angle hit never
++                 * bounces at all -- so any bounce reaching here is legitimate. */
++                if (sp64 && Player_VrShieldHeld(this)) {
++                    gSohVRShieldBlocks = gSohVRShieldBlocks + 1;
++                    if (this->shieldQuad.info.acHitInfo->toucher.effect == 1) {
++                        func_8083819C(this, play);
++                    }
++                    return 0;
++                }
++#endif
++
+                 if (!Player_IsChildWithHylianShield(this)) {
+                     if (this->invincibilityTimer >= 0) {
+                         LinkAnimationHeader* anim;
+@@ -6459,6 +6495,17 @@
+     LinkAnimationHeader* anim;
+     f32 frame;
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0049, donor z_player.c:6609-6615): the R-button crouch
++     * stance is retired while the physical shield owns blocking. The Sense
++     * GRIP is bound to R, so without this every firm squeeze mid-swing
++     * crouched Link -- and the stance sets the itemAction = -1 diverged-models
++     * marker outside the action lifecycle that repairs it. */
++    if (Player_VrShieldHeld(this)) {
++        return 0;
++    }
++#endif
++
+     if ((play->shootingGalleryStatus == 0) && (this->currentShield != PLAYER_SHIELD_NONE) &&
+         CHECK_BTN_ALL(sControlInput->cur.button, BTN_R) &&
+         (Player_IsChildWithHylianShield(this) ||

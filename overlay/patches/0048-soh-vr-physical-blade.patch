@@ -1,0 +1,1200 @@
+Overlay patch 0048: THE PHYSICAL BLADE (VR R5, VR-DONOR-MAP 8 layer 1).
+
+R4's honest headline gap, recorded in docs/VR-R4-NOTES.md 5.1 and in STATUS.md:
+"damage lands along Link's AUTHORED sword arc, not where your hand is." This
+patch closes it, and it is the reason R5 exists.
+
+TWO NEW FILES' WORTH OF WORK, ONE NEW FILE. `soh/src/code/z_soh_vr_blade.c` is
+added whole (soh/CMakeLists.txt already GLOB_RECURSEs "src/*.c", so it needs no
+build-system change), and z_player.c gains exactly two call sites plus their
+declarations. Everything in the new file is `#ifdef __IOS__`, so a desktop or
+oracle build compiles an empty translation unit.
+
+THE THREE FLOWS AND THEIR TICK ORDERING -- the part that is easy to get wrong
+and impossible to debug afterwards:
+
+  HARVEST, at DRAW. The scene's static CollisionPoly list is walked, AABB-culled
+  to 20 units around the blade line, back-face rejected at 4 units (a face the
+  blade is deeply BEHIND belongs to another volume -- the outside of this wall,
+  the ceiling of the room below -- and pushing off it drives the blade the wrong
+  way), ranked by TRUE segment-to-triangle distance with a 0.5x sticky bonus for
+  polys that already constrain the blade. The donor is explicit (VrSwing.cpp
+  :476-497) that CENTROID ranking made big wall triangles lose to small
+  irrelevant ones and churned the set every tick, and that stickiness is one of
+  three co-required tricks -- a member blinking out for a single step lets the
+  sim sink and the snap back IS the jitter. Top 16 published; the shell converts
+  to tracking metres every compositor frame and steps the solver against them.
+
+  DAMAGE, at DRAW. Two kinds of AT quad, both vanilla vertex order, both
+  TOUCH_NEAREST, both on a collider that is a byte-for-byte mirror of vanilla's
+  own D_80854650:
+    - the SWEPT quad, corners = the blade's previous and current base and tip.
+      This is the quad that makes damage follow the hand, and it is registered
+      only while the swing is HOT.
+    - the STRIKE quad (donor :1283-1297): an 18x18 square poked 6 units INSIDE
+      the surface at each contact the solver reported. It exists BECAUSE the
+      blade now physically halts at a surface -- a halted blade's swept quad
+      only grazes what it stopped on.
+  Damage class comes from the donor's kDmgFlags table mirroring vanilla's
+  D_80854488, column 1 (jump-slash, roughly 2x in every enemy's authored table)
+  above the heavy-swing speed. So every enemy's own damage table and
+  vulnerability set keeps working with nothing re-implemented -- which is the
+  same reason R4's sUseHeldItem path was worth having.
+
+  HIT READBACK, at UPDATE, ONE TICK LATE and that is not a bug. Quads are
+  registered at draw on tick N; CollisionCheck_AT runs at the top of tick N+1;
+  AT_HIT is read then. On a hit gSohVRBladeHitSeq bumps and the shell drops the
+  swing tier HOT -> ARMED. That is the donor's ENTIRE "one strike per swing"
+  mechanism (VrSwing.cpp:1522-1530): to strike again the blade must re-cross the
+  hit speed, which is what a second swing is. No hit list, nothing to leak
+  across a scene change, nothing to reset.
+
+WHY THE UPDATE HOOK IS AT THE TOP OF Player_UpdateCommon. The donor records the
+ordering trap it cost them (VrSwing.cpp:263-268): CollisionCheck_ResetDamage
+zeroes every actor's colChkInfo.displacement at the top of the tick, so anything
+written at draw time is wiped before the victim consumes it, and the player
+updates BEFORE enemies. We queue nothing at draw that an enemy must consume
+(knockback is not ported -- the donor ships it at 0 anyway), but the AT readback
+has the same shape and belongs in the same place.
+
+WHAT IS NOT PORTED, listed rather than hidden (docs/VR-R5-NOTES.md carries the
+full list): bone capsules and limb puppetry -- the donor's own comment settles
+it, "Damage is unaffected either way", and with no puppet the donor itself falls
+back to pushing AC colliders as solid prims; dynapoly probe rays, so a blade
+does not yet stop on a pushed block or an open door; actor colliders as contact
+prims, so it does not yet stop on an enemy; knockback, press-push, hit flinch
+(all 0 in the donor's own defaults); and the material SFX table.
+
+THE FALLBACK IS NOT REMOVED. `gSohVRBladeDamage == 0` restores R4 exactly -- a
+swing sets sUseHeldItem and Link's authored attack runs, animation, combos, stab
+lunge and all. It is a setting because some players will prefer the authored
+animation, and it is also what runs the moment the shell reports no hands.
+
+GATING. Everything is behind gSohVRMode && gSohVRFpActive && gSohVRMotionHands
+&& gSohVRBladeDamage && gSohVRHandValid[swordHand] -- state the flat window, the
+3D panel and every iPhone build never set.
+
+--- /dev/null
++++ b/soh/src/code/z_soh_vr_blade.c
+@@ -0,0 +1,1073 @@
++/*
++ * z_soh_vr_blade.c -- SOH_IOS (overlay 0048, VR R5). THE PHYSICAL BLADE.
++ *
++ * VR-DONOR-MAP 8, layer 1. This is our port of the parts of ShinyWindow's
++ * `VrSwing.cpp` that the `gVrPhysVisualMesh=0` path needs: the GAME's own
++ * collision mesh harvested around the blade and handed outward to the shell's
++ * contact solver, and the damage that comes back in.
++ *
++ * WHAT R4 DID, AND WHY THIS REPLACES IT. R4 turned a detected swing into
++ * `sUseHeldItem = true`, which runs Link's entire AUTHORED attack. Everything
++ * about that worked -- animation, combos, the stab lunge, jump-slash, every
++ * enemy's own damage table -- except the one thing that matters in VR: DAMAGE
++ * LANDED ALONG LINK'S AUTHORED ARC, NOT WHERE YOUR HAND WAS. Swing left and
++ * Link still hit whatever he faced. R5 damages from the blade. The R4 path is
++ * kept, whole, behind `gSohVRBladeDamage == 0`, for anyone who prefers the
++ * authored attack (and as the fallback the moment the shell reports no hands).
++ *
++ * THE THREE FLOWS, and the tick ordering each depends on:
++ *
++ *  1. HARVEST (draw time). Walk the scene's static `CollisionPoly` list,
++ *     AABB-culled to 20 units around the blade line, back-face rejected at 4
++ *     units, ranked by TRUE segment-to-triangle distance (donor :480-497 is
++ *     explicit that centroid ranking made big wall triangles lose to small
++ *     irrelevant ones and churned the set every tick), with a 0.5x sticky bonus
++ *     for polys that already constrain the blade. Top 16 published to the
++ *     shell, which converts to tracking metres and steps the solver at HEADSET
++ *     rate against them.
++ *
++ *  2. DAMAGE (draw time). Two kinds of AT quad, both on the vanilla vertex
++ *     order and both `TOUCH_NEAREST`:
++ *       - the SWEPT quad, corners = the blade's previous and current base and
++ *         tip, registered while the swing is HOT. This is the quad that makes
++ *         damage follow the hand.
++ *       - the STRIKE quad, from each contact the solver reported: an 18x18
++ *         square poked 6 units INSIDE the surface at the impact point (donor
++ *         :1283-1297). It exists because the blade now physically HALTS at a
++ *         surface, so the swept quad only grazes what it stopped on.
++ *     Damage class is the donor's `kDmgFlags` table mirroring vanilla's
++ *     `D_80854488`, column 1 (jump-slash, ~2x in every enemy's authored table)
++ *     above the heavy-swing speed. So every enemy's damage table and
++ *     vulnerability set keeps working with nothing re-implemented.
++ *
++ *  3. HIT READBACK (update time, ONE TICK LATE and that is not a bug). Quads
++ *     are registered at draw on tick N; `CollisionCheck_AT` runs at the top of
++ *     tick N+1; we read `AT_HIT` then. On a hit we bump `gSohVRBladeHitSeq`,
++ *     and the shell drops the swing tier HOT -> ARMED. That is the donor's
++ *     entire "one strike per swing" mechanism (VrSwing.cpp:1522-1530): to
++ *     strike again the blade must re-cross the hit speed, which is what a
++ *     second swing IS. No hit list, nothing to leak, nothing to reset.
++ *
++ * NOT PORTED, and listed in docs/VR-R5-NOTES.md rather than hidden: bone
++ * capsules and limb puppetry (the donor's own comment at VrSwing.cpp:499-507
++ * settles it -- "Damage is unaffected either way"), dynapoly probe rays, actor
++ * AC/OC colliders as contact prims, knockback and press-push (which the donor
++ * ships at 0 anyway), and the material SFX table.
++ */
++#ifdef __IOS__
++
++#include "global.h"
++#include "z64.h"
++
++/* Published by the shell (app/ios/SohIosShell.m), weak-zero on desktop. */
++extern volatile int gSohVRMode;
++extern volatile int gSohVRFpActive;
++extern volatile int gSohVRMotionHands;
++extern volatile int gSohVRLeftHanded;
++extern volatile int gSohVRHandValid[2];
++extern volatile int gSohVRBladeDamage;
++
++extern volatile int gSohVRPairSlot;
++
++/* shell -> game: the blade line the SIM pose implies, GAME units, published in
++ * the same two-slot rhythm as the eye pair so a frame reads one instant. */
++extern volatile int gSohVRBladeValid[2];
++extern volatile float gSohVRBladeLine[2][2][12]; /* [slot][hand][base,tip,prevBase,prevTip] */
++
++/* shell -> game: the contact ring. */
++extern volatile unsigned int gSohVRContactSeq;
++extern volatile float gSohVRContactPos[8][3];
++extern volatile float gSohVRContactNrm[8][3];
++extern volatile float gSohVRContactImpact[8];
++extern volatile int gSohVRContactHand[8];
++extern volatile int gSohVRContactId[8];
++
++/* shell -> game: swing state, already used by overlay 0042. */
++extern volatile int gSohVRSwingTier[2];
++/* rev3 (VR R7 verdict 4): the button-stab window, in game ticks. Overlay 0042
++ * rev5 opens it on a B press while motion combat covers the weapon, and counts
++ * it down; zero here means "no stab", which is also what a build without 0042
++ * gives, so this patch stays safe standalone. */
++extern volatile int gSohVRStabTicks;
++extern volatile int gSohVRStabQuads;
++/* rev4 (VR R8 part B): the Z-target overhead chop's window, opened by overlay
++ * 0042 rev7 on an A press while Z-targeting. Same standalone-safety argument as
++ * the stab window above: zero means "no chop". */
++extern volatile int gSohVRChopTicks;
++extern volatile int gSohVRSwingJump[2];
++
++/* game -> shell */
++extern volatile int gSohVRMeshCount;
++extern volatile float gSohVRMeshTri[32][9];
++extern volatile int gSohVRMeshId[32];
++/* R6: the harvest is no longer triangles alone -- see SohIosShell.m. Shape 0
++ * TRI (three verts), 1 CAPSULE (axis endpoints in a/b), 2 SPHERE (centre in
++ * a); the radius is in GAME UNITS. */
++extern volatile int gSohVRMeshShape[32];
++extern volatile float gSohVRMeshRadius[32];
++extern volatile unsigned int gSohVRMeshSeq;
++extern volatile unsigned int gSohVRBladeHitSeq[2];
++extern volatile int gSohVRBladeQuads;   /* diagnostic: AT quads registered */
++extern volatile int gSohVRBladeHits;    /* diagnostic: quads that landed */
++extern volatile int gSohVRBladeTris;    /* diagnostic: prims published */
++extern volatile int gSohVRBladeDyna;    /* diagnostic: dynapoly probe hits in the set */
++extern volatile int gSohVRBladeBodies;  /* diagnostic: actor capsules/spheres in the set */
++extern volatile int gSohVRBladeStrikes; /* diagnostic: strike quads built */
++
++#define SOH_VR_MAX_QUADS 6
++#define SOH_VR_MAX_LEVEL_TRIS 16
++/* R6: the published set is the 16 static polys PLUS the dynapoly probe hits and
++ * the actor prims, capped at the shell's array size. */
++#define SOH_VR_MAX_PRIMS 32
++#define SOH_VR_SHAPE_TRI 0
++#define SOH_VR_SHAPE_CAPSULE 1
++#define SOH_VR_SHAPE_SPHERE 2
++/* Donor VrSwing.cpp:666-679 -- five probe rays, a ~26 degree fan along the
++ * blade plus two downward reaches. */
++#define SOH_VR_DYNA_FAN 0.45f
++/* Donor VrSwing.cpp:743 -- actors further than this from Link are not the
++ * blade's business, and walking every collider in the scene is. */
++#define SOH_VR_ACTOR_RANGE 400.0f
++/* rev3 (VR R7 verdict 4): half the stab quad's width, in game units. The donor
++ * uses its blade-width slider (gVrPhysBladeWidth, 4.0 game units) for the same
++ * extrusion; 4 units is about 11 cm at 35 units/m, which is a sword's worth of
++ * flat and not a wall of one. */
++#define SOH_VR_STAB_HALF_WIDTH 4.0f
++
++/* rev3: IS THE BLADE DAMAGING THIS TICK? Two ways in, and they must agree
++ * everywhere -- the contact harvest, the swept quad and the strike quads all
++ * asked the tier directly before, so a button stab would have produced contacts
++ * that were then thrown away by a gate that had not heard of it. HOT is a real
++ * swing; a live stab window is a deliberate thrust. */
++static s32 SohVrSwordHand(void);
++
++static s32 SohVrBlade_Damaging(void) {
++    return (gSohVRSwingTier[SohVrSwordHand()] == 2) || (gSohVRStabTicks > 0) ||
++           (gSohVRChopTicks > 0);
++}
++#define SOH_VR_MAX_STRIKES 4
++
++/* Mirror of vanilla D_80854650, the player's own melee AT quad init
++ * (z_player.c). Everything about the collider is vanilla; only the VERTICES
++ * differ, which is the entire point. */
++static ColliderQuadInit sSohVrQuadInit = {
++    {
++        COLTYPE_NONE,
++        AT_ON | AT_TYPE_PLAYER,
++        AC_NONE,
++        OC1_NONE,
++        OC2_TYPE_PLAYER,
++        COLSHAPE_QUAD,
++    },
++    {
++        ELEMTYPE_UNK2,
++        { 0x00000100, 0x00, 0x01 },
++        { 0xFFCFFFFF, 0x00, 0x00 },
++        TOUCH_ON | TOUCH_NEAREST,
++        BUMP_NONE,
++        OCELEM_NONE,
++    },
++    { { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } } },
++};
++
++/* Per-weapon [slash, jump-slash] dmgFlags, rows matching vanilla D_80854488:
++ * Master, Kokiri (also the broken Giant's Knife), Biggoron. Donor
++ * VrSwing.cpp:80-86. Column 1 is roughly 2x in every enemy's authored table. */
++static const u32 sSohVrDmgFlags[3][2] = {
++    { 0x00000200, 0x08000000 },
++    { 0x00000100, 0x02000000 },
++    { 0x00000400, 0x04000000 },
++};
++
++static ColliderQuad sSohVrQuads[SOH_VR_MAX_QUADS];
++static PlayState* sSohVrQuadsPlay = NULL;
++static s32 sSohVrQuadsUsed = 0;
++
++typedef struct {
++    Vec3f pos;
++    Vec3f normal;
++    u32 dmgFlags;
++} SohVrPendingStrike;
++
++static SohVrPendingStrike sSohVrStrikes[SOH_VR_MAX_STRIKES];
++static s32 sSohVrStrikeCount = 0;
++static unsigned int sSohVrContactSeen = 0;
++
++/* R6, defined below Update because it reads the ring Update drains. */
++static void SohVrBlade_ContactSfx(PlayState* play, Player* this, s32 slot);
++
++/* Sticky poly set: a poly that already constrains the blade keeps a rank
++ * bonus, so the harvested set does not churn while the blade rests on a wall.
++ * Donor :606-612 and :655-658 -- one of three co-required tricks; without it
++ * a member blinking out for one step lets the sim sink and the snap back IS
++ * the jitter. */
++static CollisionPoly* sSohVrSticky[SOH_VR_MAX_LEVEL_TRIS];
++static s32 sSohVrStickyCount = 0;
++static PlayState* sSohVrStickyPlay = NULL;
++
++static f32 SohVrDot(Vec3f* a, Vec3f* b) {
++    return (a->x * b->x) + (a->y * b->y) + (a->z * b->z);
++}
++
++static void SohVrSub(Vec3f* out, Vec3f* a, Vec3f* b) {
++    out->x = a->x - b->x;
++    out->y = a->y - b->y;
++    out->z = a->z - b->z;
++}
++
++static f32 SohVrLen(Vec3f* a) {
++    return sqrtf(SohVrDot(a, a));
++}
++
++/* Closest point on segment ab to p. */
++static void SohVrClosestOnSeg(Vec3f* out, Vec3f* p, Vec3f* a, Vec3f* b) {
++    Vec3f ab;
++    Vec3f ap;
++    f32 d;
++    f32 t;
++
++    SohVrSub(&ab, b, a);
++    SohVrSub(&ap, p, a);
++    d = SohVrDot(&ab, &ab);
++    if (d < 1e-9f) {
++        *out = *a;
++        return;
++    }
++    t = SohVrDot(&ap, &ab) / d;
++    if (t < 0.0f) {
++        t = 0.0f;
++    } else if (t > 1.0f) {
++        t = 1.0f;
++    }
++    out->x = a->x + (ab.x * t);
++    out->y = a->y + (ab.y * t);
++    out->z = a->z + (ab.z * t);
++}
++
++/* TRUE segment-to-triangle distance squared, sampled along the segment, plus
++ * the signed distance of the blade's FRONT-MOST endpoint. Donor :480-497 --
++ * and its comment is the reason this is not a centroid test: with centroids,
++ * a big wall triangle the blade is resting ON loses to a small irrelevant one
++ * and the harvested set churns every tick. */
++static f32 SohVrSegTriDist2(Vec3f* base, Vec3f* tip, Vec3f* p0, Vec3f* p1, Vec3f* p2, Vec3f* nrm, f32* outFront) {
++    f32 best = 1e30f;
++    f32 d0;
++    f32 d1;
++    Vec3f rel;
++    s32 i;
++
++    SohVrSub(&rel, base, p0);
++    d0 = SohVrDot(&rel, nrm);
++    SohVrSub(&rel, tip, p0);
++    d1 = SohVrDot(&rel, nrm);
++    *outFront = (d0 > d1) ? d0 : d1;
++
++    for (i = 0; i <= 4; i++) {
++        f32 t = (f32)i * 0.25f;
++        Vec3f p;
++        Vec3f q;
++        Vec3f d;
++        Vec3f qa;
++        Vec3f qb;
++        Vec3f qc;
++        f32 m;
++        f32 sd;
++
++        p.x = base->x + ((tip->x - base->x) * t);
++        p.y = base->y + ((tip->y - base->y) * t);
++        p.z = base->z + ((tip->z - base->z) * t);
++        SohVrSub(&rel, &p, p0);
++        sd = SohVrDot(&rel, nrm);
++        q.x = p.x - (nrm->x * sd);
++        q.y = p.y - (nrm->y * sd);
++        q.z = p.z - (nrm->z * sd);
++        /* Cheap and sufficient: distance to the nearest of the three edges and
++         * to the in-plane projection. The solver does the exact work; this is
++         * only a RANKING. */
++        SohVrClosestOnSeg(&qa, &q, p0, p1);
++        SohVrClosestOnSeg(&qb, &q, p1, p2);
++        SohVrClosestOnSeg(&qc, &q, p2, p0);
++        SohVrSub(&d, &p, &qa);
++        m = SohVrDot(&d, &d);
++        SohVrSub(&d, &p, &qb);
++        if (SohVrDot(&d, &d) < m) {
++            m = SohVrDot(&d, &d);
++        }
++        SohVrSub(&d, &p, &qc);
++        if (SohVrDot(&d, &d) < m) {
++            m = SohVrDot(&d, &d);
++        }
++        if ((sd * sd) < m) {
++            m = sd * sd;
++        }
++        if (m < best) {
++            best = m;
++        }
++    }
++    return best;
++}
++
++static s32 SohVrSwordHand(void) {
++    return (gSohVRLeftHanded != 0) ? 0 : 1;
++}
++
++s32 SohVrBlade_Active(PlayState* play, Player* this) {
++    s32 hand;
++
++    if ((play == NULL) || (this == NULL)) {
++        return 0;
++    }
++    if ((gSohVRMode == 0) || (gSohVRFpActive == 0) || (gSohVRMotionHands == 0)) {
++        return 0;
++    }
++    if (gSohVRBladeDamage == 0) {
++        return 0; /* the user chose R4's authored attack */
++    }
++    if (this->actor.category != ACTORCAT_PLAYER) {
++        return 0;
++    }
++    hand = SohVrSwordHand();
++    if (gSohVRHandValid[hand] == 0) {
++        return 0; /* no pair, or tracking lost: 0042's fallback owns the frame */
++    }
++    return 1;
++}
++
++/* Read the blade line the shell published for THIS frame's pair. Returns 0 if
++ * there is nothing coherent to read, which is the same test the hand pin uses
++ * and for the same reason. */
++static s32 SohVrBlade_Line(Vec3f* base, Vec3f* tip, Vec3f* prevBase, Vec3f* prevTip) {
++    s32 slot = gSohVRPairSlot;
++    s32 hand = SohVrSwordHand();
++    const volatile f32* v;
++
++    if ((slot < 0) || (slot > 1)) {
++        slot = 0;
++    }
++    if (gSohVRBladeValid[hand] == 0) {
++        return 0;
++    }
++    v = gSohVRBladeLine[slot][hand];
++    base->x = v[0];
++    base->y = v[1];
++    base->z = v[2];
++    tip->x = v[3];
++    tip->y = v[4];
++    tip->z = v[5];
++    prevBase->x = v[6];
++    prevBase->y = v[7];
++    prevBase->z = v[8];
++    prevTip->x = v[9];
++    prevTip->y = v[10];
++    prevTip->z = v[11];
++    return 1;
++}
++
++static void SohVrBlade_EnsureQuads(PlayState* play, Player* this) {
++    s32 i;
++
++    if (sSohVrQuadsPlay == play) {
++        return;
++    }
++    for (i = 0; i < SOH_VR_MAX_QUADS; i++) {
++        Collider_InitQuad(play, &sSohVrQuads[i]);
++        Collider_SetQuad(play, &sSohVrQuads[i], &this->actor, &sSohVrQuadInit);
++    }
++    sSohVrQuadsPlay = play;
++    sSohVrQuadsUsed = 0;
++    sSohVrStrikeCount = 0;
++}
++
++/* Donor RegisterQuad, VrSwing.cpp:987-1003. Vanilla vertex order
++ * (func_80090480): newBase, newTip, prevBase, prevTip. The zero-motion skip is
++ * vanilla's exact-equality test with slop -- a frame where the blade did not
++ * move registers nothing rather than a degenerate quad. */
++static void SohVrBlade_RegisterQuad(PlayState* play, u32 dmgFlags, Vec3f* newBase, Vec3f* newTip, Vec3f* prevBase,
++                                    Vec3f* prevTip) {
++    ColliderQuad* quad;
++    Vec3f d;
++    f32 motion;
++
++    if (sSohVrQuadsUsed >= SOH_VR_MAX_QUADS) {
++        return;
++    }
++    SohVrSub(&d, newTip, prevTip);
++    motion = SohVrLen(&d);
++    SohVrSub(&d, newBase, prevBase);
++    motion += SohVrLen(&d);
++    if (motion < 0.1f) {
++        return;
++    }
++    quad = &sSohVrQuads[sSohVrQuadsUsed++];
++    quad->info.toucher.dmgFlags = dmgFlags;
++    quad->info.toucherFlags = TOUCH_ON | TOUCH_NEAREST;
++    Collider_SetQuadVertices(quad, newBase, newTip, prevBase, prevTip);
++    CollisionCheck_SetAT(play, &play->colChkCtx, &quad->base);
++    gSohVRBladeQuads = gSohVRBladeQuads + 1;
++}
++
++static u32 SohVrBlade_DmgFlags(Player* this) {
++    s32 held = Player_GetMeleeWeaponHeld(this);
++    s32 row = Player_HoldsBrokenKnife(this) ? 1 : (held - 1);
++    /* rev4 (VR R8 part B): the chop takes the JUMP-SLASH column, which IS the
++     * tier this table has. Column 1 is vanilla's jump-slash damage flag -- the
++     * one an overhead attack from a Z-target hop earns in the original game --
++     * so the Z-target chop asks for it explicitly rather than inventing a new
++     * strength the enemy damage tables have never heard of. */
++    s32 col = ((gSohVRSwingJump[SohVrSwordHand()] != 0) || (gSohVRChopTicks > 0)) ? 1 : 0;
++
++    if ((row < 0) || (row > 2)) {
++        row = 1;
++    }
++    return sSohVrDmgFlags[row][col];
++}
++
++/* --------------------------------------------------------------------------
++ * HARVEST. Called at draw with the blade line, publishes the polys the solver
++ * will run against for the next several headset frames.
++ * ------------------------------------------------------------------------ */
++static void SohVrBlade_Harvest(PlayState* play, Vec3f* base, Vec3f* tip) {
++    CollisionHeader* hdr;
++    f32 rank[SOH_VR_MAX_LEVEL_TRIS];
++    CollisionPoly* pick[SOH_VR_MAX_LEVEL_TRIS];
++    s32 count = 0;
++    s32 n = 0; /* R6: prims published so far -- static polys, then dyna, then bodies */
++    s32 pi;
++    s32 i;
++    s32 k;
++    f32 minX;
++    f32 maxX;
++    f32 minY;
++    f32 maxY;
++    f32 minZ;
++    f32 maxZ;
++    const f32 kMargin = 20.0f;
++    const f32 kBackMargin = 4.0f;
++
++    gSohVRMeshCount = 0;
++    gSohVRBladeTris = 0;
++    gSohVRBladeDyna = 0;
++    gSohVRBladeBodies = 0;
++    if (play == NULL) {
++        return;
++    }
++    hdr = play->colCtx.colHeader;
++    if ((hdr == NULL) || (hdr->polyList == NULL) || (hdr->vtxList == NULL)) {
++        return;
++    }
++    if (sSohVrStickyPlay != play) {
++        sSohVrStickyPlay = play;
++        sSohVrStickyCount = 0;
++    }
++
++    minX = ((base->x < tip->x) ? base->x : tip->x) - kMargin;
++    maxX = ((base->x > tip->x) ? base->x : tip->x) + kMargin;
++    minY = ((base->y < tip->y) ? base->y : tip->y) - kMargin;
++    maxY = ((base->y > tip->y) ? base->y : tip->y) + kMargin;
++    minZ = ((base->z < tip->z) ? base->z : tip->z) - kMargin;
++    maxZ = ((base->z > tip->z) ? base->z : tip->z) + kMargin;
++
++    for (pi = 0; pi < hdr->numPolygons; pi++) {
++        CollisionPoly* poly = &hdr->polyList[pi];
++        Vec3s* va = &hdr->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIA)];
++        Vec3s* vb = &hdr->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIB)];
++        Vec3s* vc = &hdr->vtxList[poly->vIC];
++        Vec3f p0;
++        Vec3f p1;
++        Vec3f p2;
++        Vec3f nrm;
++        f32 d2;
++        f32 front;
++        f32 r;
++        s32 worst;
++
++        /* Integer AABB reject first: it is one compare per axis against the raw
++         * s16 verts and it throws away the whole scene but a handful of polys
++         * before any float touches them. */
++        if (((f32)((va->x < vb->x) ? ((va->x < vc->x) ? va->x : vc->x) : ((vb->x < vc->x) ? vb->x : vc->x)) > maxX) ||
++            ((f32)((va->x > vb->x) ? ((va->x > vc->x) ? va->x : vc->x) : ((vb->x > vc->x) ? vb->x : vc->x)) < minX)) {
++            continue;
++        }
++        if (((f32)((va->y < vb->y) ? ((va->y < vc->y) ? va->y : vc->y) : ((vb->y < vc->y) ? vb->y : vc->y)) > maxY) ||
++            ((f32)((va->y > vb->y) ? ((va->y > vc->y) ? va->y : vc->y) : ((vb->y > vc->y) ? vb->y : vc->y)) < minY)) {
++            continue;
++        }
++        if (((f32)((va->z < vb->z) ? ((va->z < vc->z) ? va->z : vc->z) : ((vb->z < vc->z) ? vb->z : vc->z)) > maxZ) ||
++            ((f32)((va->z > vb->z) ? ((va->z > vc->z) ? va->z : vc->z) : ((vb->z > vc->z) ? vb->z : vc->z)) < minZ)) {
++            continue;
++        }
++
++        p0.x = (f32)va->x;
++        p0.y = (f32)va->y;
++        p0.z = (f32)va->z;
++        p1.x = (f32)vb->x;
++        p1.y = (f32)vb->y;
++        p1.z = (f32)vb->z;
++        p2.x = (f32)vc->x;
++        p2.y = (f32)vc->y;
++        p2.z = (f32)vc->z;
++        nrm.x = COLPOLY_GET_NORMAL(poly->normal.x);
++        nrm.y = COLPOLY_GET_NORMAL(poly->normal.y);
++        nrm.z = COLPOLY_GET_NORMAL(poly->normal.z);
++
++        d2 = SohVrSegTriDist2(base, tip, &p0, &p1, &p2, &nrm, &front);
++        /* Shallow back-face reject (donor kBackMargin 4.0): a face the blade
++         * is deeply BEHIND belongs to another volume -- the outside of this
++         * wall, the ceiling of the room below -- and pushing off it drives the
++         * blade the wrong way. */
++        if (front < -kBackMargin) {
++            continue;
++        }
++
++        r = d2;
++        for (k = 0; k < sSohVrStickyCount; k++) {
++            if (sSohVrSticky[k] == poly) {
++                r *= 0.5f;
++                break;
++            }
++        }
++        if (count < SOH_VR_MAX_LEVEL_TRIS) {
++            rank[count] = r;
++            pick[count] = poly;
++            count++;
++            continue;
++        }
++        worst = 0;
++        for (k = 1; k < count; k++) {
++            if (rank[k] > rank[worst]) {
++                worst = k;
++            }
++        }
++        if (r < rank[worst]) {
++            rank[worst] = r;
++            pick[worst] = poly;
++        }
++    }
++
++    for (i = 0; i < count; i++) {
++        CollisionPoly* poly = pick[i];
++        Vec3s* va = &hdr->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIA)];
++        Vec3s* vb = &hdr->vtxList[COLPOLY_VTX_INDEX(poly->flags_vIB)];
++        Vec3s* vc = &hdr->vtxList[poly->vIC];
++
++        gSohVRMeshTri[i][0] = (f32)va->x;
++        gSohVRMeshTri[i][1] = (f32)va->y;
++        gSohVRMeshTri[i][2] = (f32)va->z;
++        gSohVRMeshTri[i][3] = (f32)vb->x;
++        gSohVRMeshTri[i][4] = (f32)vb->y;
++        gSohVRMeshTri[i][5] = (f32)vb->z;
++        gSohVRMeshTri[i][6] = (f32)vc->x;
++        gSohVRMeshTri[i][7] = (f32)vc->y;
++        gSohVRMeshTri[i][8] = (f32)vc->z;
++        /* R6: the surface's OWN sfx material rides in the low bits, exactly as
++         * the donor does it (VrSwing.cpp:652). That is what lets a contact
++         * make the right noise -- wood, soft earth or hard stone -- instead of
++         * one generic clank. */
++        gSohVRMeshId[i] = (1 << 12) | ((s32)func_80041F10(&play->colCtx, poly, BGCHECK_SCENE) & 0xFFF);
++        gSohVRMeshShape[i] = SOH_VR_SHAPE_TRI;
++        gSohVRMeshRadius[i] = 0.0f;
++        sSohVrSticky[i] = poly;
++    }
++    sSohVrStickyCount = count;
++    n = count;
++
++    /* ----------------------------------------------------------------------
++     * R6, DYNAPOLY. Moving platforms, doors, drawbridges and pushed blocks are
++     * NOT in colHeader->polyList -- they live in the dyna actor list, which has
++     * no cheap "all polys near here" query. The donor's answer (VrSwing.cpp:
++     * 664-725) is five line tests: three along the blade in a ~26 degree fan,
++     * and two straight down from the tip and the middle so a platform UNDER the
++     * blade is found as well. Whatever they hit is turned into a triangle like
++     * any other. Deduped against each other and against the static set by poly
++     * pointer, because a probe that hits static geometry has found something we
++     * already have.
++     * -------------------------------------------------------------------- */
++    {
++        Vec3f bladeVec;
++        Vec3f mid;
++        Vec3f probeFrom[5];
++        Vec3f probeTo[5];
++        CollisionPoly* seen[5];
++        s32 seenCount = 0;
++        s32 pr;
++
++        SohVrSub(&bladeVec, tip, base);
++        mid.x = base->x + (bladeVec.x * 0.5f);
++        mid.y = base->y + (bladeVec.y * 0.5f);
++        mid.z = base->z + (bladeVec.z * 0.5f);
++
++        for (pr = 0; pr < 3; pr++) {
++            f32 ang = (pr == 0) ? 0.0f : ((pr == 1) ? SOH_VR_DYNA_FAN : -SOH_VR_DYNA_FAN);
++            f32 cs = cosf(ang);
++            f32 sn = sinf(ang);
++            /* Rotate about Y, the donor's rotY: x' = x*cos + z*sin,
++             * z' = -x*sin + z*cos. */
++            f32 rx = (bladeVec.x * cs) + (bladeVec.z * sn);
++            f32 rz = (-bladeVec.x * sn) + (bladeVec.z * cs);
++
++            probeFrom[pr] = *base;
++            probeTo[pr].x = base->x + (rx * 1.35f);
++            probeTo[pr].y = base->y + (bladeVec.y * 1.35f);
++            probeTo[pr].z = base->z + (rz * 1.35f);
++        }
++        probeFrom[3] = *tip;
++        probeFrom[3].y += 12.0f;
++        probeTo[3] = *tip;
++        probeTo[3].y -= 70.0f;
++        probeFrom[4] = mid;
++        probeFrom[4].y += 12.0f;
++        probeTo[4] = mid;
++        probeTo[4].y -= 70.0f;
++
++        for (pr = 0; (pr < 5) && (n < SOH_VR_MAX_PRIMS); pr++) {
++            Vec3f hitPos;
++            CollisionPoly* hp = NULL;
++            s32 bgId = 0;
++            Vec3f verts[3];
++            s32 dup = 0;
++            s32 k2;
++
++            if (!BgCheck_EntityLineTest1(&play->colCtx, &probeFrom[pr], &probeTo[pr], &hitPos, &hp, true, true,
++                                         false, true, &bgId) ||
++                (hp == NULL)) {
++                continue;
++            }
++            for (k2 = 0; k2 < seenCount; k2++) {
++                if (seen[k2] == hp) {
++                    dup = 1;
++                }
++            }
++            for (k2 = 0; (k2 < count) && !dup; k2++) {
++                if (pick[k2] == hp) {
++                    dup = 1;
++                }
++            }
++            if (dup) {
++                continue;
++            }
++            seen[seenCount++] = hp;
++
++            CollisionPoly_GetVerticesByBgId(hp, bgId, &play->colCtx, verts);
++            gSohVRMeshTri[n][0] = verts[0].x;
++            gSohVRMeshTri[n][1] = verts[0].y;
++            gSohVRMeshTri[n][2] = verts[0].z;
++            gSohVRMeshTri[n][3] = verts[1].x;
++            gSohVRMeshTri[n][4] = verts[1].y;
++            gSohVRMeshTri[n][5] = verts[1].z;
++            gSohVRMeshTri[n][6] = verts[2].x;
++            gSohVRMeshTri[n][7] = verts[2].y;
++            gSohVRMeshTri[n][8] = verts[2].z;
++            gSohVRMeshId[n] = (1 << 12) | ((s32)func_80041F10(&play->colCtx, hp, bgId) & 0xFFF);
++            gSohVRMeshShape[n] = SOH_VR_SHAPE_TRI;
++            gSohVRMeshRadius[n] = 0.0f;
++            n++;
++            gSohVRBladeDyna = gSohVRBladeDyna + 1;
++        }
++    }
++
++    /* ----------------------------------------------------------------------
++     * R6, BODIES. This tick's AC registrations, which are populated by draw
++     * time because enemies update before they draw. The donor pushes bone
++     * capsules fitted to a recorded skeleton and falls back to the AC collider
++     * for anything with no recorded skeleton (VrSwing.cpp:803-851); we have no
++     * puppet at all, so the fallback IS our path -- `solidPrim` is
++     * unconditionally true. Cylinder -> capsule, JntSph element -> sphere.
++     *
++     * DAMAGE IS UNAFFECTED by any of this (the donor says so at :499-507): the
++     * swept and strike quads hit the real AT/AC colliders exactly as before.
++     * What these prims buy is that the blade STOPS on a body instead of passing
++     * through it, which is the whole complaint.
++     * -------------------------------------------------------------------- */
++    {
++        CollisionCheckContext* colChk = &play->colChkCtx;
++        Player* pl = GET_PLAYER(play);
++        s32 ci;
++
++        for (ci = 0; (ci < colChk->colACCount) && (n < SOH_VR_MAX_PRIMS); ci++) {
++            Collider* col = colChk->colAC[ci];
++            s32 hard;
++            s32 body;
++            s32 primId;
++
++            if ((col == NULL) || (col->actor == NULL) || (col->actor == &pl->actor)) {
++                continue;
++            }
++            hard = (col->acFlags & AC_HARD) != 0;
++            body = (col->actor->category == ACTORCAT_ENEMY) || (col->actor->category == ACTORCAT_BOSS) ||
++                   (col->actor->category == ACTORCAT_NPC);
++            if (!hard && !body) {
++                continue;
++            }
++            if (Math_Vec3f_DistXYZ(&col->actor->world.pos, &pl->actor.world.pos) > SOH_VR_ACTOR_RANGE) {
++                continue;
++            }
++            /* Donor PrimId(kind, detail): HARD carries the collider's own
++             * material type, FLESH carries none. The shell already routes the
++             * kind through to the material SFX. */
++            primId = hard ? ((2 << 12) | (s32)col->colType) : (3 << 12);
++
++            if (col->shape == COLSHAPE_CYLINDER) {
++                ColliderCylinder* cyl = (ColliderCylinder*)col;
++                f32 bx;
++                f32 by;
++                f32 bz;
++
++                if (cyl->dim.radius <= 0) {
++                    continue;
++                }
++                bx = (f32)cyl->dim.pos.x;
++                by = (f32)(cyl->dim.pos.y + cyl->dim.yShift);
++                bz = (f32)cyl->dim.pos.z;
++                gSohVRMeshTri[n][0] = bx;
++                gSohVRMeshTri[n][1] = by;
++                gSohVRMeshTri[n][2] = bz;
++                gSohVRMeshTri[n][3] = bx;
++                gSohVRMeshTri[n][4] = by + (f32)cyl->dim.height;
++                gSohVRMeshTri[n][5] = bz;
++                gSohVRMeshTri[n][6] = 0.0f;
++                gSohVRMeshTri[n][7] = 0.0f;
++                gSohVRMeshTri[n][8] = 0.0f;
++                gSohVRMeshId[n] = primId;
++                gSohVRMeshShape[n] = SOH_VR_SHAPE_CAPSULE;
++                gSohVRMeshRadius[n] = (f32)cyl->dim.radius;
++                n++;
++                gSohVRBladeBodies = gSohVRBladeBodies + 1;
++            } else if (col->shape == COLSHAPE_JNTSPH) {
++                ColliderJntSph* js = (ColliderJntSph*)col;
++                s32 e;
++
++                for (e = 0; (e < js->count) && (n < SOH_VR_MAX_PRIMS); e++) {
++                    ColliderJntSphElement* el = &js->elements[e];
++
++                    if (el->dim.worldSphere.radius <= 0) {
++                        continue;
++                    }
++                    gSohVRMeshTri[n][0] = (f32)el->dim.worldSphere.center.x;
++                    gSohVRMeshTri[n][1] = (f32)el->dim.worldSphere.center.y;
++                    gSohVRMeshTri[n][2] = (f32)el->dim.worldSphere.center.z;
++                    gSohVRMeshTri[n][3] = 0.0f;
++                    gSohVRMeshTri[n][4] = 0.0f;
++                    gSohVRMeshTri[n][5] = 0.0f;
++                    gSohVRMeshTri[n][6] = 0.0f;
++                    gSohVRMeshTri[n][7] = 0.0f;
++                    gSohVRMeshTri[n][8] = 0.0f;
++                    gSohVRMeshId[n] = primId;
++                    gSohVRMeshShape[n] = SOH_VR_SHAPE_SPHERE;
++                    gSohVRMeshRadius[n] = (f32)el->dim.worldSphere.radius;
++                    n++;
++                    gSohVRBladeBodies = gSohVRBladeBodies + 1;
++                }
++            }
++        }
++    }
++
++    /* Count LAST, then the seq: a reader that catches a torn buffer catches it
++     * as a smaller count, never as a triangle from two different frames. */
++    gSohVRMeshCount = n;
++    gSohVRMeshSeq = gSohVRMeshSeq + 1u;
++    gSohVRBladeTris = n;
++}
++
++/* --------------------------------------------------------------------------
++ * UPDATE. Runs at the top of the player's update: read last tick's AT results,
++ * then drain the shell's contact ring into pending strikes.
++ * ------------------------------------------------------------------------ */
++void SohVrBlade_Update(PlayState* play, Player* this) {
++    s32 i;
++    s32 hit = 0;
++    unsigned int seq;
++
++    if (!SohVrBlade_Active(play, this)) {
++        sSohVrQuadsUsed = 0;
++        sSohVrStrikeCount = 0;
++        sSohVrContactSeen = gSohVRContactSeq;
++        /* And STOP PUBLISHING. The shell reads gSohVRMeshCount every compositor
++         * frame; leaving the last harvest standing would have the solver
++         * colliding with geometry from another scene, or from before the user
++         * turned the blade off. The suite caught this as "the harvest kept
++         * publishing after bladedamage 0". */
++        gSohVRMeshCount = 0;
++        gSohVRBladeTris = 0;
++        gSohVRBladeDyna = 0;
++        gSohVRBladeBodies = 0;
++        return;
++    }
++    SohVrBlade_EnsureQuads(play, this);
++
++    for (i = 0; i < sSohVrQuadsUsed; i++) {
++        if (sSohVrQuads[i].base.atFlags & AT_HIT) {
++            hit = 1;
++        }
++        Collider_ResetQuadAT(play, &sSohVrQuads[i].base);
++    }
++    sSohVrQuadsUsed = 0;
++    if (hit) {
++        gSohVRBladeHits = gSohVRBladeHits + 1;
++        /* ONE STRIKE PER SWING: the shell drops the tier HOT -> ARMED on this
++         * edge (donor VrSwing.cpp:1522-1530). */
++        gSohVRBladeHitSeq[SohVrSwordHand()] = gSohVRBladeHitSeq[SohVrSwordHand()] + 1u;
++    }
++
++    /* Drain the contact ring. Entries older than the ring depth are lost, and
++     * that is correct: a contact from eight events ago is not damage anyone is
++     * waiting for. */
++    seq = gSohVRContactSeq;
++    if ((seq - sSohVrContactSeen) > 8u) {
++        sSohVrContactSeen = seq - 8u;
++    }
++    while (sSohVrContactSeen != seq) {
++        s32 slot;
++
++        sSohVrContactSeen++;
++        slot = (s32)((sSohVrContactSeen - 1u) & 7u);
++        if (gSohVRContactHand[slot] != SohVrSwordHand()) {
++            continue;
++        }
++        /* R6: the noise the contact makes is independent of whether it also
++         * does damage -- run it before the HOT gate below drops the rest. */
++        SohVrBlade_ContactSfx(play, this, slot);
++        if (!SohVrBlade_Damaging()) {
++            continue; /* not a damaging swing: the blade merely touched */
++        }
++        if (sSohVrStrikeCount >= SOH_VR_MAX_STRIKES) {
++            continue;
++        }
++        sSohVrStrikes[sSohVrStrikeCount].pos.x = gSohVRContactPos[slot][0];
++        sSohVrStrikes[sSohVrStrikeCount].pos.y = gSohVRContactPos[slot][1];
++        sSohVrStrikes[sSohVrStrikeCount].pos.z = gSohVRContactPos[slot][2];
++        sSohVrStrikes[sSohVrStrikeCount].normal.x = gSohVRContactNrm[slot][0];
++        sSohVrStrikes[sSohVrStrikeCount].normal.y = gSohVRContactNrm[slot][1];
++        sSohVrStrikes[sSohVrStrikeCount].normal.z = gSohVRContactNrm[slot][2];
++        sSohVrStrikes[sSohVrStrikeCount].dmgFlags = SohVrBlade_DmgFlags(this);
++        sSohVrStrikeCount++;
++        gSohVRBladeStrikes = gSohVRBladeStrikes + 1;
++    }
++}
++
++/* --------------------------------------------------------------------------
++ * R6: MATERIAL FEEDBACK. Donor VrSwing.cpp:1420-1446, and it is the vanilla
++ * sword-recoil branch (z_player.c func_80842DF4) reached from a different
++ * direction: a WALL sounds like its own surface material, a HARD collider
++ * sounds like its colType, and FLESH is deliberately SILENT here because the
++ * strike pipeline already produces the vanilla hit sound and effects -- doubling
++ * them is how a sword hit ends up sounding like a sword hit and a rock at once.
++ *
++ * Split out of the drain loop above because that loop drops everything that is
++ * not a HOT swing on the sword hand, and a brush against a wall should still be
++ * audible. The impact gate is the donor's own 0.4 m/s: below it the blade is
++ * being LAID against a surface, not struck on one.
++ * ------------------------------------------------------------------------ */
++static void SohVrBlade_ContactSfx(PlayState* play, Player* this, s32 slot) {
++    Vec3f pos;
++    s32 id;
++    s32 kind;
++    s32 detail;
++
++    if (gSohVRContactImpact[slot] <= 0.4f) {
++        return;
++    }
++    pos.x = gSohVRContactPos[slot][0];
++    pos.y = gSohVRContactPos[slot][1];
++    pos.z = gSohVRContactPos[slot][2];
++    id = gSohVRContactId[slot];
++    kind = (id >> 12) & 0xF;
++    detail = id & 0xFFF;
++
++    if (kind == 1) { /* WALL: the surface's own material */
++        if (detail == 0xA) {
++            CollisionCheck_SpawnShieldParticlesWood(play, &pos, &this->actor.projectedPos);
++        } else {
++            CollisionCheck_SpawnShieldParticles(play, &pos);
++            Player_PlaySfx(&this->actor, (detail == 0xB) ? NA_SE_IT_WALL_HIT_SOFT : NA_SE_IT_WALL_HIT_HARD);
++        }
++    } else if (kind == 2) { /* HARD: armour, carapace, a metal door */
++        if ((detail == COLTYPE_WOOD) || (detail == COLTYPE_TREE)) {
++            CollisionCheck_SpawnShieldParticlesWood(play, &pos, &this->actor.projectedPos);
++        } else {
++            CollisionCheck_SpawnShieldParticlesMetalSound(play, &pos, &this->actor.projectedPos);
++        }
++    }
++    /* kind == 3 (FLESH): silent, deliberately. */
++}
++
++/* --------------------------------------------------------------------------
++ * DRAW. Harvest, then register this frame's damage quads.
++ * ------------------------------------------------------------------------ */
++void SohVrBlade_Draw(PlayState* play, Player* this) {
++    Vec3f base;
++    Vec3f tip;
++    Vec3f prevBase;
++    Vec3f prevTip;
++    s32 melee;
++    s32 i;
++
++    if (!SohVrBlade_Active(play, this)) {
++        return;
++    }
++    if (!SohVrBlade_Line(&base, &tip, &prevBase, &prevTip)) {
++        return;
++    }
++    SohVrBlade_EnsureQuads(play, this);
++
++    /* The harvest runs whether or not a weapon is drawn: the solver's job is
++     * to keep the HAND out of walls too, and a bare fist that clips through a
++     * doorframe reads exactly as wrong as a sword that does. */
++    SohVrBlade_Harvest(play, &base, &tip);
++
++    melee = (Player_GetMeleeWeaponHeld(this) != 0);
++    if (!melee) {
++        /* Nothing to cut with. Drop any queued strike rather than letting it
++         * wait for a weapon: a strike is a moment, and firing it whenever the
++         * sword is next drawn would be a phantom hit with no swing behind it. */
++        sSohVrStrikeCount = 0;
++        return;
++    }
++    if (SohVrBlade_Damaging()) {
++        /* THE SWEPT QUAD. Corners are the blade's previous and current base and
++         * tip -- damage where the blade actually went, which is the entire
++         * point of this round. */
++        SohVrBlade_RegisterQuad(play, SohVrBlade_DmgFlags(this), &base, &tip, &prevBase, &prevTip);
++    }
++    /* rev3 (VR R7 verdict 4): THE STAB QUAD.
++     *
++     * the user asked for both halves: an arm swing IS the attack, and the button
++     * still attacks. With the authored state machine retired (overlay 0042
++     * rev5) a B press has to produce a hitbox of its own, and the swept quad
++     * cannot be it -- a straight thrust sweeps almost no area, and a stationary
++     * sword sweeps none at all. That is the donor's own recorded reason for
++     * extruding the blade sideways into a CROSS-SECTION quad
++     * (VrSwing.cpp:1327): "the width cross-section at the current pose, which
++     * is what gives a straight STAB a quad with real area".
++     *
++     * The extrusion axis is any direction perpendicular to the blade. Vanilla
++     * builds it in hand-model space, where the blade is +X and the flat of the
++     * blade is a known axis; we only have the blade LINE in world space here,
++     * so the axis is derived: cross(blade, world up), falling back to
++     * cross(blade, world forward) for a blade held vertically, where the first
++     * cross degenerates. Which perpendicular it is does not matter -- the quad
++     * exists to give the thrust area, and a sword has area in every direction
++     * off its axis.
++     *
++     * Registered on EVERY tick of the window, not just the opening one, so a
++     * target that walks into a held thrust is still hit.
++     *
++     * rev4 (VR R8 part B): the CHOP window uses the same quad. An overhead
++     * sweep does move, so its swept quad is real -- but the sweep is driven by
++     * the shell's envelope at compositor rate against a 20 Hz consumer, and the
++     * cross-section is what guarantees area on the ticks where the two happen
++     * to sample the same pose. */
++    if ((gSohVRStabTicks > 0) || (gSohVRChopTicks > 0)) {
++        Vec3f sohStabDir;
++        Vec3f sohStabSide;
++        Vec3f sohStabA;
++        Vec3f sohStabB;
++        Vec3f sohStabC;
++        Vec3f sohStabD;
++        f32 sohStabLen;
++
++        sohStabDir.x = tip.x - base.x;
++        sohStabDir.y = tip.y - base.y;
++        sohStabDir.z = tip.z - base.z;
++        /* side = blade x up */
++        sohStabSide.x = sohStabDir.z;
++        sohStabSide.y = 0.0f;
++        sohStabSide.z = -sohStabDir.x;
++        sohStabLen = sqrtf((sohStabSide.x * sohStabSide.x) + (sohStabSide.z * sohStabSide.z));
++        if (sohStabLen < 1.0f) {
++            /* Blade held vertically: that cross degenerates. Use blade x fwd. */
++            sohStabSide.x = 0.0f;
++            sohStabSide.y = -sohStabDir.z;
++            sohStabSide.z = sohStabDir.y;
++            sohStabLen =
++                sqrtf((sohStabSide.y * sohStabSide.y) + (sohStabSide.z * sohStabSide.z));
++        }
++        if (sohStabLen > 1.0f) {
++            f32 sohStabK = SOH_VR_STAB_HALF_WIDTH / sohStabLen;
++
++            sohStabSide.x *= sohStabK;
++            sohStabSide.y *= sohStabK;
++            sohStabSide.z *= sohStabK;
++            sohStabA.x = base.x - sohStabSide.x;
++            sohStabA.y = base.y - sohStabSide.y;
++            sohStabA.z = base.z - sohStabSide.z;
++            sohStabB.x = tip.x - sohStabSide.x;
++            sohStabB.y = tip.y - sohStabSide.y;
++            sohStabB.z = tip.z - sohStabSide.z;
++            sohStabC.x = base.x + sohStabSide.x;
++            sohStabC.y = base.y + sohStabSide.y;
++            sohStabC.z = base.z + sohStabSide.z;
++            sohStabD.x = tip.x + sohStabSide.x;
++            sohStabD.y = tip.y + sohStabSide.y;
++            sohStabD.z = tip.z + sohStabSide.z;
++            SohVrBlade_RegisterQuad(play, SohVrBlade_DmgFlags(this), &sohStabA, &sohStabB, &sohStabC, &sohStabD);
++            gSohVRStabQuads = gSohVRStabQuads + 1;
++        }
++    }
++
++    /* THE STRIKE QUADS. Donor :1283-1297: because the blade physically HALTS at
++     * the surface, the swept quad only grazes what it stopped on, so each
++     * damaging contact becomes an 18x18 square poked 6 units INSIDE the
++     * surface. TOUCH_NEAREST makes it hit exactly the thing that was struck. */
++    for (i = 0; i < sSohVrStrikeCount; i++) {
++        Vec3f n = sSohVrStrikes[i].normal;
++        Vec3f up;
++        Vec3f t1;
++        Vec3f t2;
++        Vec3f c;
++        Vec3f e1;
++        Vec3f e2;
++        Vec3f v0;
++        Vec3f v1;
++        Vec3f v2;
++        Vec3f v3;
++        f32 m;
++
++        up.x = 0.0f;
++        up.y = 1.0f;
++        up.z = 0.0f;
++        if ((n.y > 0.9f) || (n.y < -0.9f)) {
++            up.x = 1.0f;
++            up.y = 0.0f;
++        }
++        t1.x = (n.y * up.z) - (n.z * up.y);
++        t1.y = (n.z * up.x) - (n.x * up.z);
++        t1.z = (n.x * up.y) - (n.y * up.x);
++        m = SohVrLen(&t1);
++        if (m < 1e-4f) {
++            continue;
++        }
++        t1.x /= m;
++        t1.y /= m;
++        t1.z /= m;
++        t2.x = (n.y * t1.z) - (n.z * t1.y);
++        t2.y = (n.z * t1.x) - (n.x * t1.z);
++        t2.z = (n.x * t1.y) - (n.y * t1.x);
++
++        c.x = sSohVrStrikes[i].pos.x - (n.x * 6.0f);
++        c.y = sSohVrStrikes[i].pos.y - (n.y * 6.0f);
++        c.z = sSohVrStrikes[i].pos.z - (n.z * 6.0f);
++        e1.x = t1.x * 9.0f;
++        e1.y = t1.y * 9.0f;
++        e1.z = t1.z * 9.0f;
++        e2.x = t2.x * 9.0f;
++        e2.y = t2.y * 9.0f;
++        e2.z = t2.z * 9.0f;
++
++        v0.x = c.x - e1.x - e2.x;
++        v0.y = c.y - e1.y - e2.y;
++        v0.z = c.z - e1.z - e2.z;
++        v1.x = c.x + e1.x - e2.x;
++        v1.y = c.y + e1.y - e2.y;
++        v1.z = c.z + e1.z - e2.z;
++        v2.x = c.x - e1.x + e2.x;
++        v2.y = c.y - e1.y + e2.y;
++        v2.z = c.z - e1.z + e2.z;
++        v3.x = c.x + e1.x + e2.x;
++        v3.y = c.y + e1.y + e2.y;
++        v3.z = c.z + e1.z + e2.z;
++        SohVrBlade_RegisterQuad(play, sSohVrStrikes[i].dmgFlags, &v0, &v1, &v2, &v3);
++    }
++    sSohVrStrikeCount = 0;
++}
++
++#endif /* __IOS__ */
+--- a/soh/src/overlays/actors/ovl_player_actor/z_player.c
++++ b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+@@ -168,6 +168,13 @@
+ void Player_StartMode_WarpSong(PlayState* play, Player* this);
+ void Player_StartMode_FaroresWind(PlayState* play, Player* this);
+ void Player_UpdateCommon(Player* this, PlayState* play, Input* input);
++#ifdef __IOS__
++/* SOH_IOS (overlay 0048, VR R5): the physical blade. Defined in
++ * soh/src/code/z_soh_vr_blade.c, which is empty outside __IOS__. */
++void SohVrBlade_Update(PlayState* play, Player* this);
++void SohVrBlade_Draw(PlayState* play, Player* this);
++extern volatile int gSohVRBladeDamage;
++#endif
+ void func_8084FF7C(Player* this);
+ void Player_UpdateBunnyEars(Player* this);
+ void func_80851008(PlayState* play, Player* this, void* anim);
+@@ -12506,6 +12513,16 @@
+ 
+     sControlInput = input;
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0048, VR R5): read last tick's AT results for the
++     * blade's damage quads and drain the solver's contact ring into this
++     * tick's pending strikes. Deliberately the FIRST thing the player's
++     * update does -- the donor's recorded ordering trap (VrSwing.cpp
++     * :263-268) is that the tick's damage pass wipes state written at draw,
++     * and the player updates before every enemy. */
++    SohVrBlade_Update(play, this);
++#endif
++
+     if (this->unk_A86 < 0) {
+         this->unk_A86++;
+         if (this->unk_A86 == 0) {
+@@ -13663,6 +13680,14 @@
+     Vec3f pos;
+     Vec3s rot;
+     f32 scale;
++
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0048, VR R5): harvest the collision mesh around the
++     * blade for the shell's contact solver, and register this frame's
++     * damage quads. Once per frame, at the draw entry, so the AT pass at
++     * the top of the NEXT tick sees them. */
++    SohVrBlade_Draw(play, this);
++#endif
+ 
+     if (LINK_AGE_IN_YEARS == YEARS_CHILD) {
+         pos.x = 2.0f;

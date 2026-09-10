@@ -1,0 +1,1205 @@
+Overlay patch 0051: THE ALYX ITEM COMPASS (VR R6, Q-VR12).
+
+Donor: ShipWright-VR `soh/soh/Enhancements/vr-combat/VrItemSelect.cpp`
+(branch MotionControls-2), 573 lines; VR-DONOR-MAP section 8. R5's mining
+sharpened the estimate that made this affordable: the compass draws through the
+GAME's own display lists -- `gItemIcons`, `Matrix_Translate`, a POLY_XLU branch
+at play-draw-end -- with no PCVR dependency anywhere in the drawing path. What
+it needs from the platform is a hand pose and a button, and we have both.
+
+HOW IT WORKS. Hold the selector input on one controller; a compass of the
+currently equipped items appears anchored where your hand was. FLICK the hand
+toward one of them; RELEASE to take it. Up is the sword, left/down/right are the
+three C items, no movement at all is empty hands. That is Valve's Half-Life:
+Alyx weapon menu almost verbatim, and the donor's header records why Valve chose
+it over holsters: it never misses and it never drops anything.
+
+WHAT WE PORT, AND WHAT WE DELIBERATELY DO NOT.
+
+Ported, from the donor almost line for line:
+  * the availability predicate (VR first person, not flat, save loaded, not in a
+    blocking cutscene, no transition running);
+  * the anchor that RIDES LINK'S BODY -- captured as an offset from the body at
+    hold-start and re-derived from the body every tick, so walking (with the
+    stick or physically) carries the compass along instead of leaving it behind,
+    and locomotion can never read as a flick;
+  * head-relative sectors: the camera's RIGHT is captured once at open and
+    flattened to the horizon, so "left" is left as you see it and stays there
+    even if you turn your head mid-selection;
+  * hysteresis -- come back inside 65 % of the threshold before it reads as "no
+    pick", and a 15 % lead is required to leave the current sector, so the
+    boundary between two adjacent directions cannot flicker;
+  * the confirmation haptic on every highlight change;
+  * execution through the REAL input path (an emulated C press, and vanilla's
+    own put-away for the centre), so items behave exactly as if their button had
+    been pressed and nothing about ammo, magic, bottles or aim-and-throw is
+    re-implemented. R21 takes the SWORD sector off the emulated B and onto
+    vanilla's own item change (`heldItemButton = 0; Player_UseItem(buttonItems
+    [0])`, which is Player_ProcessItemButtons's entire response to that press),
+    because the donor's `Player_GetMeleeWeaponHeld == 0` gate reads 4 for a Deku
+    stick and 5 for the Megaton hammer and so pressed NOTHING with either in
+    hand;
+  * the billboarded icon quads, the selected icon's 1.35x scale and full-bright
+    prim colour, the dim placeholder diamond for an empty slot, and the centre
+    ring marker -- all of it, including the donor's exact colours.
+
+NOT ported, and each for a stated reason:
+  * The SELECTOR MODE input rules -- both triggers reserved outright, C presses
+    forbidden from changing the held item, the two-grip quick-swap chord, the
+    padmgr binding profile that pays for those reservations. The brief for this
+    round is explicit that R4's trigger-mirrors-the-item's-button setting STAYS
+    as the fallback, and it does: `gSohVRItemTriggerMask` is untouched. Taking
+    the donor's ownership rules as well would re-bind half the controller in a
+    round where nobody has yet held one of these controllers.
+  * The ocarina stand-down. It exists in the donor to keep the selector's
+    RESERVATIONS from eating a note; we reserve nothing, so there is nothing to
+    stand down. The compass still refuses to open during a cutscene or a
+    transition, which is where it would actually be in the way.
+
+THE DRAW SITE. The donor hooks `OnPlayDrawEnd`. We call the same function from
+the same moment in `z_play.c`'s `Play_Draw`, immediately after the actor draw
+pass and before the overlay is chained -- POLY_XLU is open, the world matrix
+stack is where the donor's is, and (this is the part that matters for VR) it is
+INSIDE the pass overlay 0031 runs per eye, so the compass gets real per-eye
+disparity like everything else in the world rather than landing at identical
+pixels the way the HUD does.
+
+FRAME INTERPOLATION. The anchor rides in a RECORDED matrix, exactly as the donor
+has it, so LUS glides the compass at render rate with the world instead of
+stepping it at the 20 Hz tick. Without the record the compass is the one thing
+on screen that visibly stutters, because it is the one thing anchored to a hand.
+
+DESKTOP AND EVERY NON-VR BUILD. The whole file is `#ifdef __IOS__`, the call
+sites are `#ifdef __IOS__`, and the gate is `gSohVRItemSel && gSohVRMode &&
+gSohVRFpActive && !gSohVRFlatLatch` -- state a flat window, a 3D-panel session
+and every iPhone build never set.
+
+R18 PART C -- THE WHEEL DRAWS 3D MODELS (D-070). the user, on 1.0.1.22: "can our
+weapon wheel be improved? They look like 2D models -- could we use 3D models
+that look better?" It could, and this is that change: each occupied slot is now
+the game's own spinning "get item" model (`GetItem_Draw`), the 2D `gItemIcons`
+quad surviving as the fallback for a slot with no model, for an empty slot, and
+for the whole wheel when `vr set wheel3d 0`. THIS IS AN IMPROVEMENT OVER THE
+DONOR, NOT A PORT OF IT: ShipWright-VR's VrItemSelect.cpp draws the same flat
+32x32 icons we did.
+
+Why it is affordable at all: in SoH a get-item display list is an OTR PATH
+STRING resolved through LUS's hash table at draw time (`gGiBowDL` is
+`static const char[] "__OTR__objects/object_gi_bow/gGiBowDL"`, and the exported
+resource carries CRC64 references, not segmented addresses), so drawing one
+needs NO object load and NO segment 6 -- unlike the N64, where
+`Player_DrawGetItemImpl` has to point segment 6 at `giObjectSegment` first. The
+draw funcs set the segments they do need (8/9 tex scroll) themselves.
+
+What the wheel has to supply, copied from `Actor_Draw` and `func_8002EBCC`,
+because these models are LIT and Z-TESTED where the icon quads were neither:
+scene lights bound at the wheel's anchor (`LightContext_NewLights`,
+`Lights_BindAll`, `Lights_Draw`), and the hilite/lookat pair
+(`func_8002EABC`/`func_8002EB44` with `envCtx.dirLight1`'s direction) that
+En_GirlA and EnItem00's 3D drops set up the same way. Each slot then gets its
+own `FrameInterpolation_RecordOpenChild(sSohSelDl, 1 + i)` so all four spin
+smoothly instead of stepping at 20 Hz.
+
+THE SIZE, MEASURED RATHER THAN GUESSED. There is no per-GID scale table in the
+game, and the shop's `Actor_SetScale(0.25f)` is not transferable: a shop
+pedestal has a room to itself, and our four slots sit on a ring of radius
+`ringR` = 4.5 game units at the shipped 5 cm flick distance. So the vertex data
+decided it. Reading every `objects/object_gi_*` Vtx resource out of the
+extracted O2R, the bounding boxes cluster tightly: max extent 45-80 raw units,
+typical 65 (bow 63, bottle 53, hammer 61, boomerang 60, hookshot 65, ocarina
+56, kokiri sword 56, biggoron's 64). EnItem00's "NewDrops" enhancement confirms
+the same normal from the other side -- its effective scales (actor scale x its
+own `Matrix_Scale`) are 0.21 to 0.42 across a dozen GIDs. So one base scale
+does work, and it is derived from the ring instead of copied from the shop:
+
+    giScale = ringR * 0.0135 * gSohVRWheelScale
+
+which puts a typical 65-unit model at about 0.62 of the 6.4-unit gap between
+adjacent slots -- 0.061 at the shipped ring, a quarter of the shop's 0.25
+because our ring is a quarter of a shop's spacing. `vr set wheelscale`
+(default 1.0, clamped 0.02 .. 4.0) is the dial, because a number derived from
+vertex bounds is still not a number anyone has WORN.
+
+Two models depart from the 65-unit norm enough to need a factor, and both
+factors are ratios of measured extents: the gold skull token (object_gi_sutaru,
+144) and the Zora mask (object_gi_zoramask, 106). The Deku egg (80) gets one
+too. Everything else rides the base.
+
+THE RING AND THE FLICK DISTANCE DO NOT MOVE. The brief for this round suggested
+shrinking them; measurement says otherwise, and the reason is worth recording.
+Pulling the ring in cannot help occlusion -- the anchor's depth in the world is
+unchanged by its radius -- and it would both crowd four models that are far
+bigger than four 3.2-unit quads AND move where the wearer's hand has to flick,
+which is the one thing in this feature that the user's hands have already learned.
+The size problem is solved by the scale term instead.
+
+ITEM_SWORD_MASTER IS THE ONE HOLE, AND SoH ITSELF FILLS IT. The GID enum has no
+master sword: vanilla never hands you one as a get-item. SoH's randomizer wants
+one anyway and draws `object_toki_objects_DL_001BD0` -- the pedestal sword --
+in `Randomizer_DrawMasterSword` (Enhancements/randomizer/draw.cpp). The wheel
+uses that DL through five lines of the same code in C (rather than calling into
+the randomizer's C++ TU with a NULL GetItemEntry), and its extra factor is a
+measurement, not a copy: that DL's vertices span 1670 units, so 65/1670 = 0.039
+puts it on screen at the same size as its neighbours, where the randomizer's own
+0.05 would draw it 28 % large.
+
+THE SELECTED SLOT. `SETUPDL_25` uses the prim colour as the fog term, so the
+donor's full-bright-prim trick cannot brighten a lit model. The selected slot is
+therefore a scale change plus a billboard marker behind it, drawn through the
+existing quad path. The marker is the one quad in this file that IS depth tested
+(`G_RM_ZB_XLU_SURF`) and is pushed back along the camera's forward by the model's
+own half-extent, so the model occludes its middle and what shows is a rim of
+light around it.
+
+R19 PART B -- THE MARKER IS A RING, NOT A SQUARE (D-073). the user, on 1.0.1.23:
+"the highlight is a big yellow square -- not pretty. A subtle border around the
+object, or a subtle highlight of the object itself." Both halves of that are
+taken:
+
+  * THE SQUARE WAS LITERALLY A SQUARE. R18 part C's marker was an UNTEXTURED
+    `G_CC_PRIMITIVE` quad -- so every one of its pixels was prim colour, corners
+    included -- at prim (255, 214, 130, 150) and half-size `half * 1.6`, which at
+    the shipped scale is about 8.6 units across against a 6.4-unit gap between
+    adjacent slots. A softly glowing rim was the intent; a solid yellow tile the
+    size of the slot spacing was the result.
+  * THE RING. `gLensFlareRingTex` (gameplay_keep, i4 64x64) IS an annulus -- read
+    out of the extracted archive, it is a thin bright band at radius ~30 texels
+    with a hollow centre and nothing in the corners -- and vanilla's own lens
+    flare draws it with exactly the combiner this wants (`z_kankyo.c` ~1565:
+    colour = PRIMITIVE, alpha = TEXEL0 * PRIMITIVE). It is an OTR path string,
+    so it is drawable anywhere without an object load, the same property the
+    get-item models rely on. `SohVrSel_PushQuad` therefore takes a texcoord
+    extent (31 for the 32x32 icons and the centre marker, 63 for the ring), the
+    marker shrinks to `half * 1.25`, and the prim becomes a dimmer, warmer
+    (255, 236, 186, 105).
+  * THE BREATH. The flat 1.35x jump is replaced by `1.12 + 0.05 * sin(frames *
+    0.35)` -- a gentle 1.07 .. 1.17 pulse at about 0.7 Hz on the tick clock -- so
+    the selected slot reads as alive rather than merely bigger, and it no longer
+    crowds its neighbours. The 2D icon fallback takes the same 1.12 without the
+    pulse.
+  * THE DIAL. `vr set wheelhalo`: 0 none (the breath alone), 1 ring (default),
+    2 a soft round glow (`gUnknownCircle6Tex`, i8 32x32, the same combiner).
+    Reported by `vr item`.
+
+R20 -- NO MARKER AT ALL, AND A BIGGER MODEL (D-075). the user, on 1.0.1.24: "in
+the right grip item wheel, let's remove the orange circle that surrounds your
+selection. Let's just make the size or zoom of the object you're selecting a
+little bigger. That's enough UI feedback for the user along with the haptics
+that are already there." Both halves are taken literally and nothing else moves:
+
+  * `gSohVRWheelHalo` SHIPS 0. The ring, the glow, the texcoord extent and every
+    line of the marker path survive untouched behind the dial, so `vr set
+    wheelhalo 1` is still a one-command A/B back to R19's ring. The default is
+    the only thing that changed, and it changed in the one place the shell
+    defines it (SohIosShell.m).
+  * THE BREATH GROWS TO 1.35 +/- 0.05, bounds 1.30 .. 1.40, and the 2D icon
+    fallback takes the 1.35 midpoint. That is R18's original jump restored as
+    the CENTRE of the pulse rather than as a step: the reason R19 shrank it to
+    1.12 was that the ring was sized off it and a ring at 1.35 crowded the
+    neighbouring slots -- with no ring there is nothing to crowd. The clearance
+    arithmetic is beside SohVrSel_SelScale: 1.7 units of gap at 1.35, 1.6 at the
+    top of the breath.
+
+WHAT WAS RULED OUT, AND IT IS NOT SPECULATION. The prettiest option would be a
+SECOND pass of the model itself -- an outline hull, or the same model drawn
+brighter. It is infeasible here for the reason recorded above and re-checked this
+round: `GetItem_Draw` runs `Gfx_SetupDL_25*`, whose prim colour IS the fog term,
+so a second pass cannot be tinted through prim without fogging the model, and
+the get-item display lists set their own combiners internally. That is why the
+marker is a separate textured quad and not a treatment of the model.
+
+--- /dev/null
++++ b/soh/src/code/z_soh_vr_itemsel.c
+@@ -0,0 +1,937 @@
++/*
++ * z_soh_vr_itemsel.c -- SOH_IOS overlay 0051 (VR R6): the Alyx item compass.
++ *
++ * Adapted from ShipWright-VR's `VrItemSelect.cpp` (MotionControls-2),
++ * VR-DONOR-MAP section 8. The whole file is __IOS__-only and every entry point
++ * is a no-op outside VR first person, so the oracle, the flat window, the 3D
++ * panel and every iPhone build compile it to nothing that ever runs.
++ *
++ * See the patch header for what is ported and what is deliberately left out.
++ */
++#ifdef __IOS__
++
++#include "global.h"
++#include "z64.h"
++/* The compass's anchor rides a RECORDED matrix so LUS glides it at render rate
++ * with the rest of the world -- see SohVrItemSel_Draw. */
++#include "soh/frame_interpolation.h"
++/* R18 part C: ITEM_SWORD_MASTER has no GID. The pedestal sword's own display
++ * list fills the hole, exactly as SoH's randomizer does it. */
++#include "objects/object_toki_objects/object_toki_objects.h"
++/* R19 part B: gLensFlareRingTex and gUnknownCircle6Tex -- both OTR path
++ * strings, so the selected slot's marker needs no object load either. */
++#include "objects/gameplay_keep/gameplay_keep.h"
++
++/* Published by the shell (app/ios/SohIosShell.m), weak-zero on desktop. */
++extern volatile int gSohVRMode;
++extern volatile int gSohVRFpActive;
++extern volatile int gSohVRFlatLatch;
++extern volatile int gSohVRLeftHanded;
++extern volatile int gSohVRPairSlot;
++extern volatile int gSohVRHandValid[2];
++extern volatile float gSohVRHandMat[2][2][16];
++extern volatile unsigned int gSohVRSenseBtn[2];
++extern volatile float gSoh3DCamFwd[3];
++
++extern volatile int gSohVRItemSel;
++extern volatile int gSohVRItemSelHandCfg;
++extern volatile unsigned int gSohVRItemSelBtn;
++extern volatile float gSohVRItemSelDistCm;
++extern volatile float gSohVRWorldScale;
++
++extern volatile int gSohVRItemSelOpen;
++extern volatile int gSohVRItemSelHand;
++extern volatile int gSohVRItemSelSector;
++extern volatile unsigned int gSohVRItemSelTickSeq;
++extern volatile int gSohVRItemSelOpens;
++extern volatile int gSohVRItemSelPicks;
++extern volatile int gSohVRItemSelDraws;
++extern volatile int gSohVRItemSelCalls;
++extern volatile int gSohVRItemSelAvail;
++extern volatile unsigned int gSohVRItemSelBtnSeen;
++
++/* R18 part C: the 3D get-item models and their size dial. */
++extern volatile int gSohVRWheel3D;
++extern volatile float gSohVRWheelScale;
++extern volatile int gSohVRItemSelModels;
++/* R19 part B (D-073): the selected slot's marker -- 0 none, 1 ring, 2 glow.
++ * R20 (D-075): the DEFAULT IS 0. The code path is kept for A/B from a headset
++ * (`vr set wheelhalo`); nothing draws it unless somebody asks. */
++extern volatile int gSohVRWheelHalo;
++
++/* Vanilla, declared in z_player.c with no header of its own. */
++void Player_UseItem(PlayState* play, Player* player, s32 item);
++/* R21: same -- z_player.c defines it and no header carries it. (Its siblings
++ * Player_ActionToMeleeWeapon and Player_GetMeleeWeaponHeld ARE in
++ * functions.h.) */
++s8 Player_ItemToItemAction(s32 item);
++
++#define SOH_SEL_CENTER 0
++#define SOH_SEL_UP 1
++#define SOH_SEL_DOWN 2
++#define SOH_SEL_LEFT 3
++#define SOH_SEL_RIGHT 4
++
++#define SOH_SEL_MAX_GFX 256
++#define SOH_SEL_MAX_VTX 64
++
++static s32 sSohSelOpen = 0;
++static s32 sSohSelHand = 1;
++static s32 sSohSelSector = SOH_SEL_CENTER;
++static Vec3f sSohSelAnchor;    /* game units: the compass position THIS tick */
++static Vec3f sSohSelAnchorOff; /* hand-at-open, relative to Link's BODY */
++static Vec3f sSohSelHeadRight; /* camera right captured at open, horizon-flat */
++static PlayState* sSohSelPlay = NULL;
++
++static Gfx sSohSelDl[SOH_SEL_MAX_GFX];
++static Vtx sSohSelVtx[SOH_SEL_MAX_VTX];
++static s32 sSohSelVtxUsed = 0;
++
++static s32 SohVrSel_SwordHand(void) {
++    return gSohVRLeftHanded ? 0 : 1;
++}
++
++static s32 SohVrSel_Hand(void) {
++    s32 sword = SohVrSel_SwordHand();
++    return (gSohVRItemSelHandCfg == 0) ? sword : (1 - sword);
++}
++
++/* The hand's translation, in GAME units, out of the matrix the shell publishes
++ * per eye pair. Row 3 of a row-major game-space transform is the translation,
++ * which is the same row overlay 0042 pins the limb on -- one publication, one
++ * meaning, no second path to keep in sync. */
++static s32 SohVrSel_HandPos(s32 hand, Vec3f* out) {
++    s32 slot = gSohVRPairSlot & 1;
++
++    if ((hand < 0) || (hand > 1) || (gSohVRHandValid[hand] == 0)) {
++        return 0;
++    }
++    out->x = gSohVRHandMat[slot][hand][12];
++    out->y = gSohVRHandMat[slot][hand][13];
++    out->z = gSohVRHandMat[slot][hand][14];
++    return 1;
++}
++
++/* Donor PickThresholdUnits: the flick distance is specified in CENTIMETRES OF
++ * REAL HAND TRAVEL, because it is a gesture. Game units are what the anchor is
++ * in, so the world scale converts. */
++static f32 SohVrSel_ThresholdUnits(void) {
++    f32 ws = gSohVRWorldScale;
++
++    if (ws < 1.0f) {
++        ws = 35.0f;
++    }
++    return gSohVRItemSelDistCm * 0.01f * ws;
++}
++
++static s32 SohVrSel_Available(PlayState* play) {
++    Player* player;
++
++    if ((gSohVRItemSel == 0) || (gSohVRMode == 0) || (gSohVRFpActive == 0) || (gSohVRFlatLatch != 0)) {
++        return 0;
++    }
++    if (play == NULL) {
++        return 0;
++    }
++    player = GET_PLAYER(play);
++    if (player == NULL) {
++        return 0;
++    }
++    if (Player_InBlockingCsMode(play, player)) {
++        return 0;
++    }
++    if ((play->transitionTrigger != TRANS_TRIGGER_OFF) || (play->csCtx.state != CS_STATE_IDLE)) {
++        return 0;
++    }
++    return 1;
++}
++
++static void SohVrSel_Close(void) {
++    sSohSelOpen = 0;
++    sSohSelSector = SOH_SEL_CENTER;
++    gSohVRItemSelOpen = 0;
++    gSohVRItemSelSector = SOH_SEL_CENTER;
++}
++
++/* Donor ExecuteSector. Everything goes through the real input path; the one
++ * special case is the donor's own, and it is the same one overlay 0042 already
++ * relies on: never emulate B with a melee weapon already out, because with the
++ * physical blade on that is a swing. */
++static void SohVrSel_Execute(PlayState* play, Player* player, Input* input, s32 sector) {
++    u16 mask = 0;
++
++    gSohVRItemSelPicks = gSohVRItemSelPicks + 1;
++    switch (sector) {
++        case SOH_SEL_LEFT:
++            mask = BTN_CLEFT;
++            break;
++        case SOH_SEL_RIGHT:
++            mask = BTN_CRIGHT;
++            break;
++        case SOH_SEL_DOWN:
++            mask = BTN_CDOWN;
++            break;
++        case SOH_SEL_UP: {
++            /* R21: THE SWORD SECTOR CHANGES THE ITEM; IT DOES NOT PRESS B.
++             *
++             * the user, wearing 1.0.1.25: "when you select the SWORD in your
++             * weapon wheel, it doesn't switch to the sword. i know the sword
++             * isn't a c button, but we should still fix this."
++             *
++             * The donor's rule was `EmulateButtonPress(BTN_B)` only when
++             * `Player_GetMeleeWeaponHeld == 0`, and that returns 1..3 for the
++             * three swords, 4 for a Deku stick and 5 for the Megaton hammer
++             * (z_player_lib.c: Player_ActionToMeleeWeapon). So with the HAMMER
++             * or a STICK in hand the test failed, the mask stayed 0, and the
++             * UP sector pressed nothing at all -- the wheel's one sector that
++             * did literally nothing, which is what the user hit: R20 was a
++             * hammer round, so the hammer was what he was holding.
++             *
++             * The fix goes through vanilla's own item-change path instead of
++             * emulating its button, exactly as the CENTRE sector already does
++             * with Player_UseItem(ITEM_NONE). Player_ProcessItemButtons's
++             * whole response to a B press is `heldItemButton = 0;
++             * Player_UseItem(play, this, buttonItems[0])`, so calling that
++             * pair directly IS the B press's effect with none of its side
++             * effects, and it is reached from every held state: the hammer,
++             * the stick, a C item, and empty hands. Player_UseItem sends a
++             * sword item down the "new held item" arm -- nextModelGroup,
++             * PLAYER_STATE1_START_CHANGING_HELD_ITEM, and
++             * Player_StartChangingHeldItem's unsheathe animation -- because a
++             * melee itemAction is exempt from its shielding test and the
++             * sword's itemAction differs from the hammer's.
++             *
++             * THE GUARD SURVIVES, and it is the reason the emulated press had
++             * to go. Player_UseItem's LAST arm, taken when the item asked for
++             * is already the held one, sets `sUseHeldItem = true` -- a SWING.
++             * So the call is made only when a sword is NOT already out
++             * (1..3), which is the same sentence the donor's rule was trying
++             * to say and overlay 0042 relies on.
++             *
++             * The emulated press is KEPT for exactly one state: a B slot that
++             * does not hold a sword at all (swordless, or a randomizer save
++             * with something else on B) with empty hands. There vanilla's own
++             * button handling knows what to do with whatever is there and we
++             * do not, so the old path still runs.
++             *
++             * Nothing here strips the press: the only `press.button &=
++             * ~(BTN_A | BTN_B | BTN_CUP)` in z_player.c is vanilla's textbox
++             * cooldown in Player_Update, which fires only while
++             * textboxBtnCooldownTimer is nonzero. With a C item held the
++             * emulated B DID reach Player_ProcessItemButtons and DID equip the
++             * sword; that case worked, and it now takes the direct path with
++             * the rest for one behaviour instead of two. */
++            s32 sohBItem = gSaveContext.equips.buttonItems[0];
++            s32 sohHeldW = (player != NULL) ? Player_GetMeleeWeaponHeld(player) : 0;
++            s32 sohBMelee = (sohBItem < ITEM_NONE_FE)
++                                ? Player_ActionToMeleeWeapon(Player_ItemToItemAction(sohBItem))
++                                : 0;
++            s32 sohBSword = (sohBMelee >= 1) && (sohBMelee <= 3);
++            s32 sohSwordOut = (sohHeldW >= 1) && (sohHeldW <= 3);
++
++            if ((player != NULL) && (play != NULL) && sohBSword && !sohSwordOut) {
++                player->heldItemButton = 0;
++                Player_UseItem(play, player, sohBItem);
++            } else if ((player != NULL) && !sohBSword && (sohHeldW == 0)) {
++                mask = BTN_B;
++            }
++            break;
++        }
++        default:
++            /* Empty hands: vanilla's own put-away flow. The physical shield
++             * stays on the off hand under overlay 0049's rules. */
++            if ((player != NULL) && (play != NULL)) {
++                Player_UseItem(play, player, ITEM_NONE);
++            }
++            break;
++    }
++    /* THE PRESS IS INJECTED STRAIGHT INTO THIS TICK'S INPUT, not queued.
++     *
++     * The donor emulates the button through GameInteractor and then has to
++     * carry a three-tick grace window (its `sEquipGrace`) because its own press
++     * lands a tick or two later and its selector-mode rules would otherwise
++     * block it. We run at the TOP of Player_UpdateCommon, which is before
++     * Player_UpdateItems reads the button in the very same tick -- so the press
++     * is simply true when the item system looks, and there is no window, no
++     * grace counter, and no ordering to get wrong. Both `press` and `cur` are
++     * set: vanilla's item code tests the rising edge, and the held-item state
++     * machine tests the level. */
++    if ((mask != 0) && (input != NULL)) {
++        input->press.button |= mask;
++        input->cur.button |= mask;
++    }
++}
++
++/* --------------------------------------------------------------------------
++ * TICK. Called from the top of the player's update, beside overlay 0048's.
++ * ------------------------------------------------------------------------ */
++void SohVrItemSel_Update(PlayState* play, Player* this, Input* input) {
++    s32 avail = SohVrSel_Available(play);
++    s32 held;
++    s32 selHand = SohVrSel_Hand();
++    Vec3f pos;
++    f32 dx;
++    f32 dy;
++    f32 dz;
++    f32 lat;
++    f32 vert;
++    f32 r;
++    f32 th;
++    s32 newSector;
++
++    sSohSelPlay = play;
++    gSohVRItemSelCalls = gSohVRItemSelCalls + 1;
++    gSohVRItemSelAvail = avail;
++    gSohVRItemSelBtnSeen = ((selHand >= 0) && (selHand <= 1)) ? gSohVRSenseBtn[selHand] : 0u;
++
++    if (!sSohSelOpen) {
++        s32 hand = selHand;
++
++        if (avail && ((gSohVRSenseBtn[hand] & gSohVRItemSelBtn) != 0) && SohVrSel_HandPos(hand, &pos)) {
++            f32 rl;
++            Vec3f right;
++
++            /* Camera right = fwd x up, flattened to the horizon so left/right
++             * stay level even when looking up or down (donor's comment, and it
++             * is what stops a glance at the ceiling rotating the compass). */
++            right.x = -gSoh3DCamFwd[2];
++            right.y = 0.0f;
++            right.z = gSoh3DCamFwd[0];
++            rl = sqrtf((right.x * right.x) + (right.z * right.z));
++            if (rl > 1e-3f) {
++                right.x /= rl;
++                right.z /= rl;
++            } else {
++                right.x = 1.0f;
++                right.z = 0.0f;
++            }
++
++            sSohSelAnchor = pos;
++            sSohSelAnchorOff.x = pos.x - this->actor.world.pos.x;
++            sSohSelAnchorOff.y = pos.y - this->actor.world.pos.y;
++            sSohSelAnchorOff.z = pos.z - this->actor.world.pos.z;
++            sSohSelHeadRight = right;
++            sSohSelHand = hand;
++            sSohSelSector = SOH_SEL_CENTER;
++            sSohSelOpen = 1;
++            gSohVRItemSelOpen = 1;
++            gSohVRItemSelHand = hand;
++            gSohVRItemSelSector = SOH_SEL_CENTER;
++            gSohVRItemSelOpens = gSohVRItemSelOpens + 1;
++            gSohVRItemSelTickSeq = gSohVRItemSelTickSeq + 1u; /* the open tick */
++        }
++        return;
++    }
++
++    /* Open. Losing availability -- a cutscene starts, the mode goes off, a
++     * transition fires -- CANCELS without executing. */
++    if (!avail) {
++        SohVrSel_Close();
++        return;
++    }
++
++    held = (gSohVRSenseBtn[sSohSelHand] & gSohVRItemSelBtn) != 0;
++
++    /* The compass rides Link's body. */
++    sSohSelAnchor.x = this->actor.world.pos.x + sSohSelAnchorOff.x;
++    sSohSelAnchor.y = this->actor.world.pos.y + sSohSelAnchorOff.y;
++    sSohSelAnchor.z = this->actor.world.pos.z + sSohSelAnchorOff.z;
++
++    if (SohVrSel_HandPos(sSohSelHand, &pos)) {
++        dx = pos.x - sSohSelAnchor.x;
++        dy = pos.y - sSohSelAnchor.y;
++        dz = pos.z - sSohSelAnchor.z;
++        lat = (dx * sSohSelHeadRight.x) + (dz * sSohSelHeadRight.z);
++        vert = dy;
++        r = sqrtf((lat * lat) + (vert * vert));
++        th = SohVrSel_ThresholdUnits();
++        newSector = sSohSelSector;
++
++        if (sSohSelSector == SOH_SEL_CENTER) {
++            if (r >= th) {
++                newSector = (fabsf(lat) >= fabsf(vert)) ? ((lat > 0.0f) ? SOH_SEL_RIGHT : SOH_SEL_LEFT)
++                                                        : ((vert > 0.0f) ? SOH_SEL_UP : SOH_SEL_DOWN);
++            }
++        } else if (r < (th * 0.65f)) {
++            newSector = SOH_SEL_CENTER; /* hysteresis: come well back in */
++        } else {
++            s32 curLateral = (sSohSelSector == SOH_SEL_LEFT) || (sSohSelSector == SOH_SEL_RIGHT);
++            f32 curMag = curLateral ? fabsf(lat) : fabsf(vert);
++            f32 othMag = curLateral ? fabsf(vert) : fabsf(lat);
++
++            /* A 15 % lead is required to leave the current sector, so the
++             * boundary between two adjacent directions cannot flicker. */
++            if (othMag > (curMag * 1.15f)) {
++                newSector = curLateral ? ((vert > 0.0f) ? SOH_SEL_UP : SOH_SEL_DOWN)
++                                       : ((lat > 0.0f) ? SOH_SEL_RIGHT : SOH_SEL_LEFT);
++            } else if (curLateral) {
++                newSector = (lat > 0.0f) ? SOH_SEL_RIGHT : SOH_SEL_LEFT;
++            } else {
++                newSector = (vert > 0.0f) ? SOH_SEL_UP : SOH_SEL_DOWN;
++            }
++        }
++        if (newSector != sSohSelSector) {
++            sSohSelSector = newSector;
++            gSohVRItemSelSector = newSector;
++            gSohVRItemSelTickSeq = gSohVRItemSelTickSeq + 1u; /* the Alyx tick */
++        }
++    }
++
++    if (!held) {
++        s32 pick = sSohSelSector;
++
++        SohVrSel_Close();
++        SohVrSel_Execute(play, this, input, pick);
++    }
++}
++
++
++/* --------------------------------------------------------------------------
++ * R18 part C: ITEM_* -> GID_*, and the 3D draw.
++ *
++ * The mapping is transcribed from the GET_ITEM(...) rows of
++ * VanillaItemTable_Init (soh/soh/OTRGlobals.cpp) and then checked entry by
++ * entry against the GetItemDrawID enum (soh/include/z64item.h) and the
++ * per-entry comments of sDrawItemTable (soh/src/code/z_draw.c). Indexed by
++ * ITEM_*; every reachable B/C item lives at 0x00..0x3D, and the equipment
++ * rows past that are filled in because they are free and they make the table
++ * checkable as a whole.
++ *
++ * Where the vanilla table is coarser than the wheel wants, the wheel is
++ * finer: a bottle's CONTENTS get their own bottled model (GID_FAIRY,
++ * GID_BLUE_FIRE, GID_BUG, GID_POE, GID_BIG_POE, GID_FISH) rather than
++ * GET_ITEM's plain GID_BOTTLE, the three nocked magic-arrow item ids reuse
++ * the arrow models, and half a bottle of milk is milk.
++ * ------------------------------------------------------------------------ */
++#define SOH_SEL_NO_GID 0xFF
++#define SOH_SEL_GID_NONE (-1)
++#define SOH_SEL_GID_MSWORD (-2)
++
++static const u8 sSohSelGid[] = {
++    /* 0x00 ITEM_STICK            */ GID_STICK,
++    /* 0x01 ITEM_NUT              */ GID_NUTS,
++    /* 0x02 ITEM_BOMB             */ GID_BOMB,
++    /* 0x03 ITEM_BOW              */ GID_BOW,
++    /* 0x04 ITEM_ARROW_FIRE       */ GID_ARROW_FIRE,
++    /* 0x05 ITEM_DINS_FIRE        */ GID_DINS_FIRE,
++    /* 0x06 ITEM_SLINGSHOT        */ GID_SLINGSHOT,
++    /* 0x07 ITEM_OCARINA_FAIRY    */ GID_OCARINA_FAIRY,
++    /* 0x08 ITEM_OCARINA_TIME     */ GID_OCARINA_TIME,
++    /* 0x09 ITEM_BOMBCHU          */ GID_BOMBCHU,
++    /* 0x0A ITEM_HOOKSHOT         */ GID_HOOKSHOT,
++    /* 0x0B ITEM_LONGSHOT         */ GID_LONGSHOT,
++    /* 0x0C ITEM_ARROW_ICE        */ GID_ARROW_ICE,
++    /* 0x0D ITEM_FARORES_WIND     */ GID_FARORES_WIND,
++    /* 0x0E ITEM_BOOMERANG        */ GID_BOOMERANG,
++    /* 0x0F ITEM_LENS             */ GID_LENS,
++    /* 0x10 ITEM_BEAN             */ GID_BEAN,
++    /* 0x11 ITEM_HAMMER           */ GID_HAMMER,
++    /* 0x12 ITEM_ARROW_LIGHT      */ GID_ARROW_LIGHT,
++    /* 0x13 ITEM_NAYRUS_LOVE      */ GID_NAYRUS_LOVE,
++    /* 0x14 ITEM_BOTTLE           */ GID_BOTTLE,
++    /* 0x15 ITEM_POTION_RED       */ GID_POTION_RED,
++    /* 0x16 ITEM_POTION_GREEN     */ GID_POTION_GREEN,
++    /* 0x17 ITEM_POTION_BLUE      */ GID_POTION_BLUE,
++    /* 0x18 ITEM_FAIRY            */ GID_FAIRY,
++    /* 0x19 ITEM_FISH             */ GID_FISH,
++    /* 0x1A ITEM_MILK_BOTTLE      */ GID_MILK,
++    /* 0x1B ITEM_LETTER_RUTO      */ GID_LETTER_RUTO,
++    /* 0x1C ITEM_BLUE_FIRE        */ GID_BLUE_FIRE,
++    /* 0x1D ITEM_BUG              */ GID_BUG,
++    /* 0x1E ITEM_BIG_POE          */ GID_BIG_POE,
++    /* 0x1F ITEM_MILK_HALF        */ GID_MILK,
++    /* 0x20 ITEM_POE              */ GID_POE,
++    /* 0x21 ITEM_WEIRD_EGG        */ GID_EGG,
++    /* 0x22 ITEM_CHICKEN          */ GID_CHICKEN,
++    /* 0x23 ITEM_LETTER_ZELDA     */ GID_LETTER_ZELDA,
++    /* 0x24 ITEM_MASK_KEATON      */ GID_MASK_KEATON,
++    /* 0x25 ITEM_MASK_SKULL       */ GID_MASK_SKULL,
++    /* 0x26 ITEM_MASK_SPOOKY      */ GID_MASK_SPOOKY,
++    /* 0x27 ITEM_MASK_BUNNY       */ GID_MASK_BUNNY,
++    /* 0x28 ITEM_MASK_GORON       */ GID_MASK_GORON,
++    /* 0x29 ITEM_MASK_ZORA        */ GID_MASK_ZORA,
++    /* 0x2A ITEM_MASK_GERUDO      */ GID_MASK_GERUDO,
++    /* 0x2B ITEM_MASK_TRUTH       */ GID_MASK_TRUTH,
++    /* 0x2C ITEM_SOLD_OUT         */ GID_SOLDOUT,
++    /* 0x2D ITEM_POCKET_EGG       */ GID_EGG,
++    /* 0x2E ITEM_POCKET_CUCCO     */ GID_CHICKEN,
++    /* 0x2F ITEM_COJIRO           */ GID_COJIRO,
++    /* 0x30 ITEM_ODD_MUSHROOM     */ GID_ODD_MUSHROOM,
++    /* 0x31 ITEM_ODD_POTION       */ GID_ODD_POTION,
++    /* 0x32 ITEM_SAW              */ GID_SAW,
++    /* 0x33 ITEM_SWORD_BROKEN     */ GID_SWORD_BROKEN,
++    /* 0x34 ITEM_PRESCRIPTION     */ GID_PRESCRIPTION,
++    /* 0x35 ITEM_FROG             */ GID_FROG,
++    /* 0x36 ITEM_EYEDROPS         */ GID_EYEDROPS,
++    /* 0x37 ITEM_CLAIM_CHECK      */ GID_CLAIM_CHECK,
++    /* 0x38 ITEM_BOW_ARROW_FIRE   */ GID_ARROW_FIRE,
++    /* 0x39 ITEM_BOW_ARROW_ICE    */ GID_ARROW_ICE,
++    /* 0x3A ITEM_BOW_ARROW_LIGHT  */ GID_ARROW_LIGHT,
++    /* 0x3B ITEM_SWORD_KOKIRI     */ GID_SWORD_KOKIRI,
++    /* 0x3C ITEM_SWORD_MASTER     */ SOH_SEL_NO_GID, /* -> the pedestal DL */
++    /* 0x3D ITEM_SWORD_BGS        */ GID_SWORD_BGS,
++    /* 0x3E ITEM_SHIELD_DEKU      */ GID_SHIELD_DEKU,
++    /* 0x3F ITEM_SHIELD_HYLIAN    */ GID_SHIELD_HYLIAN,
++    /* 0x40 ITEM_SHIELD_MIRROR    */ GID_SHIELD_MIRROR,
++    /* 0x41 ITEM_TUNIC_KOKIRI     */ SOH_SEL_NO_GID,
++    /* 0x42 ITEM_TUNIC_GORON      */ GID_TUNIC_GORON,
++    /* 0x43 ITEM_TUNIC_ZORA       */ GID_TUNIC_ZORA,
++    /* 0x44 ITEM_BOOTS_KOKIRI     */ SOH_SEL_NO_GID,
++    /* 0x45 ITEM_BOOTS_IRON       */ GID_BOOTS_IRON,
++    /* 0x46 ITEM_BOOTS_HOVER      */ GID_BOOTS_HOVER,
++    /* 0x47 ITEM_BULLET_BAG_30    */ GID_BULLET_BAG,
++    /* 0x48 ITEM_BULLET_BAG_40    */ GID_BULLET_BAG,
++    /* 0x49 ITEM_BULLET_BAG_50    */ GID_BULLET_BAG_50,
++    /* 0x4A ITEM_QUIVER_30        */ GID_QUIVER_30,
++    /* 0x4B ITEM_QUIVER_40        */ GID_QUIVER_40,
++    /* 0x4C ITEM_QUIVER_50        */ GID_QUIVER_50,
++    /* 0x4D ITEM_BOMB_BAG_20      */ GID_BOMB_BAG_20,
++    /* 0x4E ITEM_BOMB_BAG_30      */ GID_BOMB_BAG_30,
++    /* 0x4F ITEM_BOMB_BAG_40      */ GID_BOMB_BAG_40,
++    /* 0x50 ITEM_BRACELET         */ GID_BRACELET,
++    /* 0x51 ITEM_GAUNTLETS_SILVER */ GID_GAUNTLETS_SILVER,
++    /* 0x52 ITEM_GAUNTLETS_GOLD   */ GID_GAUNTLETS_GOLD,
++    /* 0x53 ITEM_SCALE_SILVER     */ GID_SCALE_SILVER,
++    /* 0x54 ITEM_SCALE_GOLDEN     */ GID_SCALE_GOLDEN,
++    /* 0x55 ITEM_SWORD_KNIFE      */ GID_SWORD_BGS, /* Giant's Knife shares it */
++};
++
++/* Per-GID size corrections. There is no such table in the game, so these are
++ * ratios of MEASURED bounding boxes out of the extracted archive against the
++ * 65-unit norm the base scale assumes: object_gi_sutaru 144, zoramask 106,
++ * egg 80. The skull-token rows cannot be reached from a B or C button today;
++ * they are kept because they are the two entries with the largest measured
++ * departure and they are what the list exists to hold. */
++typedef struct {
++    /* 0x00 */ u8 gid;
++    /* 0x04 */ f32 mul;
++} SohSelGidScale;
++
++static const SohSelGidScale sSohSelGidScale[] = {
++    { GID_SKULL_TOKEN, 0.45f },   /* object_gi_sutaru, 144 units */
++    { GID_SKULL_TOKEN_2, 0.45f }, /* the same model out of OBJECT_ST */
++    { GID_MASK_ZORA, 0.60f },     /* object_gi_zoramask, 106 units */
++    { GID_EGG, 0.80f },           /* object_gi_egg, 80 units */
++};
++
++/* The typical get-item model's largest bounding-box extent, in raw model
++ * units, measured across every objects/object_gi_* Vtx resource in the O2R
++ * (45..80, clustered on 65). Everything about the wheel's 3D sizing is
++ * expressed against this one number. */
++#define SOH_SEL_GI_UNITS 65.0f
++/* ringR -> base scale: a typical model spans ~0.62 of the gap between two
++ * adjacent slots (ringR * sqrt(2)), i.e. 0.62 * 1.414 / 65. */
++#define SOH_SEL_GI_PER_RING 0.0135f
++/* object_toki_objects_DL_001BD0's vertices span 1670 units: 65/1670. */
++#define SOH_SEL_MSWORD_MUL 0.039f
++
++static s32 SohVrSel_Gid(u8 item) {
++    if (item == ITEM_SWORD_MASTER) {
++        return SOH_SEL_GID_MSWORD;
++    }
++    if (item >= ARRAY_COUNT(sSohSelGid)) {
++        return SOH_SEL_GID_NONE;
++    }
++    if (sSohSelGid[item] == SOH_SEL_NO_GID) {
++        return SOH_SEL_GID_NONE;
++    }
++    return sSohSelGid[item];
++}
++
++static f32 SohVrSel_GidScale(u8 gid) {
++    s32 i;
++
++    for (i = 0; i < ARRAY_COUNT(sSohSelGidScale); i++) {
++        if (sSohSelGidScale[i].gid == gid) {
++            return sSohSelGidScale[i].mul;
++        }
++    }
++    return 1.0f;
++}
++
++/* R19 part B (D-073), resized in R20 (D-075): the selected slot BREATHES, and
++ * as of R20 the breath is the ONLY feedback -- the user, on 1.0.1.24: "remove the
++ * orange circle that surrounds your selection; just make the size or zoom of
++ * the object you're selecting a little bigger. That's enough UI feedback along
++ * with the haptics." So 1.35 +/- 0.05 at about 0.7 Hz on the 20 Hz tick clock
++ * (0.35 rad per tick); the bounds are 1.30 .. 1.40 by construction, whatever
++ * the frame counter does.
++ *
++ * 1.35 CLEARS ITS NEIGHBOURS, and the arithmetic is the same one that convicted
++ * R18's marker. A typical 65-unit model at the shipped ring draws 3.95 units
++ * across (65 * ringR * 0.0135 at ringR 4.5) against a 6.36-unit gap between
++ * adjacent slots; at 1.35 it draws 5.33, and the clearance to an unselected
++ * neighbour is 6.36 - 5.33/2 - 3.95/2 = 1.7 units. Even the 1.40 top of the
++ * breath leaves 1.6. Nothing collides. */
++static f32 SohVrSel_SelScale(PlayState* play) {
++    return 1.35f + (0.05f * sinf((f32)play->gameplayFrames * 0.35f));
++}
++
++static f32 SohVrSel_GiScale(f32 ringR) {
++    f32 dial = gSohVRWheelScale;
++
++    if (!(dial > 0.02f)) { /* also catches a NaN that reached the dial */
++        dial = 0.02f;
++    } else if (dial > 4.0f) {
++        dial = 4.0f;
++    }
++    return ringR * SOH_SEL_GI_PER_RING * dial;
++}
++
++/* ITEM_SWORD_MASTER's model, which is SoH's own answer to the same gap:
++ * Randomizer_DrawMasterSword (soh/soh/Enhancements/randomizer/draw.cpp) draws
++ * the Temple of Time pedestal sword. These are that function's lines, in C, so
++ * the wheel neither links the randomizer's C++ TU nor hands it a NULL
++ * GetItemEntry. The scale factor is applied by the caller. */
++static void SohVrSel_DrawMasterSword(PlayState* play) {
++    OPEN_DISPS(play->state.gfxCtx);
++
++    Gfx_SetupDL_25Opa(play->state.gfxCtx);
++    gSPSegment(POLY_OPA_DISP++, 0x08,
++               Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, 1 * (play->state.frames * 1), 0, 32, 32, 1, 0, 0, 32, 32, 1,
++                                  0, 0, 0));
++    Matrix_RotateZ(2.1f, MTXMODE_APPLY);
++    gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_MODELVIEW | G_MTX_LOAD);
++    gSPDisplayList(POLY_OPA_DISP++, object_toki_objects_DL_001BD0);
++
++    CLOSE_DISPS(play->state.gfxCtx);
++}
++
++/* Lights and the hilite/lookat pair, bound ONCE at the wheel's anchor before
++ * any model is drawn. Copied from Actor_Draw (z_actor.c) and func_8002EBCC /
++ * func_8002ED80 with flag 0 -- which is the flag En_GirlA's hiliteFunc and
++ * EnItem00's 3D drops pass, so no get-item display list depends on segment 7
++ * being written here either. Without this the models draw unlit and black:
++ * Gfx_SetupDL_25Opa turns G_LIGHTING ON, and the icon quads never needed it. */
++static void SohVrSel_BindLights(PlayState* play) {
++    Lights* lights;
++    Vec3f lightDir;
++
++    lights = LightContext_NewLights(&play->lightCtx, play->state.gfxCtx);
++    Lights_BindAll(lights, play->lightCtx.listHead, &sSohSelAnchor);
++    Lights_Draw(lights, play->state.gfxCtx);
++
++    lightDir.x = play->envCtx.dirLight1.params.dir.x;
++    lightDir.y = play->envCtx.dirLight1.params.dir.y;
++    lightDir.z = play->envCtx.dirLight1.params.dir.z;
++    func_8002EABC(&sSohSelAnchor, &play->view.eye, &lightDir, play->state.gfxCtx);
++    func_8002EB44(&sSohSelAnchor, &play->view.eye, &lightDir, play->state.gfxCtx);
++}
++
++/* --------------------------------------------------------------------------
++ * DRAW. Called at the end of Play_Draw's actor pass, where POLY_XLU is open.
++ * ------------------------------------------------------------------------ */
++/* R19 part B: `tmax` is the texture's last texel index -- 31 for the 32x32 item
++ * icons and the untextured quads (whose texcoords nothing reads), 63 for the
++ * 64x64 ring. Before this it was hardcoded 31, which would have sampled a
++ * quarter of the ring. */
++static s32 SohVrSel_PushQuad(Vec3f at, Vec3f camRight, Vec3f camUp, f32 hs, s32 tmax) {
++    s32 base;
++    f32 rx;
++    f32 ry;
++    f32 rz;
++    f32 ux;
++    f32 uy;
++    f32 uz;
++
++    if ((sSohSelVtxUsed + 4) > SOH_SEL_MAX_VTX) {
++        return -1;
++    }
++    base = sSohSelVtxUsed;
++    rx = camRight.x * hs;
++    ry = camRight.y * hs;
++    rz = camRight.z * hs;
++    ux = camUp.x * hs;
++    uy = camUp.y * hs;
++    uz = camUp.z * hs;
++
++#define SOH_SEL_V(i, X, Y, Z, S, T)                            \
++    sSohSelVtx[base + (i)].v.ob[0] = (s16)(X);                 \
++    sSohSelVtx[base + (i)].v.ob[1] = (s16)(Y);                 \
++    sSohSelVtx[base + (i)].v.ob[2] = (s16)(Z);                 \
++    sSohSelVtx[base + (i)].v.flag = 0;                         \
++    sSohSelVtx[base + (i)].v.tc[0] = (s16)(S);                 \
++    sSohSelVtx[base + (i)].v.tc[1] = (s16)(T);                 \
++    sSohSelVtx[base + (i)].v.cn[0] = 255;                      \
++    sSohSelVtx[base + (i)].v.cn[1] = 255;                      \
++    sSohSelVtx[base + (i)].v.cn[2] = 255;                      \
++    sSohSelVtx[base + (i)].v.cn[3] = 255
++
++    /* Top-left, top-right, bottom-left, bottom-right; t grows downward. */
++    SOH_SEL_V(0, at.x - rx + ux, at.y - ry + uy, at.z - rz + uz, 0, 0);
++    SOH_SEL_V(1, at.x + rx + ux, at.y + ry + uy, at.z + rz + uz, tmax << 5, 0);
++    SOH_SEL_V(2, at.x - rx - ux, at.y - ry - uy, at.z - rz - uz, 0, tmax << 5);
++    SOH_SEL_V(3, at.x + rx - ux, at.y + ry - uy, at.z + rz - uz, tmax << 5, tmax << 5);
++#undef SOH_SEL_V
++
++    sSohSelVtxUsed += 4;
++    return base;
++}
++
++void SohVrItemSel_Draw(PlayState* play) {
++    Gfx* p;
++    Vec3f camUp;
++    Vec3f camRight;
++    Vec3f camFwd;
++    f32 crl;
++    f32 th;
++    f32 ringR;
++    f32 iconHs;
++    f32 giScale;
++    s32 use3d;
++    s32 i;
++    s32 base;
++    s32 sectors[4];
++    Vec3f at[4];
++    u8 items[4];
++    s32 gid[4];
++
++    if (!sSohSelOpen || (play == NULL) || (gSohVRItemSel == 0)) {
++        return;
++    }
++
++    p = sSohSelDl;
++    sSohSelVtxUsed = 0;
++
++    /* Billboard axes. Up is the world's, not the camera's: the compass is read
++     * standing up, and a head roll that tilts four icons is nausea, not
++     * polish. The donor uses the camera's up because a PCVR headset's roll is
++     * usually zero; ours is not guaranteed to be. */
++    camUp.x = 0.0f;
++    camUp.y = 1.0f;
++    camUp.z = 0.0f;
++    camRight.x = -gSoh3DCamFwd[2];
++    camRight.y = 0.0f;
++    camRight.z = gSoh3DCamFwd[0];
++    crl = sqrtf((camRight.x * camRight.x) + (camRight.z * camRight.z));
++    if (crl > 1e-3f) {
++        camRight.x /= crl;
++        camRight.z /= crl;
++    } else {
++        camRight.x = 1.0f;
++        camRight.z = 0.0f;
++    }
++    /* R18 part C: the halo is pushed AWAY from the eye along this. */
++    camFwd.x = gSoh3DCamFwd[0];
++    camFwd.y = gSoh3DCamFwd[1];
++    camFwd.z = gSoh3DCamFwd[2];
++
++    th = SohVrSel_ThresholdUnits();
++    /* Icons sit just past the pick threshold -- you flick INTO them -- with
++     * size floors so a short flick distance cannot shrink the compass into
++     * unreadability (donor's numbers). Unchanged by R18 part C on purpose:
++     * this radius is where the wearer's hand has learned to flick, and a
++     * smaller ring cannot help a depth-tested model anyway (see the patch
++     * header). The 3D size rides the scale term instead. */
++    ringR = (th * 1.5f > 4.5f) ? (th * 1.5f) : 4.5f;
++    iconHs = (th * 0.55f > 1.6f) ? (th * 0.55f) : 1.6f;
++    giScale = SohVrSel_GiScale(ringR);
++    use3d = (gSohVRWheel3D != 0);
++
++    /* equips.buttonItems: 0 = B (sword), 1/2/3 = C-left / C-down / C-right. */
++    sectors[0] = SOH_SEL_UP;
++    at[0].x = 0.0f;
++    at[0].y = ringR;
++    at[0].z = 0.0f;
++    items[0] = gSaveContext.equips.buttonItems[0];
++    sectors[1] = SOH_SEL_DOWN;
++    at[1].x = 0.0f;
++    at[1].y = -ringR;
++    at[1].z = 0.0f;
++    items[1] = gSaveContext.equips.buttonItems[2];
++    sectors[2] = SOH_SEL_LEFT;
++    at[2].x = -sSohSelHeadRight.x * ringR;
++    at[2].y = 0.0f;
++    at[2].z = -sSohSelHeadRight.z * ringR;
++    items[2] = gSaveContext.equips.buttonItems[1];
++    sectors[3] = SOH_SEL_RIGHT;
++    at[3].x = sSohSelHeadRight.x * ringR;
++    at[3].y = 0.0f;
++    at[3].z = sSohSelHeadRight.z * ringR;
++    items[3] = gSaveContext.equips.buttonItems[3];
++
++    /* Which slots the 3D arm will take. A slot the table has no model for --
++     * and every slot at all with `vr set wheel3d 0` -- keeps the icon quad. */
++    for (i = 0; i < 4; i++) {
++        gid[i] = use3d ? SohVrSel_Gid(items[i]) : SOH_SEL_GID_NONE;
++    }
++
++    /* Textured XLU billboards with no Z compare or write: the compass is UI and
++     * is never occluded by the world it floats in. The anchor rides a RECORDED
++     * matrix so frame interpolation glides it at render rate -- without that it
++     * is the one thing on screen visibly stepping at 20 Hz, because it is the
++     * one thing anchored to a hand. */
++    FrameInterpolation_RecordOpenChild((const void*)sSohSelDl, 0);
++    Matrix_Translate(sSohSelAnchor.x, sSohSelAnchor.y, sSohSelAnchor.z, MTXMODE_NEW);
++    gSPMatrix(p++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
++    FrameInterpolation_RecordCloseChild();
++    gDPPipeSync(p++);
++    gDPSetCycleType(p++, G_CYC_1CYCLE);
++    gDPSetRenderMode(p++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
++    gDPSetTextureFilter(p++, G_TF_BILERP);
++    gSPClearGeometryMode(p++, G_CULL_BOTH | G_LIGHTING);
++    gSPTexture(p++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_ON);
++
++    for (i = 0; i < 4; i++) {
++        s32 selected = (sSohSelSector == sectors[i]);
++        /* R20 (D-075): 1.35 again -- see SohVrSel_SelScale, whose midpoint this
++         * is. The icon path takes the midpoint of the breath rather than the
++         * breath itself; a pulsing flat sticker reads as a glitch, a pulsing
++         * model reads as alive. */
++        f32 hs = selected ? (iconHs * 1.35f) : iconHs;
++
++        if (gid[i] != SOH_SEL_GID_NONE) {
++            /* R18 part C: a 3D model owns this slot, drawn after this display
++             * list. The only quad it gets is the selection marker, and only
++             * while it is the pick -- SETUPDL_25 spends the prim colour on the
++             * fog term, so a lit model cannot be brightened the way the donor
++             * brightened an icon. The marker is the one quad here that IS depth
++             * tested, and it is pushed back by the model's own half extent so
++             * the model occludes its middle and a rim of light is what shows.
++             *
++             * R19 part B (D-073): it is a thin gold RING now, not a solid
++             * yellow tile -- the user's "big yellow square". gLensFlareRingTex is
++             * gameplay_keep's own annulus and vanilla's lens flare draws it with
++             * this exact combiner (colour = PRIMITIVE, alpha = TEXEL0 * PRIM);
++             * `vr set wheelhalo 2` swaps it for a soft round glow and 0 removes
++             * it, leaving only the breath. */
++            if (selected && (gSohVRWheelHalo != 0)) {
++                f32 half = SOH_SEL_GI_UNITS * 0.5f * giScale * SohVrSel_SelScale(play);
++                s32 ring = (gSohVRWheelHalo != 2);
++                Vec3f haloAt;
++
++                haloAt.x = at[i].x + (camFwd.x * half);
++                haloAt.y = at[i].y + (camFwd.y * half);
++                haloAt.z = at[i].z + (camFwd.z * half);
++                /* 1.25, not 1.6: the ring has to READ as a border round the
++                 * model, and 1.6 put its band most of the way to the next
++                 * slot. */
++                base = SohVrSel_PushQuad(haloAt, camRight, camUp, half * 1.25f, ring ? 63 : 31);
++                if (base >= 0) {
++                    gDPPipeSync(p++);
++                    gDPSetRenderMode(p++, G_RM_ZB_XLU_SURF, G_RM_ZB_XLU_SURF2);
++                    gDPSetCombineLERP(p++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0, 0,
++                                      PRIMITIVE, 0);
++                    gDPSetPrimColor(p++, 0, 0, 255, 236, 186, 105);
++                    if (ring) {
++                        gDPLoadTextureBlock_4b(p++, gLensFlareRingTex, G_IM_FMT_I, 64, 64, 0,
++                                               G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 6, 6,
++                                               G_TX_NOLOD, G_TX_NOLOD);
++                    } else {
++                        gDPLoadTextureBlock(p++, gUnknownCircle6Tex, G_IM_FMT_I, G_IM_SIZ_8b, 32, 32, 0,
++                                            G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 5, 5, G_TX_NOLOD,
++                                            G_TX_NOLOD);
++                    }
++                    gSPVertex(p++, (uintptr_t)&sSohSelVtx[base], 4, 0);
++                    gSP2Triangles(p++, 0, 1, 2, 0, 2, 1, 3, 0);
++                    gDPPipeSync(p++);
++                    gDPSetRenderMode(p++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
++                }
++            }
++            continue;
++        }
++
++        base = SohVrSel_PushQuad(at[i], camRight, camUp, hs, 31);
++        if (base < 0) {
++            break;
++        }
++        if (items[i] < 158) {
++            gDPSetCombineMode(p++, G_CC_MODULATERGBA_PRIM, G_CC_MODULATERGBA_PRIM);
++            if (selected) {
++                gDPSetPrimColor(p++, 0, 0, 255, 255, 255, 255);
++            } else {
++                gDPSetPrimColor(p++, 0, 0, 165, 165, 165, 185);
++            }
++            gDPLoadTextureBlock(p++, gItemIcons[items[i]], G_IM_FMT_RGBA, G_IM_SIZ_32b, 32, 32, 0,
++                                G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 5, 5, G_TX_NOLOD,
++                                G_TX_NOLOD);
++        } else {
++            /* Empty slot: a dim placeholder diamond, so the compass always has
++             * four directions and the muscle memory never has to check. */
++            gDPSetCombineMode(p++, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
++            gDPSetPrimColor(p++, 0, 0, 120, 120, 120, selected ? 160 : 90);
++        }
++        gSPVertex(p++, (uintptr_t)&sSohSelVtx[base], 4, 0);
++        gSP2Triangles(p++, 0, 1, 2, 0, 2, 1, 3, 0);
++    }
++
++    /* Centre: the "empty hands" marker, brighter while it is the pick. */
++    {
++        Vec3f centre;
++
++        centre.x = 0.0f;
++        centre.y = 0.0f;
++        centre.z = 0.0f;
++        base = SohVrSel_PushQuad(centre, camRight, camUp,
++                                 (sSohSelSector == SOH_SEL_CENTER) ? (iconHs * 0.55f) : (iconHs * 0.35f), 31);
++        if (base >= 0) {
++            gDPSetCombineMode(p++, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
++            if (sSohSelSector == SOH_SEL_CENTER) {
++                gDPSetPrimColor(p++, 0, 0, 255, 250, 210, 235);
++            } else {
++                gDPSetPrimColor(p++, 0, 0, 190, 190, 190, 130);
++            }
++            gSPVertex(p++, (uintptr_t)&sSohSelVtx[base], 4, 0);
++            gSP2Triangles(p++, 0, 1, 2, 0, 2, 1, 3, 0);
++        }
++    }
++
++    gSPEndDisplayList(p++);
++
++    OPEN_DISPS(play->state.gfxCtx);
++    gSPDisplayList(POLY_XLU_DISP++, sSohSelDl);
++    CLOSE_DISPS(play->state.gfxCtx);
++    gSohVRItemSelDraws = gSohVRItemSelDraws + 1;
++
++    /* ----------------------------------------------------------------------
++     * R18 part C: the 3D arm. The get-item draw funcs emit into POLY_OPA /
++     * POLY_XLU themselves and open their own disps, so nothing of ours may be
++     * open here. Lights and the hilite pair go in ONCE, before the loop.
++     * -------------------------------------------------------------------- */
++    if (!use3d) {
++        return;
++    }
++    if ((gid[0] == SOH_SEL_GID_NONE) && (gid[1] == SOH_SEL_GID_NONE) && (gid[2] == SOH_SEL_GID_NONE) &&
++        (gid[3] == SOH_SEL_GID_NONE)) {
++        return;
++    }
++
++    SohVrSel_BindLights(play);
++
++    for (i = 0; i < 4; i++) {
++        f32 s = giScale;
++
++        if (gid[i] == SOH_SEL_GID_NONE) {
++            continue;
++        }
++        if (sSohSelSector == sectors[i]) {
++            /* R19 part B (D-073): the breath, the same one the marker sizes
++             * itself against, so the ring hugs the model at every phase. */
++            s *= SohVrSel_SelScale(play);
++        }
++        if (gid[i] == SOH_SEL_GID_MSWORD) {
++            s *= SOH_SEL_MSWORD_MUL;
++        } else {
++            s *= SohVrSel_GidScale((u8)gid[i]);
++        }
++
++        /* One recorded child per slot, so every model glides at render rate
++         * and spins smoothly instead of stepping four times a second. Slot 0
++         * of this key belongs to the compass's own anchor matrix above. */
++        FrameInterpolation_RecordOpenChild((const void*)sSohSelDl, 1 + i);
++        Matrix_Translate(sSohSelAnchor.x + at[i].x, sSohSelAnchor.y + at[i].y, sSohSelAnchor.z + at[i].z,
++                         MTXMODE_NEW);
++        /* The get-item spin, at Player_DrawGetItemImpl's own rate. */
++        Matrix_RotateZYX(0, play->gameplayFrames * 1000, 0, MTXMODE_APPLY);
++        Matrix_Scale(s, s, s, MTXMODE_APPLY);
++        if (gid[i] == SOH_SEL_GID_MSWORD) {
++            SohVrSel_DrawMasterSword(play);
++        } else {
++            GetItem_Draw(play, (s16)gid[i]);
++        }
++        FrameInterpolation_RecordCloseChild();
++        gSohVRItemSelModels = gSohVRItemSelModels + 1;
++    }
++}
++
++#endif /* __IOS__ */
+--- a/soh/src/overlays/actors/ovl_player_actor/z_player.c
++++ b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+@@ -13253,6 +13253,12 @@
+ static f32 sWaterConveyorSpeeds[] = { 2.0f, 4.0f, 7.0f };
+ static f32 sFloorConveyorSpeeds[] = { 0.5f, 1.0f, 3.0f };
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0051, VR R6): the Alyx item compass. Defined in
++ * soh/src/code/z_soh_vr_itemsel.c, which is empty outside __IOS__. */
++void SohVrItemSel_Update(PlayState* play, Player* this, Input* input);
++#endif
++
+ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
+     s32 pad;
+ 
+@@ -13276,6 +13282,15 @@
+         }
+     }
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0051, VR R6): the item compass ticks near the top of
++     * the player's update -- before Player_UpdateItems reads the button --
++     * so the equip press it raises on release is simply TRUE when the item
++     * system looks, in the same tick. That is what lets us drop the donor's
++     * three-tick grace window entirely. */
++    SohVrItemSel_Update(play, this, input);
++#endif
++
+     Math_Vec3f_Copy(&this->actor.prevPos, &this->actor.home.pos);
+ 
+     if (this->unk_A73 != 0) {
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -1686,7 +1686,21 @@
+ 
+         if ((HREG(80) != 10) || (HREG(93) != 0)) {
+             DebugDisplay_DrawObjects(play);
++        }
++
++#ifdef __IOS__
++        {
++            /* SOH_IOS (overlay 0051, VR R6): the Alyx item compass, drawn at
++             * the donor's own moment (OnPlayDrawEnd, right after the debug
++             * display's colViewer) -- POLY_XLU is open, the world matrix
++             * stack is live, and it is INSIDE the per-eye pass overlay 0031
++             * runs, so the compass gets real disparity instead of landing at
++             * identical pixels the way the HUD does. A no-op unless the
++             * compass is open. */
++            extern void SohVrItemSel_Draw(PlayState * play);
++            SohVrItemSel_Draw(play);
+         }
++#endif
+ 
+         if ((R_PAUSE_MENU_MODE == 1) || (gTrnsnUnkState == 1)) {
+             Gfx* gfxP = OVERLAY_DISP;

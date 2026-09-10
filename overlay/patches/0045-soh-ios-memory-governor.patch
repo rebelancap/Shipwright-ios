@@ -1,0 +1,426 @@
+Overlay patch 0045: THE MEMORY GOVERNOR (VR R8 part C).
+
+WHAT KILLED THE USER'S SESSIONS, and it was never a crash. The 2026-09-05 pull
+from the headset holds no signal record at all -- `Documents/crash.txt` was
+still July's SIGABRT -- and one JetsamEvent: soh at rpages 299184 x 16 KB =
+4.90 GB resident, lifetimeMax 5.05 GB, active and frontmost, system free
+250 MB. That is a SIGKILL from the kernel's memory-pressure killer. No handler
+runs, no backtrace exists, and no amount of better death-reporting would ever
+have produced one.
+
+THE SLOPE, from `vr-mem.log` (579 lines, 5 launches, 3385 s): available memory
+falls 5082 -> 150 MB, and the rate is SCENE-DEPENDENT by more than ten times --
+Hyrule Field (scene 81) burns 400-950 MB/min while Kokiri Forest (85) burns
+16-52, and a 290 s flat-mode segment in the same scene grew by NOTHING. Both
+scenes run at the same frame rate. A per-frame allocation leak cannot do that.
+**The growth tracks new TEXTURE CONTENT, not frames.**
+
+THE CAUSE. `ResourceManager::mResourceCache` is a strong `shared_ptr` map that
+NOTHING ever evicts: `UnloadResource`'s only callers are SoH's alt-asset
+toggles. Every distinct texture Link walks past leaves a permanently resident
+decoded CPU copy for the life of the process -- on top of the GPU copy in
+Fast3D's own cache. With a 4K texture pack installed (the user runs one) that is
+gigabytes, it explains the scene dependence exactly, and it explains the part
+that looked strangest in the log: the baseline RATCHETS while in VR and does
+not come back when VR exits. VR is not the leak. VR is the ~800 MB of eye,
+HUD and compositor surfaces that removes the headroom the flat build had.
+
+THE FIX, in four parts, and the ORDER of the last two is load-bearing.
+
+1. `ResourceManager::SohIosTrimTextureResources` -- evict cached resources of
+   type OTEX only, and only those whose use_count says the cache is the last
+   owner. TEXTURES ARE THE ONLY SAFE CLASS and that is not a guess: both OTR
+   texture opcodes (`G_SETTIMG_OTR_HASH`, `G_SETTIMG_OTR_FILEPATH`) re-resolve
+   their texture through the ResourceManager on EVERY execution of the display
+   list, so an evicted texture is simply reloaded on the next draw. Vertices,
+   skeletons, animations and object segments are handed to the game as RAW
+   POINTERS that outlive the shared_ptr (`ResourceMgr_GetResourceDataByName-
+   HandlingMQ` returns `GetRawPointer()` and drops its reference immediately),
+   so evicting one of those would be a use-after-free. This patch will not
+   touch them.
+   The doomed resources are moved into a local vector, erased under the lock,
+   and destroyed AFTER it is released -- a resource destructor can load other
+   resources, which would deadlock on the mutex we are holding (upstream's own
+   `UnloadResource` comment says so and then never actually does it).
+
+2. `SohIos_TexCacheClearHard` -- Fast3D's texture cache is keyed by the CPU
+   ADDRESS of the texture data. Freeing texture resources therefore makes the
+   allocator free to hand the same address to a DIFFERENT texture, which would
+   alias onto a live cache entry and draw the wrong image. So a resource trim
+   is ALWAYS followed by a full texture-cache clear, and the clear releases the
+   GPU textures for real: upstream's `TextureCacheClear` only parks the ids on
+   a free list and never calls `DeleteTexture`, so it frees no memory at all.
+   This is also why `gfx_texture_cache_clear()` having zero callers was not the
+   whole story -- calling it would have freed nothing.
+
+3. `SohIos_ServiceMemoryTrim(sceneNum)` -- serviced from `RunFrame`, on the
+   GAME thread, at the top of a frame with no display list built and no
+   interpreter frame open. Nothing may free a texture from another thread: the
+   memory-pressure source runs on a dispatch queue and can only ever set a
+   FLAG. The trim fires on request, on a scene change, and on a five-second
+   timer while over `gSohIos.ResCacheBudgetMB` (default 768; 0 disables it
+   outright, which is the A/B control). THE TIMER IS NOT OPTIONAL: Hyrule Field
+   killed the app in 60-170 s WITHOUT leaving the scene, so a scene-change-only
+   governor would have watched the user die. A trim costs a full texture
+   re-upload, so it carries a 15 s cooldown, and a trim that frees less than
+   32 MB backs off to a minute -- a cache that big because it is all in USE
+   cannot be trimmed, and repeating it would buy nothing at real cost.
+
+4. `SohIos_MetalDeviceRegister` / `SohIos_MetalAllocatedBytes` /
+   `SohIos_PendingMipsCount` -- the measurement side. `MTLDevice
+   currentAllocatedSize` splits GPU from CPU in one number, and the pending-mip
+   count is the direct read of the H4 leak that overlay 0019's regeneration in
+   this same round fixes.
+
+WHY THE STATS WALK IS NOT PER FRAME. `SohIos_ResCacheStats` walks the whole
+cache; at 10k entries that is tens of microseconds, fine at the 5 s heartbeat
+and wasteful at 60 Hz. The service function only computes it when the scene
+actually changed or a trim was requested.
+
+--- a/libultraship/include/ship/resource/ResourceManager.h
++++ b/libultraship/include/ship/resource/ResourceManager.h
+@@ -374,7 +374,30 @@
+      */
+     bool GetResourceIsCustom(std::shared_ptr<IResource> resource);
+ 
++    // SOH_IOS (overlay 0045): the memory governor. The resource cache is a
++    // STRONG map that nothing evicts for the life of the process, which with a
++    // 4K texture pack is gigabytes of decoded CPU copies and is what jetsam
++    // killed the user's headset sessions for.
++
+     /**
++     * @brief Total payload bytes of every live cached resource.
++     * @param outCount If non-null, receives the number of live cached resources.
++     * @return Sum of GetPointerSize() over the cache.
++     */
++    size_t SohIosResourceCacheStats(size_t* outCount);
++
++    /**
++     * @brief Evicts cached TEXTURE resources the cache is the last owner of.
++     *        Textures only: both OTR texture opcodes re-resolve through this
++     *        manager on every display-list execution, so an evicted texture is
++     *        reloaded on the next draw. Every other resource class is handed to
++     *        the game as a raw pointer that outlives its shared_ptr.
++     * @param outEvicted If non-null, receives the number of resources evicted.
++     * @return Payload bytes released.
++     */
++    size_t SohIosTrimTextureResources(size_t* outEvicted);
++
++    /**
+      * @brief Returns true if the resource at the given path is an alt-asset override.
+      * @param name Virtual path of the resource.
+      */
+--- a/libultraship/src/ship/resource/ResourceManager.cpp
++++ b/libultraship/src/ship/resource/ResourceManager.cpp
+@@ -520,6 +520,75 @@
+     auto resource = LoadResource(crc);
+ 
+     return GetResourceRawPointer(resource);
++}
++
++// SOH_IOS (overlay 0045): see the patch header. Nothing here runs off the game
++// thread -- a resource destructor can load other resources, and the memory
++// pressure source that asks for a trim only ever sets a flag.
++size_t ResourceManager::SohIosResourceCacheStats(size_t* outCount) {
++    const std::lock_guard<std::mutex> lock(mMutex);
++    size_t bytes = 0;
++    size_t count = 0;
++    for (const auto& entry : mResourceCache) {
++        if (!std::holds_alternative<std::shared_ptr<IResource>>(entry.second)) {
++            continue;
++        }
++        const auto& resource = std::get<std::shared_ptr<IResource>>(entry.second);
++        if (resource == nullptr) {
++            continue;
++        }
++        count++;
++        bytes += resource->GetPointerSize();
++    }
++    if (outCount != nullptr) {
++        *outCount = count;
++    }
++    return bytes;
+ }
+ 
++size_t ResourceManager::SohIosTrimTextureResources(size_t* outEvicted) {
++    // 'OTEX' -- Fast::ResourceType::Texture, spelled as its FourCC so this
++    // translation unit does not have to depend on the Fast layer.
++    static const uint32_t kSohIosTextureType = 0x4F544558;
++    // Destroyed OUTSIDE the lock: a resource destructor can load other
++    // resources, and that would deadlock on the mutex we are holding. Upstream
++    // UnloadResource says exactly this in a comment and then keeps a variant it
++    // never assigns, which is the same bug written down.
++    std::vector<std::shared_ptr<IResource>> doomed;
++    size_t bytes = 0;
++    {
++        const std::lock_guard<std::mutex> lock(mMutex);
++        for (auto it = mResourceCache.begin(); it != mResourceCache.end();) {
++            if (!std::holds_alternative<std::shared_ptr<IResource>>(it->second)) {
++                ++it;
++                continue;
++            }
++            auto resource = std::get<std::shared_ptr<IResource>>(it->second);
++            if (resource == nullptr || resource->GetInitData() == nullptr) {
++                ++it;
++                continue;
++            }
++            if (resource->GetInitData()->Type != kSohIosTextureType) {
++                ++it;
++                continue;
++            }
++            // The cache holds one reference and `resource` above is the second.
++            // Anything higher means a live owner -- the RDP's loaded-texture
++            // metadata is the usual one -- and it is left alone.
++            if (resource.use_count() > 2) {
++                ++it;
++                continue;
++            }
++            bytes += resource->GetPointerSize();
++            doomed.push_back(resource);
++            it = mResourceCache.erase(it);
++        }
++    }
++    if (outEvicted != nullptr) {
++        *outEvicted = doomed.size();
++    }
++    doomed.clear();
++    return bytes;
++}
++
+ } // namespace Ship
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -68,6 +68,18 @@
+     return MTL::SamplerAddressModeClampToEdge;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0045): the Metal device, kept for the memory reporter.
++// MTLDevice::currentAllocatedSize splits GPU bytes from CPU bytes in one field:
++// if it plateaus while phys_footprint keeps climbing, the leak is on the CPU
++// side and the resource cache is the whole story.
++static MTL::Device* sSohIosMetalDevice = nullptr;
++
++static void SohIos_MetalDeviceRegister(MTL::Device* device) {
++    sSohIosMetalDevice = device;
++}
++#endif
++
+ // MARK: - ImGui & SDL Wrappers
+ 
+ bool GfxRenderingAPIMetal::NonUniformThreadGroupSupported() {
+@@ -88,6 +100,9 @@
+     mLayer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+ 
+     mDevice = mLayer->device();
++#ifdef __IOS__
++    SohIos_MetalDeviceRegister(mDevice); // SOH_IOS (overlay 0045)
++#endif
+     mCommandQueue = mDevice->newCommandQueue();
+     mReadbackQueue = mDevice->newCommandQueue();
+ 
+@@ -1882,7 +1897,26 @@
+ 
+ void GfxRenderingAPIMetal::SetSrgbMode() {
+     mSrgbMode = true;
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0045): the three Metal-side numbers the heartbeat reports.
++// `pendmips_n` is the direct read of the leak overlay 0031 rev17 fixes in this
++// same round -- it must be 0 between frames, and any steady non-zero value is a
++// walk that uploaded textures and drew no framebuffer. `mip_orphans` counts how
++// often that actually happened.
++extern "C" unsigned long long SohIos_MetalAllocatedBytes(void) {
++    return sSohIosMetalDevice != nullptr ? (unsigned long long)sSohIosMetalDevice->currentAllocatedSize() : 0ull;
+ }
++
++extern "C" unsigned long long SohIos_PendingMipsCount(void) {
++    return (unsigned long long)sSohIosPendingMips.size();
++}
++
++extern "C" unsigned long long SohIos_MipOrphans(void) {
++    return gSohIosMipOrphans;
++}
++#endif
+ } // namespace Fast
+ 
+ bool Metal_IsSupported() {
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -5804,4 +5804,150 @@
+ 
+ extern "C" void gfx_unregister_fb_texture(const void* cpuAddr) {
+     Fast::mInstance.lock().get()->UnregisterFbTexture(cpuAddr);
+-}
+\ No newline at end of file
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0045): THE MEMORY GOVERNOR. See the patch header for why the
++// resource cache is the leak and why textures are the only class it is safe to
++// evict. Everything below runs on the GAME thread; the pressure source only
++// sets gSohIosMemTrimReq.
++
++// Published for the shell's heartbeat and `vr mem`.
++extern "C" {
++volatile int gSohIosMemTrimReq = 0;      // set by the shell, cleared by the service
++volatile int gSohIosMemTrims = 0;        // trims performed
++volatile int gSohIosMemTrimFreedMB = 0;  // payload MB released by the last trim
++volatile int gSohIosMemTrimEvicted = 0;  // resources evicted by the last trim
++}
++
++extern "C" void SohIos_TexCacheStats(unsigned long long* outBytes, unsigned long long* outCount) {
++    unsigned long long bytes = 0;
++    unsigned long long count = 0;
++    auto instance = Fast::mInstance.lock();
++    if (instance != nullptr) {
++        if (instance->mRapi != nullptr) {
++            bytes = (unsigned long long)instance->mRapi->GetTextureBytes();
++        }
++        count = (unsigned long long)instance->mTextureCache.map.size();
++    }
++    if (outBytes != nullptr) {
++        *outBytes = bytes;
++    }
++    if (outCount != nullptr) {
++        *outCount = count;
++    }
++}
++
++// Upstream's TextureCacheClear parks every id on the free list and never calls
++// DeleteTexture, so it releases NO GPU memory -- which is why the existing
++// gfx_texture_cache_clear() having no callers was never the whole story.
++extern "C" void SohIos_TexCacheClearHard(void) {
++    auto instance = Fast::mInstance.lock();
++    if (instance == nullptr) {
++        return;
++    }
++    if (instance->mRapi != nullptr) {
++        for (const auto& entry : instance->mTextureCache.map) {
++            instance->mRapi->DeleteTexture(entry.second.texture_id);
++        }
++    }
++    instance->TextureCacheClear();
++}
++
++extern "C" void SohIos_ResCacheStats(unsigned long long* outBytes, unsigned long long* outCount) {
++    unsigned long long bytes = 0;
++    unsigned long long count = 0;
++    auto context = Ship::Context::GetRawInstance();
++    if (context != nullptr) {
++        auto rm = context->GetResourceManager();
++        if (rm != nullptr) {
++            size_t n = 0;
++            bytes = (unsigned long long)rm->SohIosResourceCacheStats(&n);
++            count = (unsigned long long)n;
++        }
++    }
++    if (outBytes != nullptr) {
++        *outBytes = bytes;
++    }
++    if (outCount != nullptr) {
++        *outCount = count;
++    }
++}
++
++// The trim itself. ALWAYS followed by the hard texture-cache clear: Fast3D keys
++// its cache on the texture's CPU ADDRESS, and freeing resources lets the
++// allocator hand that address to a different texture, which would alias onto a
++// live entry and draw the wrong image.
++extern "C" unsigned long long SohIos_MemoryTrim(void) {
++    auto context = Ship::Context::GetRawInstance();
++    if (context == nullptr) {
++        return 0;
++    }
++    auto rm = context->GetResourceManager();
++    if (rm == nullptr) {
++        return 0;
++    }
++    size_t evicted = 0;
++    size_t freed = rm->SohIosTrimTextureResources(&evicted);
++    SohIos_TexCacheClearHard();
++    gSohIosMemTrims = gSohIosMemTrims + 1;
++    gSohIosMemTrimFreedMB = (int)(freed / (1024 * 1024));
++    gSohIosMemTrimEvicted = (int)evicted;
++    SPDLOG_INFO("SOH_IOS memtrim: evicted {} texture resources, {} MB payload (trim #{})", evicted,
++                freed / (1024 * 1024), (int)gSohIosMemTrims);
++    return (unsigned long long)freed;
++}
++
++// Called from RunFrame (soh/src/code/graph.c) at the top of a game frame: no
++// display list built yet, no interpreter frame open, and the only thread that
++// is allowed to destroy a resource.
++extern "C" void SohIos_ServiceMemoryTrim(int sceneNum) {
++    static int sSohIosLastScene = -2;
++    static unsigned int sSohIosFrames = 0;
++    static unsigned int sSohIosNextCheck = 0;
++    static unsigned int sSohIosCooldownUntil = 0;
++
++    sSohIosFrames++;
++    bool sceneChanged = (sceneNum != sSohIosLastScene);
++    sSohIosLastScene = sceneNum;
++    bool requested = (gSohIosMemTrimReq != 0);
++
++    if (requested) {
++        gSohIosMemTrimReq = 0;
++        SohIos_MemoryTrim();
++        sSohIosCooldownUntil = sSohIosFrames + 900;
++        return;
++    }
++    // A SCENE CHANGE IS NOT ENOUGH, and the evidence says so plainly: Hyrule
++    // Field killed the app in 60-170 s WITHOUT leaving the scene. So the budget
++    // is also checked on a timer -- every 300 frames, about five seconds -- and
++    // the cheap frame is the one that does nothing at all.
++    if (!sceneChanged && sSohIosFrames < sSohIosNextCheck) {
++        return;
++    }
++    sSohIosNextCheck = sSohIosFrames + 300;
++    if (sSohIosFrames < sSohIosCooldownUntil) {
++        return; // a trim costs a full texture re-upload; do not thrash
++    }
++    auto context = Ship::Context::GetRawInstance();
++    if (context == nullptr) {
++        return;
++    }
++    int budgetMB = context->GetConsoleVariables()->GetInteger("gSohIos.ResCacheBudgetMB", 768);
++    if (budgetMB <= 0) {
++        return; // 0 disables the governor outright -- the A/B control
++    }
++    unsigned long long bytes = 0;
++    SohIos_ResCacheStats(&bytes, nullptr);
++    if (bytes <= (unsigned long long)budgetMB * 1024ull * 1024ull) {
++        return;
++    }
++    unsigned long long freed = SohIos_MemoryTrim();
++    // BACK OFF WHEN IT DID NOT HELP. If a trim over budget frees less than
++    // 32 MB, the cache is that big because it is all IN USE -- everything in it
++    // has a live owner -- and repeating the trim would buy nothing while paying
++    // a full texture re-upload every five seconds. Sixty seconds instead of
++    // five, and the pressure hook can still force one at any moment.
++    sSohIosCooldownUntil = sSohIosFrames + (freed < 32ull * 1024ull * 1024ull ? 3600 : 900);
++}
++#endif
+\ No newline at end of file
+--- a/soh/src/code/graph.c
++++ b/soh/src/code/graph.c
+@@ -772,6 +772,19 @@
+             // uint64_t ticksA, ticksB;
+             // ticksA = GetPerfCounter();
+ 
++#ifdef __IOS__
++            /* SOH_IOS (overlay 0045): service a pending memory trim HERE, on
++             * the game thread, at the top of the frame -- no display list has
++             * been built and the interpreter has no frame open, which is the
++             * only point at which freeing a texture resource and clearing the
++             * texture cache are both safe. A trim asked for from the memory
++             * pressure source (another queue entirely) is a flag, never a
++             * call. */
++            {
++                extern void SohIos_ServiceMemoryTrim(int sceneNum);
++                SohIos_ServiceMemoryTrim((gPlayState != NULL) ? (int)gPlayState->sceneNum : -1);
++            }
++#endif
+             Graph_StartFrame();
+ 
+             PadMgr_ThreadEntry(&gPadMgr);

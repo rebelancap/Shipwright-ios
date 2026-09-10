@@ -1,0 +1,516 @@
+Overlay patch 0047: the Sense pair becomes a pad (VR-DONOR-MAP 8,
+`padmgr.c`). The donor's six-input taxonomy -- TRIGGER, GRIP, PRIMARY,
+SECONDARY, THUMBCLICK, MENU per hand -- is OR'd into the N64 pad so the hands
+can play the game, while the gamepad stays the shipped default for everything
+the hands do not cover.
+
+WHERE. Inside PadMgr_HandleRetraceMsg, IMMEDIATELY AFTER
+`osContGetReadData(padMgr->pads)` and BEFORE `PadMgr_ProcessInputs`, which is
+the donor's own hook site and the only correct one: ProcessInputs is what
+derives this tick's press/rel edges from cur-vs-prev. Hooking after it would
+mean synthesising every edge by hand; hooking before it means a Sense button
+gets exactly the same edge treatment as a physical one, for free.
+
+WHAT. Everything is OR'd into `padMgr->pads[0].button` -- nothing is cleared --
+so a keyboard or a connected gamepad keeps working alongside the hands. The
+left Sense stick drives the N64 analog stick ONLY while it is actually
+deflected (|axis| > 0.02); writing it unconditionally would zero a gamepad's
+stick every tick whenever a Sense pair happened to be paired.
+
+THE PROFILES. Two, and as of rev4 (VR R9 part B) they are built from ROLES
+rather than written per physical hand -- because the sword hand is a shipped
+setting (R9 part A) and a table written as "left" and "right" silently stops
+being the user's table the moment he switches it.
+
+rev4 applies the user's 1.0.1.12 ruling on top of rev3:
+
+  "Right stick click: unbind (no C-UP, it's useless in VR mode). Left face
+   buttons mirror the right: bottom = A, top = B. Keep START on left stick click
+   and both MENU buttons."
+
+  CLASSIC, the shipped binding. ROLE columns first (they mirror on
+  gSohVRLeftHanded), then the physical ones (they do not, because the STICKS do
+  not: the left unit is always the movement stick and the right is always the
+  turn):
+    OFF hand   TRIGGER = Z (always, under every condition)
+    SWORD hand TRIGGER = B (attack; also the mirrored item trigger)
+    OFF hand   GRIP    = R (hold shield, and the crouch)
+    SWORD hand GRIP    = -- (the item wheel; no N64 bit at all)
+    both       PRIMARY (bottom face) = A      <- rev4: symmetric
+    both       SECONDARY (top face)  = B      <- rev4: symmetric
+    LEFT unit  THUMBCLICK = START             <- rev4: kept
+    RIGHT unit THUMBCLICK = --                <- rev4: UNBOUND (was C-UP)
+    both       MENU = START
+
+  rev3 had left PRIMARY=START / SECONDARY=A and right THUMBCLICK=C-UP. the user
+  wore that and asked for the face buttons to read the same on both hands, and
+  for the right thumbclick to do nothing. First person is still reachable: it is
+  a C-UP, and C-UP is on the item wheel like every other C item.
+
+  OCARINA, which OVERRIDES classic while the ocarina is ACTUALLY OUT, also by
+  role --
+    OFF   : TRIGGER=C-down GRIP=Z  PRIMARY=C-left  SECONDARY=C-up  MENU=START
+    SWORD : TRIGGER=A      GRIP=R  PRIMARY=C-right SECONDARY=B     MENU=START
+  i.e. the five notes are D4=A (sword trigger), F4=C-down (off trigger),
+  A4=C-right (sword bottom face), B4=C-left (off bottom face), D5=C-up (off
+  top face); sharpen=R on the sword grip, flatten=Z on the off grip,
+  put-away=B on the sword top face. Every note is on a trigger or a face button,
+  which is the whole reason the profile exists.
+
+  AND, rev4: THE RIGHT STICK BECOMES THE C-PAD -- HERE AND ONLY HERE. the user:
+  "It should ONLY trigger C buttons when you're holding ocarina." That is now
+  literally true: overlay 0052 takes the Sense pair out of SDL's gamepad
+  enumeration entirely, so no stick of theirs can raise a C bit through LUS's
+  axis mapping in any mode; and the ONE place a stick may become a C button is
+  this block, while the ocarina is genuinely out. Deflection past 25% on the
+  RIGHT unit's stick sets C-left/right/up/down as raw STATE, which is what
+  ocarina notes need -- PadMgr_ProcessInputs derives the press and release edges
+  from it a few lines later, exactly as it does for a physical button.
+
+THE OCARINA PREDICATE, AND THE BUG THAT WAS IN IT (rev3, VR R8 part B).
+
+  rev1/rev2 used `gPlayState->msgCtx.ocarinaMode != 0`. THAT FIELD IS A LATCH,
+  not a "the ocarina is out" flag. z_message_PAL.c sets OCARINA_MODE_04 when the
+  player puts the ocarina away and the player actor CONSUMES it
+  (z_player.c:14958) without clearing it; the only writers of OCARINA_MODE_00
+  are Message_Init, the textbox openers, and a handful of actors. So after ANY
+  ocarina use the field stays non-zero until the next textbox opens -- often for
+  the rest of a play session.
+
+  That is exactly what the user reported: "bottom face button on right controller
+  is C RIGHT. left trigger is C DOWN. WHy?!" Both are the OCARINA row, verbatim,
+  and the ocarina profile had simply never been switched back off. Overlay 0039
+  used the same predicate to suppress the VR turn, so the smooth turn died the
+  same way and for the same reason.
+
+  The honest predicate is the message system's MODE, which is what "the ocarina
+  is out" actually means: msgMode in [MSGMODE_OCARINA_STARTING (0x09),
+  MSGMODE_FROGS_WAITING (0x33)]. That one contiguous range covers ocarina input,
+  song demonstration and playback, the scarecrow recorder, the Skull Kid memory
+  game and the frog choir -- every state that takes ocarina notes -- and nothing
+  else. It rises when the ocarina comes out and falls when it goes away, which
+  a latch never did.
+
+ONE RESERVATION, ON THE RIGHT TRIGGER ONLY (rev3).
+
+  A hand holding a bow/hookshot/boomerang/slingshot needs its trigger to be the
+  ITEM's own N64 button as raw STATE -- press nocks, hold draws, release looses.
+  rev1 reserved the trigger of whichever hand held the item, which was the OFF
+  hand, which is the LEFT hand: equipping a C-item therefore took Z away and
+  gave nothing back, because the mirror itself was never written. the user's
+  ruling settles it: "left trigger is Z (always)". So the reservation lives on
+  the SWORD hand's trigger (the right, unless left-handed), it MIRRORS
+  gSohVRItemTriggerMask rather than merely dropping the binding, and the left
+  trigger is Z under every condition.
+
+  2. ORDERING AGAINST OVERLAY 0039. 0039 does its C-button work at the ONE
+     merged snapshot in graph.c, at the tick boundary; this runs EARLIER, in
+     padmgr, per hardware read. That order is correct and deliberate: padmgr ORs
+     the Sense bits in, then graph.c masks off the C bits the RIGHT STICK
+     produced. Because the Sense bits are not stick-produced, 0039's
+     `~sohCFromStick` normally cannot touch them.
+
+     KNOWN INTERACTION, recorded rather than papered over: 0039 masks by BIT,
+     not by provenance. A Sense-produced C-left arriving on the same tick as a
+     right-stick deflection past 25% to the left WILL be cleared by 0039, since
+     the two are indistinguishable once merged. Fixing that requires 0039's mask
+     to exempt Sense-produced bits; this patch does not change 0039. What it
+     does do is make the collision VISIBLE instead of silent: `gSohVRSensePadBits`
+     publishes exactly the mask this tick OR'd in, so a `vr` dump showing bits in
+     gSohVRSensePadBits that are absent from 0039's gSohVRPadCur IS the
+     collision, readable in one line.
+
+GATING, rev5 (VR R10 verdict 5). THE MERGE RUNS IN EVERY MODE NOW.
+
+  the user, on 1.0.1.13: "The VR controllers no longer work in 2D mode. Is there a
+  way to allow it in 2D without messing up VR?" Two correct mechanisms in series
+  had taken them away: overlay 0052 removed a spatial controller from SDL's
+  gamepad enumeration (its right stick was playing the C buttons), and this
+  merge -- the path that replaced it -- was gated on `gSohVRMode != 0`. Outside
+  VR the pair was neither a gamepad nor merged, so nothing read it at all.
+
+  The gate is now `gSohVRSenseActive != 0` alone, and `gSohVRMode` selects the
+  PROFILE instead. Buttons and sticks are ordinary GameController inputs and
+  need no tracking, no head pose and no ARKit session; the shell's
+  SohVR_SenseFlatPump (app/ios/SohIosShell.m) is called from here, once per pad
+  read, to publish them outside VR the way the compositor loop publishes them
+  inside it. One producer at a time: the pump stands down while the VR loop runs.
+
+  THE FLAT PROFILE. Classic bindings, with ONE difference, and it is the mirror
+  image of the VR rule: in VR the right stick TURNS and may never be a C button;
+  in 2D there is no VR turn and no item wheel, so the right stick IS the four C
+  buttons, at the same 25% the LUS gamepad mapping used before 0052 removed it.
+  Nothing else changes -- left stick moves, off trigger Z, sword trigger B, off
+  grip R, sword grip nothing, both face buttons A and B, START on the menu
+  buttons and the left thumbclick.
+
+  The flat profile does NOT take the ocarina override. It does not need it: with
+  the C buttons on the right stick the pad is an ordinary N64 controller and
+  vanilla's own ocarina handling applies, exactly as it does for a gamepad.
+
+  With no Sense pair the pad is byte-for-byte what it is today, on every target;
+  the whole block is `#ifdef __IOS__`, with the vanilla call sequence preserved
+  outside it, exactly as overlays 0039 and 0043 do.
+
+rev6 (VR R16 part C) adds the ONE mode this table had left uncovered: THE VR
+PAUSE MENU. the user, wearing 1.0.1.20: the left stick moves the kaleido cursor
+but the right stick cannot assign an item to C-left/down/right. It could not:
+0052 removed the Sense units from SDL enumeration (so LUS's stick-to-C mapping
+is gone), 0039's C/turn block does not run while paused, and rev5's C gate here
+was `sohVrOcarina || sohVrFlat`. The gate gains `|| sohVrPaused`, the raw
+right-stick axis publish loses those same ticks so the stick never carries two
+meanings, and C-UP is withheld from the stick while paused because in kaleido
+C-up is a modifier, not a slot. 2D is byte-for-byte unchanged (sohVrFlat
+already covered it).
+
+rev7 (VR R18 item 2) SETTLES THE TRIGGERS WHILE AN ITEM IS OUT: BOTH OF THEM
+DRIVE IT, AND NEITHER IS Z OR B.
+
+  the user, wearing 1.0.1.22: "while holding an item, either trigger performs the
+  action -- it's counterintuitive to use the RIGHT trigger when the slingshot is
+  in the LEFT hand. The user hits A or B to exit, or the grip to change item."
+
+  So the rev3 reservation stops being a reservation of ONE trigger. While the
+  item in hand is one a trigger drives -- gSohVRItemTriggerBoth, published by
+  overlay 0042 rev19 from Player_VrTriggerItem: the bows, the slingshot, the
+  hookshot and longshot, the boomerang, the Megaton hammer and the Deku stick --
+  BOTH triggers mirror gSohVRItemTriggerMask as raw STATE, and neither carries
+  its classic binding:
+
+    OFF hand   TRIGGER = the item's own N64 button   (was Z)
+    SWORD hand TRIGGER = the item's own N64 button   (unchanged from rev3)
+
+  It is a mirror of STATE on both hands, so hold-to-aim still works from either
+  one, holding both is the same bit twice, and a release from either releases.
+
+  Z-TARGETING IS THEREFORE UNAVAILABLE WHILE SUCH AN ITEM IS OUT. That is
+  the user's own call, not a side effect we are living with: with the aim ray
+  driving the shot there is nothing for Z to add to a bow, and the way out of an
+  item is A or B (both face buttons, unchanged) or the grip's item wheel.
+
+  NARROWER THAN THE MASK, ON PURPOSE. gSohVRItemTriggerMask is non-zero for
+  EVERY non-sword C item, a bottle and a mask and the ocarina included, because
+  its question is "which button does the held item live on". Widening the
+  both-triggers rule to it would take Z away from a Link holding a bottle. So
+  the rule reads the narrow flag, and everything not on that whitelist keeps
+  rev3's behaviour exactly: sword trigger mirrors the item, off trigger is Z.
+
+  THE OCARINA PROFILE IS UNTOUCHED, twice over: the ocarina is not on the
+  whitelist, and the both-triggers branch is additionally gated on
+  !sohVrOcarina, so the five notes keep the trigger bindings the profile gives
+  them (D4 = A on the sword trigger, F4 = C-down on the off trigger).
+
+The shell (app/ios/SohIosShell.m, not vendor) defines gSohVRSensePadBits,
+gSohVRItemTriggerMask and gSohVRItemTriggerBoth alongside the R4 Sense globals
+it already owns.
+
+--- a/soh/src/code/padmgr.c
++++ b/soh/src/code/padmgr.c
+@@ -317,7 +317,307 @@
+     }
+     osRecvMesg(queue, NULL, OS_MESG_BLOCK);
+     osContGetReadData(padMgr->pads);
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0047, VR-DONOR-MAP 8 `padmgr.c`): merge the PSVR2 Sense
++     * pair into the pad here, after the hardware read and BEFORE
++     * PadMgr_ProcessInputs, which is what derives this tick's press/rel edges.
++     * OR only -- keyboard and gamepad keep working alongside the hands. */
++    {
++        extern volatile int gSohVRMode;
++        extern volatile int gSohVRSenseActive;
++        /* rev5: reads the pair's buttons and sticks when the VR compositor loop
++         * is not running, and publishes them into the gSohVRSense* words below.
++         * A no-op while VR is live, and on targets without SohSense.m. */
++        extern void SohVR_SenseFlatPump(void);
++        extern volatile unsigned int gSohVRSenseBtn[2];
++        extern volatile float gSohVRSenseStickX[2];
++        extern volatile float gSohVRSenseStickY[2];
++        extern volatile int gSohVRSensePadBits;
++        extern volatile int gSohVRLeftHanded;
++        /* rev4: the ocarina profile's live state, and the harness override. */
++        extern volatile int gSohVROcarinaForce;
++        extern volatile int gSohVROcarinaOut;
++        /* Published by overlay 0042 on the SWORD hand; zero means "nothing
++         * reserved". rev3: it is MIRRORED as raw state, not merely reserved. */
++        extern volatile unsigned short gSohVRItemTriggerMask[2];
++        /* rev7 (VR R18 item 2): 1 while that item is one BOTH triggers drive
++         * (overlay 0042 rev19 Player_VrTriggerItem -- the bows, the slingshot,
++         * the hookshot and longshot, the boomerang, the Megaton hammer, the
++         * Deku stick). Narrower than the mask on purpose: a bottle or a mask
++         * keeps Z on the off hand. */
++        extern volatile int gSohVRItemTriggerBoth;
++        extern PlayState* gPlayState;
++        /* Donor sVrBtnMasks order: 0 TRIGGER, 1 GRIP, 2 PRIMARY, 3 SECONDARY,
++         * 4 THUMBCLICK, 5 MENU. The bit values are app/ios/SohSense.h's
++         * SOHSENSE_BTN_* -- one taxonomy shared by hardware, injection and this. */
++        static const u32 sohVrSenseMask[6] = {
++            1u << 2, 1u << 3, 1u << 0, 1u << 1, 1u << 4, 1u << 5,
++        };
++        /* rev3 (VR R8 part B): THE USER'S table, not the donor's. Row 0 = left
++         * hand, row 1 = right. Column order is sohVrSenseMask's above.
++         *   left  TRIGGER Z | GRIP R | PRIMARY(bottom) START | SECONDARY(top) A
++         *         THUMB START | MENU START
++         *   right TRIGGER B | GRIP -- (the item wheel) | PRIMARY(bottom) A
++         *         SECONDARY(top) B | THUMB C-UP (first person) | MENU START */
++        /* rev4 (VR R9 part B): the tables are BUILT, not written down, because
++         * every column that means a ROLE has to follow gSohVRLeftHanded. Row 0
++         * is the OFF hand, row 1 is the SWORD hand; the two physical columns
++         * (THUMBCLICK, which is START on the movement unit and unbound on the
++         * turn unit) are applied afterwards by physical index. */
++        static const u16 sohVrRoleClassic[2][6] = {
++            /* OFF  : TRIGGER Z | GRIP R | PRIMARY A | SECONDARY B | THUMB - | MENU START */
++            { BTN_Z, BTN_R, BTN_A, BTN_B, 0, BTN_START },
++            /* SWORD: TRIGGER B | GRIP - (item wheel) | PRIMARY A | SECONDARY B | THUMB - | MENU START */
++            { BTN_B, 0, BTN_A, BTN_B, 0, BTN_START },
++        };
++        static const u16 sohVrRoleOcarina[2][6] = {
++            { BTN_CDOWN, BTN_Z, BTN_CLEFT, BTN_CUP, 0, BTN_START },
++            { BTN_A, BTN_R, BTN_CRIGHT, BTN_B, 0, BTN_START },
++        };
++        u16 sohVrBind[2][6];
++        s32 sohVrOcarina = 0;
++        u16 sohVrBits = 0;
++        s32 sohVrHand;
++        s32 sohVrIdx;
++        s32 sohVrItemHand;
++        s32 sohVrSwordHand;
++        u16 sohVrItemMask;
++        /* rev7 (VR R18 item 2): EITHER trigger drives the held item. */
++        s32 sohVrItemBoth;
++        s32 sohVrFlat;
++        /* rev6 (VR R16 part C): the kaleido menu is open. */
++        s32 sohVrPaused;
++
++        /* rev5: OUTSIDE VR, this is what puts anything in those words at all. */
++        SohVR_SenseFlatPump();
++        sohVrFlat = (gSohVRMode == 0);
++        /* rev6 (VR R16 part C): the project's pause test, the same predicate
++         * overlays 0039/0032/0013 use -- `pauseCtx.state != 0` is every state
++         * of the kaleido menu including its open and close animations. */
++        sohVrPaused = (gPlayState != NULL) && (gPlayState->pauseCtx.state != 0);
++        if (gSohVRSenseActive != 0) {
++            /* rev3: THE OCARINA IS OUT WHEN THE MESSAGE SYSTEM SAYS SO.
++             * `msgCtx.ocarinaMode` is a LATCH -- it holds OCARINA_MODE_04 from
++             * the moment the ocarina is put away until the next textbox opens,
++             * which is frequently the rest of the session -- and reading it as
++             * "the ocarina is out" is what made the user's right bottom face
++             * button C-RIGHT and his left trigger C-DOWN long after he had
++             * finished playing. msgMode 0x09..0x33 is the contiguous range of
++             * every state that takes ocarina notes (ocarina, song demo and
++             * playback, scarecrow, memory game, frogs) and nothing else. */
++            sohVrOcarina = ((gPlayState != NULL) &&
++                            (gPlayState->msgCtx.msgMode >= MSGMODE_OCARINA_STARTING) &&
++                            (gPlayState->msgCtx.msgMode <= MSGMODE_FROGS_WAITING));
++            /* rev5 (VR R10 verdict 5): the ocarina profile is a VR profile. It
++             * exists because in VR the C buttons live on an item wheel and the
++             * notes have nowhere else to go; in 2D the right stick IS the C
++             * pad below, so the pair is an ordinary N64 controller and
++             * vanilla's own ocarina handling applies unchanged. */
++            if (sohVrFlat) {
++                sohVrOcarina = 0;
++            }
++            /* rev4: a TEST OVERRIDE, and it exists because the ocarina profile
++             * is otherwise unreachable from the harness -- reaching it for real
++             * needs an ocarina, a song and a textbox, none of which a simulator
++             * suite can arrange. -1 (the shipped value) follows the game. */
++            if (gSohVROcarinaForce >= 0) {
++                sohVrOcarina = (gSohVROcarinaForce != 0);
++            }
++            /* rev3: the reservation is the SWORD hand's trigger and no other.
++             * "left trigger is Z (always)" -- if a two-handed item needs a
++             * trigger it uses the right one. */
++            sohVrSwordHand = (gSohVRLeftHanded != 0) ? 0 : 1;
++            sohVrItemHand = sohVrSwordHand;
++            sohVrItemMask = gSohVRItemTriggerMask[sohVrItemHand];
++            /* rev7 (VR R18 item 2): the user -- "either trigger performs the
++             * action". Both hands mirror the item and neither is Z or B, for
++             * exactly the items overlay 0042 whitelists. The ocarina profile is
++             * excluded here as well as by the whitelist, because two of its five
++             * notes ARE the triggers. */
++            sohVrItemBoth = (sohVrItemMask != 0) && (gSohVRItemTriggerBoth != 0) &&
++                            !sohVrOcarina;
++            /* rev4: BUILD the physical table from the role table. */
++            for (sohVrHand = 0; sohVrHand < 2; sohVrHand++) {
++                s32 sohVrRole = (sohVrHand == sohVrSwordHand) ? 1 : 0;
++
++                for (sohVrIdx = 0; sohVrIdx < 6; sohVrIdx++) {
++                    sohVrBind[sohVrHand][sohVrIdx] =
++                        sohVrOcarina ? sohVrRoleOcarina[sohVrRole][sohVrIdx] : sohVrRoleClassic[sohVrRole][sohVrIdx];
++                }
++            }
++            /* The two PHYSICAL columns. The thumbclicks are not role-based
++             * because the STICKS are not: the left unit is always the movement
++             * stick and the right unit is always the turn. the user: "keep START
++             * on left stick click"; "right stick click: unbind". Classic only --
++             * the ocarina profile has no thumbclick binding on either hand. */
++            if (!sohVrOcarina) {
++                sohVrBind[0][4] = BTN_START;
++                sohVrBind[1][4] = 0;
++            }
++            for (sohVrHand = 0; sohVrHand < 2; sohVrHand++) {
++                u32 sohVrBtn = gSohVRSenseBtn[sohVrHand];
++
++                for (sohVrIdx = 0; sohVrIdx < 6; sohVrIdx++) {
++                    if ((sohVrIdx == 0) && (sohVrItemMask != 0) &&
++                        (sohVrItemBoth || (sohVrHand == sohVrItemHand))) {
++                        /* MIRROR, not skip. Raw STATE from the trigger onto the
++                         * item's own N64 button: press nocks, hold draws,
++                         * release looses, with every vanilla rule intact. */
++                        if (sohVrBtn & sohVrSenseMask[0]) {
++                            sohVrBits |= sohVrItemMask;
++                        }
++                        continue;
++                    }
++                    if (sohVrBtn & sohVrSenseMask[sohVrIdx]) {
++                        sohVrBits |= sohVrBind[sohVrHand][sohVrIdx];
++                    }
++                }
++            }
++            /* rev4 (VR R9 part B): THE ONLY PLACE A STICK MAY BECOME A C
++             * BUTTON. the user: "It should ONLY trigger C buttons when you're
++             * holding ocarina." Overlay 0052 removed the other route (SDL was
++             * enumerating each Sense unit as a gamepad, and SoH's default
++             * mapping binds RIGHTX/RIGHTY to the C buttons at 25%), so this is
++             * now literally the whole of it.
++             *
++             * RAW STATE, not an edge: notes are held, and PadMgr_ProcessInputs
++             * runs a few lines below and derives press/rel from cur exactly as
++             * it does for a physical button. 25% matches the threshold the
++             * removed LUS mapping used, so the deflection that used to produce
++             * a C bit still does -- in the one mode where it should. */
++            /* rev5 (VR R10 verdict 5): ...OR IN 2D, WHERE IT IS THE ONLY C
++             * PAD THERE IS. The VR rule ("the right stick turns and can never
++             * be a C button") is a rule about VR: outside it there is no smooth
++             * turn to protect and no item wheel to reach the C items through,
++             * and before overlay 0052 this same deflection produced these same
++             * bits through the LUS mapping at this same 25%. the user lost that
++             * when 0052 landed; this is where it comes back. */
++            /* rev6 (VR R16 part C): ...OR WHILE THE PAUSE MENU IS OPEN, which
++             * is the one place in VR where the C buttons are not items but
++             * SLOTS. `KaleidoScope_UpdateItemEquip`'s assignment reads
++             * `input->press.button & (BTN_CLEFT | BTN_CDOWN | BTN_CRIGHT)`
++             * (z_kaleido_item.c:696), and in VR nothing was producing those:
++             * overlay 0052 took the Sense units out of SDL's gamepad
++             * enumeration, so LUS's own right-stick-to-C mapping is gone, and
++             * 0039's C/turn block -- the other producer -- is gated on
++             * `sohVRFlat == 0`, i.e. it does not run while paused. The left
++             * stick moves the cursor (it is the N64 analog stick, published
++             * unconditionally above) and worked all along; the right stick
++             * assigned nothing because it meant nothing.
++             *
++             * The turn integrator cannot double-book the stick here: 0039's
++             * whole block is `(gSohVRMode != 0) && (sohVRFlat == 0)`, and
++             * sohVRFlat is this same pause predicate, so while paused there is
++             * no turn to protect -- and the raw axis publish below now stands
++             * down for the same ticks, so one physical stick never carries two
++             * meanings at once. */
++            if (sohVrOcarina || sohVrFlat || sohVrPaused) {
++                float sohVrOcX = gSohVRSenseStickX[1];
++                float sohVrOcY = gSohVRSenseStickY[1];
+ 
++                if (sohVrOcX > 0.25f) {
++                    sohVrBits |= BTN_CRIGHT;
++                } else if (sohVrOcX < -0.25f) {
++                    sohVrBits |= BTN_CLEFT;
++                }
++                if (sohVrOcY > 0.25f) {
++                    /* rev6: NO C-UP FROM THE STICK WHILE PAUSED. C-up is not an
++                     * item slot -- in kaleido it is only a modifier (the
++                     * DpadEquips chord at z_kaleido_item.c:698) and a
++                     * randomizer shortcut -- so an up-flick on the way to a
++                     * slot would toggle things rather than assign. The cursor
++                     * is on the LEFT stick, which keeps its full range. In 2D
++                     * and with the ocarina out the right stick is still the
++                     * whole C pad, C-up included. */
++                    if (sohVrOcarina || sohVrFlat) {
++                        sohVrBits |= BTN_CUP;
++                    }
++                } else if (sohVrOcY < -0.25f) {
++                    sohVrBits |= BTN_CDOWN;
++                }
++            }
++            padMgr->pads[0].button |= sohVrBits;
++            /* The LEFT stick drives the N64 analog stick, but only while it is
++             * actually deflected: writing it unconditionally would zero a
++             * connected gamepad's stick on every tick. */
++            {
++                float sohVrX = gSohVRSenseStickX[0];
++                float sohVrY = gSohVRSenseStickY[0];
++
++                if ((fabsf(sohVrX) > 0.02f) || (fabsf(sohVrY) > 0.02f)) {
++                    s32 sohVrSx = (s32)(sohVrX * 127.0f);
++                    s32 sohVrSy = (s32)(sohVrY * 127.0f);
++
++                    if (sohVrSx > 127) {
++                        sohVrSx = 127;
++                    } else if (sohVrSx < -127) {
++                        sohVrSx = -127;
++                    }
++                    if (sohVrSy > 127) {
++                        sohVrSy = 127;
++                    } else if (sohVrSy < -127) {
++                        sohVrSy = -127;
++                    }
++                    padMgr->pads[0].stick_x = (s8)sohVrSx;
++                    padMgr->pads[0].stick_y = (s8)sohVrSy;
++                }
++            }
++            /* rev2 (VR R7 verdict 6): THE RIGHT STICK REACHES THE PAD AT ALL.
++             * It never did. rev1 published only the left stick, so on a Sense
++             * pair the right stick drove nothing: not the turn (overlay 0039
++             * reads `Input.cur.right_stick_x`, which stayed 0), and not the C
++             * buttons. the user's verdict describes the rule he wants, not the
++             * behaviour he saw -- "if you do joystick left or right, it's just
++             * smooth turn or snap turn... if you want to do C up, down, left,
++             * right, you must HOLD right grip AND then the right joystick
++             * becomes C buttons" -- and neither half of it could happen with
++             * the axis unpublished.
++             *
++             * It goes onto the pad's RIGHT stick rather than being interpreted
++             * here, deliberately: 0039 already owns the one merged snapshot
++             * where turn-versus-C is decided (spec D9), it is where the
++             * gamepad's right stick lands too, and putting the Sense stick
++             * anywhere else would give the two producers two different rules. */
++            /* rev6 (VR R16 part C): ...AND NOT WHILE PAUSED, where that same
++             * deflection has just become the C buttons above. Nothing consumes
++             * the raw axis during a pause anyway (0039's turn block is gated
++             * off), so this removes a meaning rather than a behaviour. */
++            if (!sohVrFlat && !sohVrPaused) {
++                float sohVrRx = gSohVRSenseStickX[1];
++                float sohVrRy = gSohVRSenseStickY[1];
++
++                /* rev5: VR ONLY. In 2D that same deflection has just become
++                 * the C buttons above, and publishing it as a raw axis as well
++                 * would give one physical stick two meanings at once. */
++                if ((fabsf(sohVrRx) > 0.02f) || (fabsf(sohVrRy) > 0.02f)) {
++                    s32 sohVrRsx = (s32)(sohVrRx * 127.0f);
++                    s32 sohVrRsy = (s32)(sohVrRy * 127.0f);
++
++                    if (sohVrRsx > 127) {
++                        sohVrRsx = 127;
++                    } else if (sohVrRsx < -127) {
++                        sohVrRsx = -127;
++                    }
++                    if (sohVrRsy > 127) {
++                        sohVrRsy = 127;
++                    } else if (sohVrRsy < -127) {
++                        sohVrRsy = -127;
++                    }
++                    padMgr->pads[0].right_stick_x = (s8)sohVrRsx;
++                    padMgr->pads[0].right_stick_y = (s8)sohVrRsy;
++                }
++            }
++        }
++        /* Diagnostic: exactly what was OR'd in this tick. Bits present here and
++         * absent from 0039's gSohVRPadCur are the C-mask collision the header
++         * describes, rather than a silent lost press. */
++        gSohVRSensePadBits = (int)sohVrBits;
++        /* rev4: published unconditionally, so it is 0 outside VR rather than
++         * whatever the last VR tick left behind. */
++        gSohVROcarinaOut = sohVrOcarina;
++    }
++#endif
++
+     Mouse_UpdateAll();
+ 
+     for (i = 0; i < __osMaxControllers; i++) {

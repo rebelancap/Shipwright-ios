@@ -20,6 +20,13 @@ SOH_BUILD="$(date -u +%Y%m%d%H%M)"
 CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 echo "=== soh $SOH_VERSION (build $SOH_BUILD), remote console: $CONSOLE ==="
 
+for _stale in "$BUILD"/soh/Release-*/soh.app "$BUILD"/soh/Release-*/libsohvisionswift.a; do
+    if [[ -L "$_stale" && ! -e "$_stale" ]]; then
+        echo "build: removing dangling symlink $_stale"
+        rm -f "$_stale"
+    fi
+done
+
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Shipwright" -B "$BUILD" -GXcode \
     -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \

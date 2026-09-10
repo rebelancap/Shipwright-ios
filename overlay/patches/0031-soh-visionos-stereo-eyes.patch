@@ -21,12 +21,126 @@ camera-to-focus distance exported by 0032, biased by gSohIos.StereoConvBias
 the convergence, so background disparity is scene-constant. Fixed sep/conv
 made depth swing wildly with OoT's camera distance (uphill-intense,
 field-flat, near-ground diplopia — all one root cause).
+rev12 (VR R0, VR-spec D2): the SAME injection seam also carries VR. When
+gSohVRMode is set the shell publishes a complete per-eye A.V.P matrix each
+compositor frame (row-vector, Fast3D order) and Soh3DStereoP SUBSTITUTES it
+for the game's combined view*projection rather than skewing it — ortho/HUD
+still keeps the game's own matrix, so the perspective-only gate is shared.
+This lands as a REGENERATION of 0031 rather than a stacked patch: the seam is
+inside text 0031 itself inserts, and a patch stacked onto patch-inserted text
+breaks 0031's reverse probe in apply-overlay.sh (SpaghettiKart VR-R0 finding).
+rev13 (VR R1, VR-spec D2/D3/D8): three additions, all VR-gated.
+(a) POSE RENDEZVOUS. The shell now publishes a LIVE pose every compositor
+frame, so the matrices can no longer be read straight out of a shared array
+while the interpreter walks it. gSohVREyeVP becomes DOUBLE-BUFFERED
+([slot][eye][16]) and the host-frame branch latches gSohVRPoseSeq -- and
+therefore one slot -- ONCE for the whole two-eye pair, so both eyes are
+guaranteed to come from the same head pose. On completion it publishes
+gSohVREyeSeqDone, which the compositor loop waits on with a bounded timeout
+before presenting (timeout -> it re-presents the previous pair against the
+anchor that pair was rendered with).
+(b) FLAT-SCREEN CONTEXTS. gSohVRFlatLatch (overlay 0039, latched at the tick
+boundary before the DL is built) is latched again for the pair; while set,
+Soh3DStereoP leaves the game's own matrix alone, so a flat frame renders MONO
+and lands on the world-locked panel instead of being smeared across the world.
+(c) DEPTH HANDOFF. The eye framebuffer's DEPTH texture is published beside its
+colour texture on GPU completion, so the compositor blit can convert Fast3D's
+forward-Z depth into the drawable's reverse-Z/infinite-far target (R0 finding
+4: the conventions genuinely differ, so this is a conversion, never a copy).
+rev14 (VR R2a, device round, trap D35): THE EYE PAIR IS THE UNIT, NOT THE EYE.
+rev11 publishes each eye texture from its OWN GPU completion handler, so the
+compositor -- which reads gSoh3DEyeTexture[0] and [1] independently -- can hold
+eye 0 from host frame N and eye 1 from host frame N-1, submit ONE device anchor
+for the two, and hand the headset two eyes rendered for two different head
+poses. That is diplopia no projection math can fix, and it is the leading
+candidate for the user's "everything is doubled" on the first device build. It is
+invisible in the simulator, whose serialized queues publish both eyes together.
+Fix: every published eye carries the PAIR TAG (gSohVRPairTag, the pose seq the
+host-frame branch latched for that pair), and a new
+Soh3DEyePairSnapshot(tex, depth, tag) hands the shell both eyes' textures,
+depths and tags in ONE critical section under the existing publish mutex. The
+shell adopts a pair only when the two tags match and otherwise re-presents the
+last coherent pair against that pair's own anchor.
+rev15 (VR R2b, spec D7 + the rainbow finding): TWO additions.
+(a) THE HUD PLANE. OoT's interface -- the in-play HUD, the scene title card,
+dialogue boxes, the title/intro overlay -- is TEXRECT output: screen-space
+vertices built by GfxDpTextureRectangle that never touch MP_matrix, so the
+projection injector cannot reach them and the ortho gate leaves them on the
+game's own matrix. Both eyes therefore get IDENTICAL PIXEL POSITIONS, and under
+the device's asymmetric per-eye frusta identical pixels are not the same
+direction -- the HUD doubles and drifts to the edges (the user, 1.0.1.2). Overlay
+0043 unchains the overlay display list in VR gameplay; a THIRD interpreter walk
+(sSoh3DEye == 3) renders it once per host frame into its own 4:3 framebuffer,
+cleared TRANSPARENT (Soh3DSetFbClearAlphaZero), published in slot 2 through the
+same completion machinery as the eyes and carrying the same pair tag. The shell
+composites it as a flat plane at a real distance with each eye's own
+projection, which is what gives it true disparity.
+(b) THE VERTEX BUFFER POOL. kMaxVertexBufferPoolSize is 3, sized for ONE
+offscreen pass per host frame; VR does two (three with the HUD) and nothing
+fences the CPU's memcpy into a pool slot against the GPU still reading it. See
+the comment in gfx_metal.h -- this is the best explanation on the table for the
+rainbow polygons the user sees only while the Mac Virtual Display is in view.
+iOS gets 8 slots; desktop keeps 3.
 All new code is __IOS__-guarded; the shell globals live in SohIosShell.m so
 iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
+rev3 (VR R1): the macOS build could not LINK. These extern declarations are
+unguarded on purpose -- the code they gate is behaviour-gated by gSoh3DMode
+rather than compiled out -- but the strong definitions live in the iOS shell
+(app/ios/SohIosShell.m), which no desktop build links. So every unguarded
+reference now carries a WEAK zeroed default beside it, compiled only when
+__IOS__ is absent. The shell's strong definitions win wherever it IS linked
+(weak loses to strong), and on desktop the flag is a constant 0, so the gated
+paths are unreachable exactly as intended. Found when the Q-VR5 fmt/ZAPD
+blocker was cleared and soh-macos reached the link step for the first time.
+rev19 (VR R11 verdict 1): A SKYBOX HAS NO POSITION. the user, on 1.0.1.14: "Sky
+still pulsates like crazy when I move." R7 seated the sky matrix on the game
+camera and R10 on the head; both are POSITIONS, and both failed for one reason
+neither round wrote down. A skybox vertex lands in eye space at
+S * R^T * (R_sky*p_model + M_t - seat), and the sphere radius |p_model| = 126
+units is multiplied by the SAME S -- so the 100x "effective infinity" scale
+divides the residual and the radius alike and changes no angle at all. The
+error is |M_t - seat| / 126 radians whatever the scale, M_t is the game camera
+as Fast3D INTERPOLATED it for this host frame, and no seat we can compute is
+sampled on the same clock: ten units of disagreement is 4.5 degrees of swim.
+The fix removes translation from the path entirely -- the shell publishes a sky
+pose whose translation is zero, and this rev zeroes the MODEL matrix's
+translation row for draws inside 0033's skybox sentinel (Soh3DSkyModel /
+Soh3DSkyPath, at both MP composition sites). What is left is
+S * R^T * R_sky * p_model: the sphere centred on the eye by construction, both
+eyes sharing one rotation so the disparity stays exactly zero. The dropped
+translation is published as gSohVRSkyMDrop for `vr sky`.
+rev20 (VR R18 part B, D-071): THE ASPECT CORRECTION BELONGS TO THE DISPLAY LIST,
+NOT TO THE PASS. the user, on 1.0.1.22: the Lens of Truth "should show the same red
+interface with a circle like vanilla" -- and in VR its circle is an oval with
+clipped sides. AdjXForAspectRatio multiplies every screen-space texrect edge AND
+every vertex's clip x by (4/3)/aspect, reading mCurDimensions, i.e. the dims of
+the pass being RENDERED. rev15 leaves those dims at the HUD plane's 4:3
+1600x1200 between host frames on purpose, so the GAME thread builds its display
+list while GetAspectRatio() reports 4:3: OTRGetRectDimensionFromLeftEdge(0) is
+0 and OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH) is SCREEN_WIDTH, a rect that
+already spans the whole field, and then the eye pass stretches it by
+(4/3)/eye_aspect anyway. Hence the oval.
+The factor is now taken against the aspect the DL was BUILT with -- sampled once
+per host frame by Soh3DNoteBuildAspect() before the first eye pass moves dims --
+rather than by restoring eye dims after the HUD pass, which would move the
+pillarboxing onto the HUD instead.
+TWO CONSEQUENCES, SAID OUT LOUD. (a) Every world-list screen-space rect
+un-stretches with the lens: Environment_FillScreen's flashes and fades,
+Oceff_Storm, z_room's fills, the game-over/void-out washes. (b) So does the
+WORLD: in VR Soh3DStereoP substitutes the shell's exact per-eye frustum for the
+game's whole view*projection, so a (4/3)/eye_aspect scale on clip x was pure
+error there -- roughly 7 per cent of horizontal stretch at the device's 1.246
+eye aspect. The oval circle is the proof it was live, since the mask and the
+world go through the same multiply. It follows that the R17 aim trims (the bow's
+yaw +25 especially) were measured through that stretch and may want
+re-measuring; that is a headset question, not a host one.
+The branch is a provable no-op everywhere else: eye 1 and eye 2 share dims with
+the recorded value, the HUD pass's dims ARE the recorded value, and the 3D-panel
+mode (no HUD plane) records the eye aspect it already used.
 
 --- a/libultraship/include/fast/backends/gfx_rendering_api.h
 +++ b/libultraship/include/fast/backends/gfx_rendering_api.h
-@@ -53,6 +53,21 @@
+@@ -53,6 +53,29 @@
      virtual void OnResize() = 0;
      virtual void StartFrame() = 0;
      virtual void EndFrame() = 0;
@@ -43,47 +157,148 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +    }
 +    // rev11: request that this framebuffer's texture be published to the
 +    // stereo compositor ON GPU COMPLETION of the frame that renders it.
-+    virtual void Soh3DPublishOnComplete(int fb, int eyeIdx) {
++    // rev14: with the PAIR TAG, so the compositor can tell a coherent
++    // stereo frame from two eyes rendered for two different poses.
++    virtual void Soh3DPublishOnComplete(int fb, int eyeIdx, unsigned int tag) {
++    }
++    // rev15 (VR R2b, spec D7): clear THIS framebuffer to alpha 0
++    // instead of opaque black. The HUD plane is composited over the
++    // world, so everywhere the interface does not draw has to be
++    // transparent; the eye framebuffers keep the opaque clear.
++    virtual void Soh3DSetFbClearAlphaZero(int fb) {
 +    }
      virtual void FinishRender() = 0;
      virtual int CreateFramebuffer() = 0;
      virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
 --- a/libultraship/include/fast/backends/gfx_metal.h
 +++ b/libultraship/include/fast/backends/gfx_metal.h
-@@ -153,6 +153,10 @@
+@@ -13,7 +13,28 @@
+ #include <imgui_impl_sdl2.h>
+ #include <simd/simd.h>
+ 
++// SOH_IOS (overlay 0031 rev15, VR R2b): THE VERTEX BUFFER POOL IS SIZED FOR
++// ONE OFFSCREEN PASS PER HOST FRAME, AND VR RUNS THREE.
++// The pool index advances once per EndFrame/EndFrameOffscreen. Flat play
++// does one of those per frame, so a slot is reused three frames later and
++// the GPU has long finished with it. The VR loop does TWO (one per eye) --
++// three with rev15's HUD pass -- so with three slots a slot is rewritten
++// roughly every host frame, and nothing fences the CPU's memcpy into it
++// against the GPU still reading it. Whenever the GPU falls a frame behind
++// (which is exactly what happens when the compositor also has to render a
++// Mac Virtual Display window), live vertex data is overwritten mid-draw.
++// That is the signature the user photographed on 1.0.1.2: huge sheared
++// saturated triangles that appear only while the MVD is in view, and it is
++// the same artefact SpaghettiKart saw and 'cured' by shrinking its eye
++// targets (VR-R7-NOTES 5) -- shrinking cut GPU time, so the GPU stopped
++// falling behind; the pool was never the thing anyone looked at.
++// iOS/visionOS gets 8 slots (~2.7 host frames of slack at three passes,
++// 38 MB at this buffer size). Desktop keeps 3 byte-for-byte.
++#ifdef __IOS__
++static constexpr size_t kMaxVertexBufferPoolSize = 8;
++#else
+ static constexpr size_t kMaxVertexBufferPoolSize = 3;
++#endif
+ static constexpr size_t METAL_MAX_MULTISAMPLE_SAMPLE_COUNT = 8;
+ static constexpr size_t MAX_PIXEL_DEPTH_COORDS = 1024;
+ 
+@@ -153,6 +174,12 @@
      void OnResize() override;
      void StartFrame() override;
      void EndFrame() override;
 +    void EndFrameOffscreen() override;
 +    void Soh3DImGuiPrime(int fb) override;
 +    void Soh3DImGuiRender(int fb, void* drawData) override;
-+    void Soh3DPublishOnComplete(int fb, int eyeIdx) override;
++    void Soh3DPublishOnComplete(int fb, int eyeIdx, unsigned int tag) override;
++    void Soh3DSetFbClearAlphaZero(int fb) override;
++    int mSoh3DAlphaZeroFb = -1;
      void FinishRender() override;
      int CreateFramebuffer() override;
      void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
 --- a/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -817,6 +817,131 @@
- void GfxRenderingAPIMetal::FinishRender() {
+@@ -849,8 +849,244 @@
  }
  
+ void GfxRenderingAPIMetal::FinishRender() {
++}
++
 +// SOH_IOS (overlay 0031): end-of-eye-pass flush for stereoscopic 3D. The
 +// screen framebuffer was never set up this frame (no drawable — a hidden
 +// window's acquire stalls), so EndFrame's present path is unusable: commit
 +// every drawn framebuffer's command buffer, ride 0019's pending-mip pass on
 +// the last one, and replicate EndFrame's per-frame state cleanup.
 +extern "C" {
-+extern void* volatile gSoh3DEyeTexture[2];
++extern void* volatile gSoh3DEyeTexture[3];
++// rev13 (VR R1): the eye's DEPTH texture, published beside the colour
++// one so the VR blit can convert forward-Z -> reverse-Z (spec D2).
++extern void* volatile gSoh3DEyeDepthTexture[3];
++// rev14 (VR R2a, trap D35): the pair tag each published eye carries.
++extern volatile unsigned int gSoh3DEyeTag[3];
 +}
++#ifndef __IOS__
++// rev13: WEAK zeroed defaults so desktop builds (the macOS build) link
++// without the iOS shell, which owns the strong definitions. Weak loses
++// to strong wherever the shell IS linked; here the publish path is
++// unreachable anyway (nothing ever sets an eye framebuffer).
++extern "C" {
++__attribute__((weak)) void* volatile gSoh3DEyeTexture[3] = { nullptr, nullptr, nullptr };
++__attribute__((weak)) void* volatile gSoh3DEyeDepthTexture[3] = { nullptr, nullptr, nullptr };
++__attribute__((weak)) volatile unsigned int gSoh3DEyeTag[3] = { 0u, 0u, 0u };
++}
++#endif
 +static int sSoh3DPublishFb = -1;
 +static int sSoh3DPublishEye = -1;
++static unsigned int sSoh3DPublishTag = 0;
 +static std::mutex sSoh3DPublishMutex;
 +static void* sSoh3DRetired[16];
 +static int sSoh3DRetiredIdx = 0;
++// SOH_IOS (overlay 0031 rev17, VR R8 part C): orphaned pending-mip drains.
++// Non-zero means a walk uploaded textures and drew no framebuffer -- see
++// EndFrameOffscreen. Read back through SohIos_MipOrphans (overlay 0045).
++unsigned long long gSohIosMipOrphans = 0;
 +
-+void GfxRenderingAPIMetal::Soh3DPublishOnComplete(int fb, int eyeIdx) {
++// rev14 (trap D35): hand the compositor BOTH eyes in ONE critical
++// section. Reading gSoh3DEyeTexture[0] and [1] separately is precisely
++// the torn read the tag exists to detect -- the two eyes are published
++// by independent completion handlers and a read can land between them.
++// rev15 (VR R2b, spec D7): the HUD plane is published through the
++// SAME completion machinery, in slot 2, so it can never be sampled
++// mid-GPU either. It carries the pair tag of the host frame that built
++// it, which is what lets the compositor refuse a HUD from a different
++// frame than the eyes it is composited over.
++extern "C" void Soh3DHudSnapshot(void** sohTex, unsigned int* sohTag) {
++    std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++    if (sohTex != nullptr) {
++        sohTex[0] = (void*)gSoh3DEyeTexture[2];
++    }
++    if (sohTag != nullptr) {
++        sohTag[0] = gSoh3DEyeTag[2];
++    }
++}
++
++extern "C" void Soh3DEyePairSnapshot(void** sohTex, void** sohDepth, unsigned int* sohTag) {
++    std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++    for (int sohE = 0; sohE < 2; sohE++) {
++        if (sohTex != nullptr) {
++            sohTex[sohE] = (void*)gSoh3DEyeTexture[sohE];
++        }
++        if (sohDepth != nullptr) {
++            sohDepth[sohE] = (void*)gSoh3DEyeDepthTexture[sohE];
++        }
++        if (sohTag != nullptr) {
++            sohTag[sohE] = gSoh3DEyeTag[sohE];
++        }
++    }
+ }
+ 
++void GfxRenderingAPIMetal::Soh3DSetFbClearAlphaZero(int fb) {
++    mSoh3DAlphaZeroFb = fb;
++}
++
++void GfxRenderingAPIMetal::Soh3DPublishOnComplete(int fb, int eyeIdx, unsigned int tag) {
 +    sSoh3DPublishFb = fb;
 +    sSoh3DPublishEye = eyeIdx;
++    sSoh3DPublishTag = tag;
 +}
 +
 +void GfxRenderingAPIMetal::EndFrameOffscreen() {
@@ -113,27 +328,73 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +        // serializes queues).
 +        if (sohFbId == sSoh3DPublishFb) {
 +            MTL::Texture* sohPubTex = mTextures[sohFb.mTextureId].texture;
++            MTL::Texture* sohPubDepth = sohFb.mDepthTexture;
 +            int sohPubEye = sSoh3DPublishEye;
++            unsigned int sohPubTag = sSoh3DPublishTag;
 +            sSoh3DPublishFb = -1;
-+            if (sohPubTex != nullptr && sohPubEye >= 0 && sohPubEye <= 1) {
++            if (sohPubTex != nullptr && sohPubEye >= 0 && sohPubEye <= 2) {
 +                sohPubTex->retain();
++                if (sohPubDepth != nullptr) {
++                    sohPubDepth->retain();
++                }
 +                sohFb.mCommandBuffer->addCompletedHandler(
-+                    MTL::HandlerFunction([sohPubTex, sohPubEye](MTL::CommandBuffer* sohCb) {
++                    MTL::HandlerFunction([sohPubTex, sohPubDepth, sohPubEye,
++                                          sohPubTag](MTL::CommandBuffer* sohCb) {
 +                        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
 +                        void* sohOld = (void*)gSoh3DEyeTexture[sohPubEye];
++                        void* sohOldD = (void*)gSoh3DEyeDepthTexture[sohPubEye];
 +                        gSoh3DEyeTexture[sohPubEye] = (void*)sohPubTex;
-+                        if (sohOld != nullptr) {
++                        gSoh3DEyeDepthTexture[sohPubEye] = (void*)sohPubDepth;
++                        // rev14: the tag is written LAST inside the same
++                        // critical section the snapshot reads under, so a
++                        // reader can never see a new tag on an old texture.
++                        gSoh3DEyeTag[sohPubEye] = sohPubTag;
++                        // Retire BOTH through the same ring: the VR blit
++                        // samples colour and depth in one pass, so they
++                        // must not outlive each other.
++                        void* sohRetire[2] = { sohOld, sohOldD };
++                        for (int sohR = 0; sohR < 2; sohR++) {
++                            if (sohRetire[sohR] == nullptr) {
++                                continue;
++                            }
 +                            void* sohSlot = sSoh3DRetired[sSoh3DRetiredIdx];
 +                            if (sohSlot != nullptr) {
 +                                ((MTL::Texture*)sohSlot)->release();
 +                            }
-+                            sSoh3DRetired[sSoh3DRetiredIdx] = sohOld;
++                            sSoh3DRetired[sSoh3DRetiredIdx] = sohRetire[sohR];
 +                            sSoh3DRetiredIdx = (sSoh3DRetiredIdx + 1) % 16;
 +                        }
 +                    }));
 +            }
 +        }
 +        sohFb.mCommandBuffer->commit();
++    }
++    // SOH_IOS (overlay 0031 rev17, VR R8 part C): THE PENDING-MIP LEAK.
++    // The drain above lives INSIDE the loop and the loop `continue`s on a
++    // null command buffer, so a walk that uploaded textures and ended with
++    // mDrawnFramebuffers empty (or all-null) neither released nor cleared the
++    // vector: every one of those textures kept a full retain, and the next
++    // frame pushed them again with another one. In VR there are THREE walks
++    // per host frame and the HUD walk is the one most likely to draw nothing.
++    // Whatever is still pending here gets its mips on a command buffer of its
++    // own -- safe, because every framebuffer command buffer above has already
++    // been committed, which is exactly the condition 0019 rev4's mid-frame
++    // deadlock rule is about -- and is then released exactly once.
++    if (!sSohIosPendingMips.empty()) {
++        gSohIosMipOrphans += (unsigned long long)sSohIosPendingMips.size();
++        MTL::CommandBuffer* sohOrphanCb = mCommandQueue->commandBuffer();
++        if (sohOrphanCb != nullptr) {
++            MTL::BlitCommandEncoder* sohOrphanBlit = sohOrphanCb->blitCommandEncoder();
++            for (MTL::Texture* sohTex : sSohIosPendingMips) {
++                sohOrphanBlit->generateMipmaps(sohTex);
++            }
++            sohOrphanBlit->endEncoding();
++            sohOrphanCb->commit();
++        }
++        for (MTL::Texture* sohTex : sSohIosPendingMips) {
++            sohTex->release();
++        }
++        sSohIosPendingMips.clear();
 +    }
 +    mDrawnFramebuffers.clear();
 +    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
@@ -173,6 +434,11 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +}
 +
 +extern "C" volatile int gSoh3DDbgMenuDraws;
++#ifndef __IOS__
++extern "C" {
++__attribute__((weak)) volatile int gSoh3DDbgMenuDraws = 0; // rev13: see above
++}
++#endif
 +
 +void GfxRenderingAPIMetal::Soh3DImGuiRender(int fb, void* drawData) {
 +    if (fb < 0 || fb >= (int)mFramebuffers.size() || drawData == nullptr) {
@@ -195,20 +461,37 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
  int GfxRenderingAPIMetal::CreateFramebuffer() {
      uint32_t texture_id = NewTexture();
      TextureDataMetal& t = mTextures[texture_id];
+@@ -1154,6 +1390,15 @@
+     MTL::LoadAction origLoadAction = srcColorAttachment->loadAction();
+     if (color) {
+         srcColorAttachment->setLoadAction(MTL::LoadActionClear);
++#ifdef __IOS__
++        // SOH_IOS (overlay 0031 rev15, spec D7): the HUD plane clears
++        // TRANSPARENT so the world shows through everywhere the interface
++        // does not draw. Every other framebuffer keeps Metal's default
++        // opaque-black clear, byte for byte.
++        srcColorAttachment->setClearColor(((int)mCurrentFramebuffer == mSoh3DAlphaZeroFb)
++                                              ? MTL::ClearColor(0.0, 0.0, 0.0, 0.0)
++                                              : MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
++#endif
+     }
+ 
+     MTL::RenderPassDepthAttachmentDescriptor* srcDepthAttachment = framebuffer.mRenderPassDescriptor->depthAttachment();
 --- a/libultraship/include/fast/interpreter.h
 +++ b/libultraship/include/fast/interpreter.h
-@@ -385,6 +385,10 @@
+@@ -385,6 +385,11 @@
      void RunGuiOnly();
      void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
      void EndFrame();
 +    // SOH_IOS (overlay 0031): stereoscopic eye passes (visionOS 3D).
 +    void Soh3DSetEye(int eye);
++    void Soh3DNoteBuildAspect();
 +    void Soh3DEndEyePass(int eye);
 +    int Soh3DGetEyeFb(int eye);
      void HandleWindowEvents();
      bool IsFrameReady();
      bool ViewportMatchesRendererResolution();
-@@ -533,6 +537,15 @@
+@@ -533,6 +538,18 @@
  
      int mGameFb{};             // game_framebuffer;
      int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
@@ -217,6 +500,9 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +    // published texture from its own queue with no cross-queue fence, so
 +    // the engine must never re-render the texture it last published.
 +    int mSoh3DEyeFb[2][2] = { { -1, -1 }, { -1, -1 } };
++    // rev15 (VR R2b, spec D7): the HUD plane's own framebuffer,
++    // double-buffered for the same reason the eyes are.
++    int mSoh3DHudFb[2] = { -1, -1 };
 +    int mSoh3DPing = 0;
 +    int mSoh3DSavedGameFb = -1;
 +    uint32_t mSoh3DSavedW = 0, mSoh3DSavedH = 0;
@@ -226,10 +512,12 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
      std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
 --- a/libultraship/src/fast/interpreter.cpp
 +++ b/libultraship/src/fast/interpreter.cpp
-@@ -1413,6 +1413,75 @@
+@@ -1430,8 +1430,241 @@
+     res[0] = a[0] * b[0][0] + a[1] * b[0][1] + a[2] * b[0][2];
+     res[1] = a[0] * b[1][0] + a[1] * b[1][1] + a[2] * b[1][2];
      res[2] = a[0] * b[2][0] + a[1] * b[2][1] + a[2] * b[2][2];
- }
- 
++}
++
 +#ifdef __IOS__
 +#include <CoreFoundation/CFBase.h>
 +// SOH_IOS (overlay 0031): stereoscopic eye state. The shell owns the mode
@@ -237,7 +525,7 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +// the mode simply never leaves 0). sSoh3DEye is set around each eye pass.
 +extern "C" {
 +extern volatile int gSoh3DMode;
-+extern void* volatile gSoh3DEyeTexture[2];
++extern void* volatile gSoh3DEyeTexture[3];
 +extern volatile int gSoh3DEyeFrames[2];
 +extern volatile int gSoh3DEyeW, gSoh3DEyeH;
 +extern volatile float gSoh3DCamDist, gSoh3DCamP00;
@@ -248,7 +536,45 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +extern volatile int gSoh3DInPlay;
 +extern volatile int gSoh3DDbg2DW, gSoh3DDbg2DH;
 +extern volatile int gSoh3DDbgCurW, gSoh3DDbgCurH;
++// VR mode (VR-spec D2, R0): when non-zero the shell publishes a
++// complete per-eye A.V.P matrix (row-vector, Fast3D order) each
++// compositor frame and the interpreter SUBSTITUTES it for the game's
++// combined view*projection instead of skewing it. Defined in
++// SohIosShell.m beside the gSoh3D family so iPhone links resolve.
++extern volatile int gSohVRMode;
++extern volatile int gSohVREyeVPValid;
++// rev13: DOUBLE-BUFFERED [slot][eye][16]. The shell writes the slot the
++// engine is not reading, then publishes gSohVRPoseSeq; the host-frame
++// branch latches that seq (and therefore the slot) ONCE per two-eye pair,
++// so the two eyes can never straddle two head poses.
++extern volatile float gSohVREyeVP[2][2][16];
++// rev18 (VR R7 verdict 8): the SKYBOX's own per-eye matrix, same slot and
++// same lifetime. Head ROTATION only, seated at the game camera, scaled to
++// effective infinity -- see the use site below for why the sky pulsated.
++extern volatile float gSohVRSkyVP[2][2][16];
++// rev19 (VR R11 verdict 1): the MODEL translation dropped for a skybox
++// draw, and the count of draws it was dropped from. `vr sky` prints them.
++extern volatile float gSohVRSkyMDrop[3];
++extern volatile unsigned int gSohVRSkyDrops;
++// rev19: the FINAL composed MVP of the last skybox draw, exactly as the
++// hardware got it. `vr sky` projects a canonical sphere vertex through it,
++// so the suite's claim is read off the shipped path rather than rebuilt.
++extern volatile float gSohVRSkyMP[16];
++extern volatile unsigned int gSohVRPoseSeq;
++extern volatile unsigned int gSohVREyeSeqDone;
++extern volatile int gSohVRFlatLatch;
++// Latched ONCE per host frame by the Fast3dWindow VR branch below (both
++// TUs need them, so they live in SohIosShell.m with the rest).
++extern volatile int gSohVRPairSlot;
++extern volatile int gSohVRPairFlat;
++// rev14 (trap D35): the tag stamped on both eyes of this pair.
++extern volatile unsigned int gSohVRPairTag;
++// rev15 (VR R2b, spec D7): the HUD plane's render extent, shell-owned.
++extern volatile int gSohVRHudW, gSohVRHudH;
 +}
++// rev15: 3 = the HUD pass. It renders the game's OWN matrices (mono,
++// screen-space texrects) into a dedicated framebuffer; the shell gives it
++// per-eye disparity by placing it as a plane at a real distance.
 +static int sSoh3DEye = 0;
 +static float sSoh3DSep = 3.0f;
 +static float sSoh3DConv = 300.0f;
@@ -257,6 +583,28 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +static float sSoh3DAimMix = 0.0f;   // 1 = aiming (slingshot/bow/look)
 +static int sSoh3DSkybox = 0;        // inside skybox draw (0033 sentinels)
 +static float sSoh3DP[4][4];
++// rev20 (VR R18 part B, D-071): THE ASPECT THE DISPLAY LIST WAS BUILT
++// WITH. AdjXForAspectRatio scales every screen-space texrect AND every
++// vertex's clip x by (4/3)/aspect, and it reads mCurDimensions -- the
++// dims of the pass BEING RENDERED. In VR with the HUD plane on, the
++// last StartFrame of a host frame is the HUD's (4:3, 1600x1200) and
++// dims are deliberately left there ('NO SetEye(0) here'), so the GAME
++// thread builds its display list while GetAspectRatio() reports 4:3 --
++// which is what OTRGetRectDimensionFromLeftEdge/RightEdge lay their
++// screen-space rects out against -- and then the EYE pass scales those
++// same rects by (4/3)/eye_aspect. That mismatch is the user's oval Lens of
++// Truth circle with clipped sides, and it hits every world-list
++// screen-space rect (Environment_FillScreen, Oceff_Storm, the z_room
++// fills) and every VERTEX in the eye pass alike -- the world itself is
++// stretched horizontally by the same factor, because in VR the whole
++// view*projection is REPLACED by the shell's exact per-eye frustum and
++// wants no aspect correction at all.
++// So the factor is taken against the aspect the DL was BUILT with,
++// sampled once per host frame by Soh3DNoteBuildAspect() before the first
++// eye pass changes dims. Restoring eye dims after the HUD pass instead
++// would move the pillarboxing onto the HUD; this touches no dims.
++static float sSoh3DBuildAspect = 0.0f;
++static float sSoh3DSkyM[4][4]; // rev19: the model matrix with no translation
 +// Off-axis stereo for OoT's COMBINED viewing*projection matrix (rev4).
 +// The camera axes cannot be derived from the combined matrix, so the game
 +// exports its basis (0032 v2). Camera shift: world translation by
@@ -267,11 +615,115 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +// (rev1-3 used world-X offsets + a w-column COMPONENT test: depth varied
 +// with camera heading, vertical parallax broke fusion, and stereo cut
 +// out entirely at some headings — all four device-round symptoms.)
++// rev19 (VR R11 verdict 1): A SKYBOX HAS NO POSITION.
++//
++// the user, on 1.0.1.14: "Sky still pulsates like crazy when I move." Two
++// seats have failed (R7 the game camera, R10 the head) and they failed for
++// the same reason: a skybox vertex lands in eye space at
++//
++//     S * R^T * ( R_sky * p_model  +  M_t  -  seat )
++//
++// and the sphere radius |p_model| = 126 units is multiplied by exactly the
++// same S. The 100x scale therefore divides NOTHING: the angular error is
++// |M_t - seat| / 126 radians whichever scale is used, and M_t (the game
++// camera, interpolated by Fast3D to the display rate) and any seat we can
++// compute are sampled by different clocks by construction. Ten units of
++// disagreement is 4.5 degrees of sky swim.
++//
++// So there is no translation anywhere on this path. The shell publishes a
++// sky pose whose translation is zero; this drops M's. What is left is
++// S * R^T * R_sky * p_model -- the sphere centred on the eye BY
++// CONSTRUCTION, immune to tick rate, to interpolation, to Link's motion
++// and to the wearer's. The dropped translation is published rather than
++// discarded so `vr sky` can show what it was.
++static void Soh3DSkyPublish(const float mp[4][4]) {
++    for (int sohI = 0; sohI < 4; sohI++) {
++        for (int sohJ = 0; sohJ < 4; sohJ++) {
++            gSohVRSkyMP[sohI * 4 + sohJ] = mp[sohI][sohJ];
++        }
++    }
+ }
+ 
++static void Soh3DSkyModel(float out[4][4], const float in[4][4]) {
++    memcpy(out, in, sizeof(sSoh3DSkyM));
++    gSohVRSkyMDrop[0] = in[3][0];
++    gSohVRSkyMDrop[1] = in[3][1];
++    gSohVRSkyMDrop[2] = in[3][2];
++    gSohVRSkyDrops = gSohVRSkyDrops + 1u;
++    out[3][0] = 0.0f;
++    out[3][1] = 0.0f;
++    out[3][2] = 0.0f;
++}
++
++// rev19: true when THIS draw is a skybox draw that the VR branch is about
++// to hand gSohVRSkyVP. Exactly the condition Soh3DStereoP uses to pick the
++// sky matrix, so the model side and the view side can never disagree.
++static int Soh3DSkyPath(void) {
++    return (sSoh3DSkybox != 0) && (sSoh3DEye != 0) && (sSoh3DEye != 3) && (gSohVRMode != 0) &&
++           (gSohVREyeVPValid != 0) && (gSohVRPairFlat == 0);
++}
++
 +static void Soh3DStereoP(float out[4][4], const float in[4][4]) {
 +    memcpy(out, in, sizeof(sSoh3DP));
++    if (sSoh3DEye == 3) {
++        return; // rev15: the HUD pass is mono by construction
++    }
 +    float sohWx = in[0][3], sohWy = in[1][3], sohWz = in[2][3];
 +    if (sohWx * sohWx + sohWy * sohWy + sohWz * sohWz < 0.25f) {
 +        return; // orthographic (HUD/2D): stays on the panel plane
++    }
++    // VR (VR-spec D2): a head-mounted eye is not a skew of the game's
++    // camera — the whole combined view*projection is REPLACED by the
++    // shell-composed A.V.P for this eye. Same seam, same perspective-only
++    // gate (ortho/HUD keeps the game's own matrix). Substitution, not
++    // mutation: `out` is already an idempotent copy of P.
++    if (gSohVRMode != 0) {
++        if (gSohVREyeVPValid == 0 || gSohVRPairFlat != 0) {
++            // No pose yet, or (spec D3) this frame's DL was built in a
++            // FLAT-SCREEN context and belongs on the panel: render the
++            // game's own view, mono, rather than smearing a menu across
++            // the world.
++            return;
++        }
++        // rev18 (VR R7 verdict 8). the user, 2026-09-04: "the sky outside in
++        // hyrule field violently pulsates as you're moving. and the depth is
++        // off.. it is relatively close when it should be the most distant
++        // texture."
++        //
++        // OoT's skybox is a +/-126-unit sphere CENTRED ON THE CAMERA, which
++        // at 35 units/m is a 3.6 m ball, and the game re-centres it once per
++        // 20 Hz game tick while this matrix is recomposed every compositor
++        // frame from the live head. Between ticks the head therefore
++        // translates INSIDE a stale 3.6 m sphere, and a 3.6 m sphere gives
++        // real parallax for a few centimetres of motion: the sky swims at
++        // the tick rate, worst while walking. Same radius, same reason it
++        // reads as near.
++        //
++        // Overlay 0033 already brackets the skybox display list with its
++        // sentinels and sSoh3DSkybox is exactly that bracket -- the 3D-panel
++        // path below has used it since R0 to make the skybox skew-only, i.e.
++        // zero disparity, i.e. infinity. This VR branch never consulted it:
++        // it substituted the composed A.V.P for EVERY perspective draw and
++        // the sentinel fell straight through.
++        //
++        // Now it picks. gSohVRSkyVP is composed by the shell from the same
++        // pose, in the same slot, under the same pair tag -- so a skybox
++        // draw and the world around it can never come from two head poses --
++        // but seated at the GAME camera with the head's rotation only and
++        // scaled out 100x. Position from the camera kills the pulsation at
++        // its source rather than damping it; rotation from the head keeps
++        // looking around working; the scale is for the DEPTH the compositor
++        // reprojects on, and both eyes get the same seat so the disparity is
++        // zero either way.
++        const volatile float* sohVRSrc = sSoh3DSkybox
++                                            ? gSohVRSkyVP[gSohVRPairSlot & 1][sSoh3DEye == 2 ? 1 : 0]
++                                            : gSohVREyeVP[gSohVRPairSlot & 1][sSoh3DEye == 2 ? 1 : 0];
++        for (int sohI = 0; sohI < 4; sohI++) {
++            for (int sohJ = 0; sohJ < 4; sohJ++) {
++                out[sohI][sohJ] = sohVRSrc[sohI * 4 + sohJ];
++            }
++        }
++        return;
 +    }
 +    const float e = (sSoh3DEye == 2 ? 1.0f : -1.0f) * 0.5f * sSoh3DSep * sSoh3DPauseMix;
 +    if (e == 0.0f) {
@@ -302,34 +754,67 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
  void Interpreter::MatrixMul(float res[4][4], const float a[4][4], const float b[4][4]) {
      float tmp[4][4];
      for (int i = 0; i < 4; i++) {
-@@ -1485,6 +1554,12 @@
+@@ -1504,6 +1737,19 @@
          }
          mRsp->lights_changed = 1;
      }
 +#ifdef __IOS__
 +    if (sSoh3DEye != 0) {
 +        Soh3DStereoP(sSoh3DP, mRsp->P_matrix);
-+        MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], sSoh3DP);
++        if (Soh3DSkyPath()) {
++            Soh3DSkyModel(sSoh3DSkyM, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
++            MatrixMul(mRsp->MP_matrix, sSoh3DSkyM, sSoh3DP);
++            Soh3DSkyPublish(mRsp->MP_matrix);
++        } else {
++            MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
++                      sSoh3DP);
++        }
 +    } else
 +#endif
      MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
  }
  
-@@ -1493,6 +1568,13 @@
+@@ -1512,6 +1758,20 @@
          if (mRsp->modelview_matrix_stack_size > 0) {
              --mRsp->modelview_matrix_stack_size;
              if (mRsp->modelview_matrix_stack_size > 0) {
 +#ifdef __IOS__
 +                if (sSoh3DEye != 0) {
 +                    Soh3DStereoP(sSoh3DP, mRsp->P_matrix);
-+                    MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
-+                              sSoh3DP);
++                    if (Soh3DSkyPath()) {
++                        Soh3DSkyModel(sSoh3DSkyM,
++                                      mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
++                        MatrixMul(mRsp->MP_matrix, sSoh3DSkyM, sSoh3DP);
++                        Soh3DSkyPublish(mRsp->MP_matrix);
++                    } else {
++                        MatrixMul(mRsp->MP_matrix,
++                                  mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], sSoh3DP);
++                    }
 +                } else
 +#endif
                  MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
                            mRsp->P_matrix);
              }
-@@ -3273,6 +3355,14 @@
+@@ -1527,6 +1787,18 @@
+         (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect)) {
+         return x;
+     } else {
++#ifdef __IOS__
++        // SOH_IOS (overlay 0031 rev20, VR R18 part B, D-071): THE ADJUSTMENT
++        // BELONGS TO THE ASPECT THE DL WAS BUILT WITH, NOT TO THE PASS BEING
++        // RENDERED. See sSoh3DBuildAspect above for the whole argument. In
++        // every configuration EXCEPT VR-with-the-HUD-plane the recorded
++        // aspect IS this pass's own (eye 1 and 2 share dims, and the HUD
++        // pass's dims are the ones the game read), so this branch is a
++        // provable no-op there and changes exactly one case.
++        if (sSoh3DEye != 0 && sSoh3DBuildAspect > 0.01f) {
++            return x * (4.0f / 3.0f) / sSoh3DBuildAspect;
++        }
++#endif
+         return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
+     }
+ }
+@@ -3292,6 +3564,14 @@
      const char* filename = (const char*)(cmd)->words.w1;
      uint32_t p = C0(16, 8);
      uint32_t l = C0(0, 16);
@@ -344,7 +829,7 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
      if (p == 7) {
          g_exec_stack.openDisp(filename, l);
      } else if (p == 8) {
-@@ -4989,6 +5079,20 @@
+@@ -5008,6 +5288,28 @@
          mRendersToFb = false;
      }
  
@@ -355,6 +840,14 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +    if (sSoh3DEye != 0) {
 +        uint32_t sohEw = gSoh3DEyeW > 0 ? (uint32_t)gSoh3DEyeW : 3840u;
 +        uint32_t sohEh = gSoh3DEyeH > 0 ? (uint32_t)gSoh3DEyeH : 2160u;
++        if (sSoh3DEye == 3) {
++            // rev15: the HUD plane has its own extent. It must stay 4:3 --
++            // AdjXForAspectRatio scales every texrect by (4/3)/aspect, so a
++            // HUD rendered at any other aspect is pre-distorted before the
++            // plane ever gets it.
++            sohEw = gSohVRHudW > 0 ? (uint32_t)gSohVRHudW : 1600u;
++            sohEh = gSohVRHudH > 0 ? (uint32_t)gSohVRHudH : 1200u;
++        }
 +        mRendersToFb = true;
 +        mCurDimensions.width = sohEw;
 +        mCurDimensions.height = sohEh;
@@ -365,7 +858,7 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
      mFbActive = false;
  }
  
-@@ -5042,6 +5146,18 @@
+@@ -5061,6 +5363,18 @@
  
      mCurMtxReplacements = &mtx_replacements;
  
@@ -384,7 +877,7 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
      mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                         false, true, true, !mRendersToFb);
      mRapi->StartFrame();
-@@ -5077,6 +5193,14 @@
+@@ -5096,6 +5410,14 @@
      mGfxFrameBuffer = 0;
      currentDir = std::stack<std::string>();
  
@@ -399,15 +892,37 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
      if (mRendersToFb) {
          mRapi->StartDrawToFramebuffer(0, 1);
          mRapi->ClearFramebuffer(true, true);
-@@ -5106,6 +5230,97 @@
+@@ -5123,8 +5445,147 @@
+     mWapi->SwapBuffersBegin();
+     mRapi->FinishRender();
      mWapi->SwapBuffersEnd();
- }
- 
++}
++
 +#ifdef __IOS__
++// SOH_IOS (overlay 0031 rev20, VR R18 part B): sample the aspect the GAME
++// thread built this frame's display list against. Called once per host
++// frame by the Fast3dWindow VR/3D branch BEFORE the first eye pass moves
++// mCurDimensions, which is exactly the value GetAspectRatio() was
++// returning while the DL was being built (dims are deliberately left at
++// the last pass's size between frames).
++void Interpreter::Soh3DNoteBuildAspect() {
++    if (mCurDimensions.height > 0) {
++        sSoh3DBuildAspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
++    }
++}
++
 +// SOH_IOS (overlay 0031): eye-pass control. SetEye(1|2) swaps mGameFb to the
 +// eye's framebuffer (created lazily) — every existing mGameFb consumer then
 +// targets it transparently; SetEye(0) restores 2D state.
 +void Interpreter::Soh3DSetEye(int eye) {
++    // rev16 (VR R4): the transparent-clear selection is a ONE-PASS
++    // property of the HUD framebuffer, not a sticky mode. rev15 set it
++    // on every SetEye(3) and never cleared it, so the id survived the
++    // HUD plane being switched off and every later pass that happened
++    // to target that framebuffer would have cleared to alpha 0.
++    if (eye != 3) {
++        mRapi->Soh3DSetFbClearAlphaZero(-1);
++    }
 +    if (eye == 0) {
 +        if (mSoh3DSavedGameFb >= 0) {
 +            mGameFb = mSoh3DSavedGameFb;
@@ -418,6 +933,26 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +            mCurDimensions.aspect_ratio = mSoh3DSavedAspect;
 +        }
 +        sSoh3DEye = 0;
++        return;
++    }
++    if (eye == 3) {
++        // rev15 (spec D7): the HUD pass. No ping-pong bump (the eyes own
++        // that once per host frame), no convergence recompute, and the 2D
++        // state is already saved by the eye passes that ran before it.
++        if (mSoh3DHudFb[0] < 0) {
++            for (int sohB = 0; sohB < 2; sohB++) {
++                mSoh3DHudFb[sohB] = mRapi->CreateFramebuffer();
++            }
++        }
++        if (sSoh3DEye == 0) {
++            mSoh3DSavedGameFb = mGameFb;
++            mSoh3DSavedW = mCurDimensions.width;
++            mSoh3DSavedH = mCurDimensions.height;
++            mSoh3DSavedAspect = mCurDimensions.aspect_ratio;
++        }
++        mRapi->Soh3DSetFbClearAlphaZero(mSoh3DHudFb[mSoh3DPing]);
++        mGameFb = mSoh3DHudFb[mSoh3DPing];
++        sSoh3DEye = 3;
 +        return;
 +    }
 +    if (mSoh3DEyeFb[0][0] < 0) {
@@ -474,9 +1009,12 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +}
 +
 +int Interpreter::Soh3DGetEyeFb(int eye) {
++    if (eye == 3) {
++        return mSoh3DHudFb[mSoh3DPing]; // rev15: the HUD plane
++    }
 +    return (eye >= 1 && eye <= 2) ? mSoh3DEyeFb[eye - 1][mSoh3DPing] : -1;
-+}
-+
+ }
+ 
 +void Interpreter::Soh3DEndEyePass(int eye) {
 +    // rev11 (fresh-eyes root cause): publish ON GPU COMPLETION, never at
 +    // commit — the compositor blit-copies the published texture from its
@@ -484,7 +1022,12 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +    // every pass EXCEPT the final one (which holds the ImGui overlay): game
 +    // visible, menu never. Device-only: the simulator serializes queues.
 +    if (eye >= 1 && eye <= 2 && mSoh3DEyeFb[eye - 1][mSoh3DPing] >= 0) {
-+        mRapi->Soh3DPublishOnComplete(mSoh3DEyeFb[eye - 1][mSoh3DPing], eye - 1);
++        mRapi->Soh3DPublishOnComplete(mSoh3DEyeFb[eye - 1][mSoh3DPing], eye - 1,
++                                      (unsigned int)gSohVRPairTag);
++    } else if (eye == 3 && mSoh3DHudFb[mSoh3DPing] >= 0) {
++        // rev15: slot 2 is the HUD plane, published through the same
++        // completion handler and carrying the same pair tag.
++        mRapi->Soh3DPublishOnComplete(mSoh3DHudFb[mSoh3DPing], 2, (unsigned int)gSohVRPairTag);
 +    }
 +    mRapi->EndFrameOffscreen();
 +    mRapi->FinishRender();
@@ -499,7 +1042,7 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
  }
 --- a/libultraship/src/fast/Fast3dWindow.cpp
 +++ b/libultraship/src/fast/Fast3dWindow.cpp
-@@ -193,6 +193,18 @@
+@@ -193,13 +193,183 @@
      return mWindowManagerApi->IsFrameReady();
  }
  
@@ -512,16 +1055,33 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +extern volatile int gSoh3DMode;
 +extern volatile int gSoh3DDbgMenuVis, gSoh3DDbgMenuBuilds, gSoh3DDbgMenuVtx;
 +extern volatile int gSoh3DMenuToggleReq;
++// rev13 (VR R1): the pose rendezvous (spec D2/D8) and the
++// flat-screen latch (spec D3).
++extern volatile int gSohVRMode;
++extern volatile unsigned int gSohVRPoseSeq;
++extern volatile unsigned int gSohVREyeSeqDone;
++extern volatile int gSohVRFlatLatch;
++extern volatile int gSohVRPairSlot;
++extern volatile int gSohVRPairFlat;
++extern volatile unsigned int gSohVRPairTag;
++// rev15 (VR R2b, spec D7): the HUD plane. gSohVROverlayDL is the
++// overlay display list overlay 0043 hands over in VR gameplay.
++extern volatile int gSohVRHudPlane;
++extern void* volatile gSohVROverlayDL;
++extern volatile int gSohVRHudFrames;
++// rev17 (VR R6): the HUD-DL race counter. See the use site.
++extern volatile int gSohVRHudDLRaces;
 +}
 +#endif
 +
  bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
      std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
  
-@@ -201,6 +213,67 @@
+     // Skip dropped frames
+     if (!wnd->IsFrameReady()) {
          return false;
-     }
- 
++    }
++
 +#ifdef __IOS__
 +    // SOH_IOS (overlay 0031): in 3D, render BOTH eyes each host frame (same
 +    // game time — alternating halves each eye's rate and judders), entirely
@@ -530,6 +1090,11 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +    static bool sohWas3D = false;
 +    if (gSoh3DMode != 0) {
 +        sohWas3D = true;
++        // rev20 (VR R18 part B, D-071): the aspect the GAME built THIS
++        // frame's display list against, sampled before any eye pass
++        // moves mCurDimensions. AdjXForAspectRatio uses it instead of
++        // the rendering pass's own dims -- see interpreter.cpp.
++        mInterpreter->Soh3DNoteBuildAspect();
 +        // SoH menu in 3D (0034): build the ImGui frame ONCE per host frame
 +        // (primed against an eye framebuffer — the screen backend NewFrame
 +        // would acquire the hidden window's drawable), composite the same
@@ -541,6 +1106,23 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +        if (gSoh3DMenuToggleReq != 0 && sohGui != nullptr && sohGui->GetMenu() != nullptr) {
 +            gSoh3DMenuToggleReq = 0;
 +            sohGui->GetMenu()->ToggleVisibility();
++        }
++        // rev13 (VR R1): latch the pose slot and the flat-screen
++        // predicate ONCE for the whole two-eye pair. Latching per eye
++        // would let the two eyes straddle two head poses (diplopia) or
++        // two modes (half the frame on the panel, half in the world).
++        unsigned int sohVRPairSeq = 0;
++        if (gSohVRMode != 0) {
++            sohVRPairSeq = gSohVRPoseSeq;
++            gSohVRPairSlot = (int)(sohVRPairSeq & 1u);
++            gSohVRPairFlat = gSohVRFlatLatch;
++            // rev14 (trap D35): the SAME seq is stamped on both eye
++            // textures of this pair, so the compositor can refuse a
++            // pair whose two eyes came from different host frames.
++            gSohVRPairTag = sohVRPairSeq;
++        } else {
++            gSohVRPairFlat = 0;
++            gSohVRPairTag = 0;
 +        }
 +        void* sohMenuData = nullptr;
 +        int sohPrimeFb = mInterpreter->Soh3DGetEyeFb(1);
@@ -565,8 +1147,67 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +            }
 +            mInterpreter->Soh3DEndEyePass(sohEye);
 +        }
++        // rev15 (spec D7 / VR-DONOR-MAP 6): THE HUD PLANE. OoT's
++        // interface is TEXRECT output -- screen-space vertices that never
++        // touch MP_matrix -- so it lands at IDENTICAL PIXEL POSITIONS in
++        // both eyes, and under the device's asymmetric frusta identical
++        // pixels are not the same direction: it doubles and drifts to the
++        // edges (the user, 1.0.1.2). Overlay 0043 unchains the overlay DL in
++        // VR gameplay; here it gets its own pass into its own framebuffer,
++        // which the shell places as a FLAT PLANE at a real distance and
++        // draws with each eye's own projection -- true disparity, so it
++        // fuses. Flat plane, never floating 3D text (the sm64 diplopia
++        // lesson, spec D7).
++        // Once per host frame, not once per eye: the pixels are the same
++        // for both eyes by construction, and the whole point is that only
++        // their PLACEMENT differs.
++        // rev16 (VR R4): the gate is the POINTER, not a re-read of
++        // the latch. graph.c (overlay 0043) decided at DL-BUILD time
++        // on the live gSohVRFlatLatch and ENCODED that decision by
++        // unchaining the overlay buffer and publishing it here; the
++        // render-time gSohVRPairFlat is a SECOND sample of the same
++        // predicate, and on any frame where the two disagree (entry,
++        // exit, the pause menu opening between the tick and the
++        // render) the unchained interface display list was dropped
++        // ENTIRELY -- no HUD in the world and none on the panel.
++        //
++        // rev17 (VR R6): SAMPLED ONCE, and the local is what runs.
++        // gSohVROverlayDL is written by the GAME thread (0043, at DL
++        // build) and was ALSO written by the compositor loop thread on
++        // its way out of VR, so the gate below tested one load of a
++        // volatile and the call re-loaded it -- with Soh3DSetEye and a
++        // whole StartFrame in between. Losing that race hands the
++        // interpreter a NULL display list and it faults on the first
++        // word of the first command: this is R5's rapid enter/exit
++        // SIGSEGV at address 0 in Fast::Interpreter::Run, caught in the
++        // debugger with this exact return address. The cause is fixed
++        // on the shell side (the loop thread no longer writes a
++        // variable the game thread owns); this local is the second
++        // half of the same fix, because a decision taken on one sample
++        // must be ACTED ON with that sample. Running the sampled
++        // pointer is always safe: it is a buffer out of the frame's own
++        // graph pool, which nothing frees underneath us.
++        // gSohVRHudDLRaces counts the disagreements so the claim stays
++        // measurable rather than argued -- it must be 0 in `vr room`.
++        Gfx* sohHudDL = (Gfx*)gSohVROverlayDL;
++        if (gSohVRMode != 0 && gSohVRHudPlane != 0 && sohHudDL != nullptr) {
++            mInterpreter->Soh3DSetEye(3);
++            mInterpreter->StartFrame();
++            if ((Gfx*)gSohVROverlayDL != sohHudDL) {
++                gSohVRHudDLRaces = gSohVRHudDLRaces + 1;
++            }
++            mInterpreter->Run(sohHudDL, mtxReplacements);
++            mInterpreter->Soh3DEndEyePass(3);
++            gSohVRHudFrames = gSohVRHudFrames + 1;
++        }
 +        if (sohMenuData != nullptr) {
 +            sohGui->Soh3DFinishMenuFrame();
++        }
++        if (gSohVRMode != 0) {
++            // The rendezvous signal: BOTH eyes are now rendered from
++            // pose sohVRPairSeq. The compositor loop waits on this with
++            // a bounded timeout before it presents.
++            gSohVREyeSeqDone = sohVRPairSeq;
 +        }
 +        // NO SetEye(0) here: resetting per frame flaps mCurDimensions
 +        // between eye and 2D sizes, and the interpreter's dims-changed
@@ -576,13 +1217,12 @@ iPhone links resolve (mode simply stays 0 there); macOS compiles none of it.
 +        mWindowManagerApi->SwapBuffersBegin();
 +        mWindowManagerApi->SwapBuffersEnd();
 +        return true;
-+    }
+     }
 +    if (sohWas3D) {
 +        sohWas3D = false;
 +        mInterpreter->Soh3DSetEye(0); // restore saved 2D state ONCE
 +    }
 +#endif
-+
+ 
      auto gui = wnd->GetGui();
      // Setup mouse state manager
-     wnd->GetMouseStateManager()->StartFrame();

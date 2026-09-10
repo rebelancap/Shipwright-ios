@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/spikes/soh-vision-sim-build"
 PREFIX="$ROOT/work/vision-sim-deps/prefix"
-SOH_O2R="$ROOT/oracle/build-cmake/soh/soh.o2r"
+SOH_O2R="${SOH_O2R:-$ROOT/oracle/build-cmake/soh/soh.o2r}"
 
 [[ -d "$ROOT/vendor/Shipwright/.git" ]] || "$ROOT/scripts/bootstrap.sh"
 "$ROOT/scripts/apply-overlay.sh"

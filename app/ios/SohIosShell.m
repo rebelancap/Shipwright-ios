@@ -9,8 +9,10 @@
 // rotated (a cosmetic simulator quirk); `xcrun simctl io <udid> screenshot`
 // captures the true landscape framebuffer and is the verification source.
 #import <GameController/GameController.h>
+#include <dlfcn.h> // R17 part B: dladdr, to name a terminating C++ exception
 #import <AVFAudio/AVFAudio.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
 UIView* SohIos_FindMetalViewIn(UIView* v);
 UIView* SohIos_FindMetalView(UIWindow* w);
 void SohIos_GlueWindowToScene(UIWindow* w, UIWindowScene* scene);
@@ -18,6 +20,9 @@ void SohIos_ForceViewChainAdopt(void);
 static UIWindow* SohIos_GameWindowWithMetal(UIView** outMv);
 #if TARGET_OS_VISION
 extern volatile float gSohIosVisionLongEdge;
+// R10 verdict 5: the Sense pair's flat-mode pump reads through this. Only the
+// visionOS target compiles SohSense.m.
+#import "SohSense.h"
 #endif
 // Written by gfx_metal's command-buffer completed handler (overlay 0028).
 volatile float gSohIosGpuMs = 0;
@@ -30,7 +35,8 @@ static volatile float gSohIosDrawableW = 0, gSohIosDrawableH = 0, gSohIosContent
 // resolve; on iPhone the mode simply never leaves 0. The host VC (visionOS
 // target only) flips the mode; the LUS eye passes publish the textures.
 volatile int gSoh3DMode = 0;
-void* volatile gSoh3DEyeTexture[2] = { NULL, NULL };
+// R2b: slot 2 is the HUD plane (spec D7) — see gSoh3DEyeDepthTexture.
+void* volatile gSoh3DEyeTexture[3] = { NULL, NULL, NULL };
 volatile int gSoh3DEyeFrames[2] = { 0, 0 };
 volatile int gSoh3DEyeW = 0, gSoh3DEyeH = 0; // 0 = engine default (3840x2160)
 volatile float gSoh3DCamDist = 0;            // 0032: camera-to-focus, per frame
@@ -47,6 +53,1173 @@ volatile int gSoh3DDbgMenuVtx = 0, gSoh3DDbgMenuDraws = 0;  // draw-data + guard
 volatile int gSohAudioAnchorStatus = 0;              // spatial anchor: 1 ok / 2 threw
 volatile int gSoh3DDbg2DW = 0, gSoh3DDbg2DH = 0;     // engine 2D dims (fill bug)
 volatile int gSoh3DDbgCurW = 0, gSoh3DDbgCurH = 0;   // interpreter mCurDimensions (crop diag)
+
+// VR-spec D1/D2 (round R0): VR mode state. Defined HERE for the same reason
+// as the gSoh3D family above — SohIosShell.m is compiled on iPhone too, so the
+// Fast3D overlay's strong externs always resolve and the mode simply never
+// leaves 0 there. gSohVREyeVP holds the shell-composed per-eye A.V.P matrix in
+// Fast3D's ROW-VECTOR order (row i, col j at [i*4+j]); overlay 0031 rev12
+// substitutes it for the game's combined view*projection at the MP sites.
+volatile int gSohVRMode = 0;
+volatile int gSohVREyeVPValid = 0;
+// R1: DOUBLE-BUFFERED [slot][eye][16]. The compositor thread writes the slot
+// the engine is not reading and only then publishes gSohVRPoseSeq; the engine
+// latches that seq (and therefore the slot) ONCE per two-eye pair. Without the
+// double buffer a live pose tears across the two interpreter walks.
+volatile float gSohVREyeVP[2][2][16] = { { { 0 } }, { { 0 } } };
+// R19 part B: the per-eye TANGENTS of the compositor's own frustum, in the
+// order L, R, B, T, exactly as sohvr_contract carries them. The game side needs
+// them for one reason: a HEAD-LOCKED WORLD QUAD (overlay 0055 rev2's lens mask)
+// has to know how wide the eye's field actually is to reproduce vanilla's
+// proportion of it, and NDC (0,0) is not the gaze axis on this device -- the
+// frusta are asymmetric (measured: tanL -1.7321, tanR 1.0 on the left eye), so
+// a screen-space rect centred on the field is off-axis in opposite directions
+// per eye. That is exactly why the user saw TWO circles. Not double-buffered: it
+// is a property of the display, and it changes only when the compositor hands
+// us a different view (which sohvr_contract's tan_changes counter already
+// watches).
+volatile float gSohVREyeTan[2][4] = { { -1.0f, 1.0f, -1.0f, 1.0f }, { -1.0f, 1.0f, -1.0f, 1.0f } };
+volatile unsigned int gSohVRPoseSeq = 0;   // shell -> engine: pose generation
+volatile unsigned int gSohVREyeSeqDone = 0; // engine -> shell: pair rendered
+volatile int gSohVRPairSlot = 0;            // latched by 0031 for the pair
+volatile int gSohVRPairFlat = 0;            // latched by 0031 for the pair
+// R2a (trap D35): the tag the engine stamps on BOTH eye textures of a pair, so
+// the compositor can tell a coherent stereo frame from two eyes rendered for
+// two different head poses. Latched with the slot by 0031 rev14 and carried
+// into each eye's GPU completion handler.
+volatile unsigned int gSohVRPairTag = 0;
+volatile unsigned int gSoh3DEyeTag[3] = { 0, 0, 0 };
+// R2a: how VR treats a pre-rendered (image-backed) room. 0 panel / 1 flat /
+// 2 3d — see SohImmersive.h. Read by overlay 0039 rev2 (the flat-screen latch)
+// and overlay 0040 rev2 (the 3DSceneRender enhancement gate). Defined here for
+// the same reason as the rest of the family: SohIosShell.m is compiled on
+// iPhone too, so the overlay's strong externs always resolve and the mode
+// simply never leaves 0 there.
+volatile int gSohVRRoomMode = 0;
+volatile int gSohVRRoomImage = 0; // diagnostics: the live room-shape test
+// R16 part B: the OTHER arm of the same latch — a fixed-camera region of a town
+// scene (overlay 0039 rev9). Published beside the room test so `vr room` says
+// which arm made the frame a panel; debounced on the game side.
+volatile int gSohVRRoomFixedCam = 0;
+
+// VR camera unification (spec D5, overlay 0037). The engine exports the
+// GAME camera's own basis (Anchor*) BEFORE it overwrites the view; the shell
+// seats VR's A matrix on that and pushes the composed head pose back through
+// Cam*. Anchoring on the written-back view instead would chase our own HMD
+// offset in a feedback loop — the donor records the same trap.
+volatile int gSohVRAnchorValid = 0;
+volatile float gSohVRAnchorEye[3] = { 0, 0, 0 };
+volatile float gSohVRAnchorFwd[3] = { 0, 0, -1 };
+volatile int gSohVRCamValid = 0;
+volatile float gSohVRCamEye[3] = { 0, 0, 0 };
+volatile float gSohVRCamFwd[3] = { 0, 0, -1 };
+volatile float gSohVRCamUp[3] = { 0, 1, 0 };
+volatile float gSohVRCamFovy = 100.0f;
+
+// Flat-screen context (spec D3, overlay 0039): latched at the tick boundary
+// before the DL is built; gSohVRFlatRaw is the live value, diagnostics only.
+volatile int gSohVRFlatLatch = 0;
+volatile int gSohVRFlatRaw = 0;
+
+// Sim-rate correctness (spec D8, overlay 0040): the MEASURED headset
+// refresh, which GetInterpolationFPS() divides by OoT's native 20 Hz.
+volatile int gSohVRRefreshHz = 0;
+
+// R1 depth handoff (spec D2 / D-044): the eye framebuffer's depth texture,
+// published beside its colour texture by 0031 rev13.
+// R2b: THREE slots — 0 and 1 are the eyes, 2 is the HUD plane (spec D7),
+// published through exactly the same GPU-completion machinery so it can never
+// be sampled mid-frame either.
+void* volatile gSoh3DEyeDepthTexture[3] = { NULL, NULL, NULL };
+
+// --- VR R2b -------------------------------------------------------------------
+// FIRST PERSON (spec D4, overlay 0041). The anchor is a GAME quantity —
+// actor root plus eye height, sampled at the tick boundary — so the engine
+// publishes it and the shell seats VR's A matrix on it. gSohVRFpActive is the
+// authority the steering table (overlay 0042) and the limb cull read; it is
+// raised only inside VR, only in a non-flat frame, and only when the far-camera
+// guard has not withdrawn the anchor.
+volatile int gSohVRFpActive = 0;
+volatile int gSohVRFpFar = 0;      // the 1200-unit director's-camera fallback
+volatile int gSohVRFpEntered = 0;  // rising-edge counter: recenter on entry
+// R16 part B: first person coming BACK after this block suspended it (the flat
+// latch — a pause, a panel room — or the far-camera fallback). Counted apart
+// from a genuine entry because rev1 counted them together, and the shell zeroed
+// the artificial yaw on that counter: every unpause turned the wearer to face
+// the game's -Z. Neither counter touches the yaw now.
+volatile int gSohVRFpResumed = 0;
+volatile float gSohVRFpAnchor[3] = { 0, 0, 0 };
+volatile float gSohVRFpEyeHeight = 0.0f; // STANDING height, for world-scale work
+volatile int gSohVRFpBodyYaw = 0;        // Link's shape.rot.y, binang
+// Donor-tuned constants, live so the headset can sweep them without a build.
+volatile float gSohVRHeadHeightOffset = -9.0f; // donor gVrHeadHeightOffset
+volatile float gSohVRHeadOffsetFwd = 6.0f;     // donor gVrHeadOffsetForward
+volatile float gSohVRFpFallbackDist = 1200.0f; // donor gVrFpFallbackDist
+
+// STEERING (spec D6, overlay 0042): the head yaw as a GAME binang, published
+// by the shell as atan2(fwd.x, fwd.z) of the horizontally-projected head
+// forward. Game yaw 0 faces +Z and movement is sin->x cos->z, so this IS the
+// game convention with no conversion — the donor records an Euler extraction
+// with fudge constants that skewed steering ~15 degrees when pitched.
+volatile int gSohVRHeadingValid = 0;
+volatile int gSohVRHeadingYaw = 0;
+
+// --- VR R3 --------------------------------------------------------------------
+// TURNING (spec D6, DONOR-MAP §4c). R2b ran a snap-turn edge detector on the
+// GAME thread and handed the shell a request counter; that second latch over the
+// same pad snapshot is what wedged the user's controller on 1.0.1.3, and a 20 Hz
+// tick has no honest dt for smooth turning anyway. R3: overlay 0041 rev2
+// publishes the right stick as a LEVEL and the shell owns the one edge detector
+// and the one integrator, on the loop thread, pivoting on the LIVE head.
+volatile float gSohVRTurnAxis = 0.0f;
+
+// BODY + DIRECT MOVEMENT (spec D4, overlay 0042 rev2, DONOR-MAP §3 "Link's
+// body" + §4b). Donor defaults, verbatim: gVrHideBody 1 (every limb except the
+// hands is hidden — a full body in first person "mostly reads as wrong", and
+// looking down or behind you shows the inside of a torso), gVrBodyFollowsHead 1
+// (Link's body faces where you look, so you can never see your own back), and
+// gVrLegaiaLockOn 0 (lock-on framing rotates the player's view for them: the
+// classic sickness trigger, so it ships off — spec scope, DONOR-MAP §4d).
+volatile int gSohVRHideBody = 1;
+volatile int gSohVRBodyFollowsHead = 1;
+/* R8 item 9: gSohVRLockOn is GONE. "Turn the world toward a Z-target" was
+ * Legaiaflame's lock-on FRAMING -- the comfort option that rotates the player's
+ * view for them -- and R7 verdict 5 already showed what it cost: the facing
+ * pin's correctness exclusion had been gated on it, so vanilla Z-targeting
+ * could not strafe, hop or flip while it shipped off. the user's R8 ruling is to
+ * remove the option outright rather than keep a setting nobody should turn on.
+ * Player_VrZTargetActive -- vanilla's own lock-on, which owes nothing to any
+ * CVar -- is untouched and is what the strafe/hop/backflip all ride. */
+
+/* R8 item 8: THE FORWARD ROLL, published beside gSohVRHopKind. The backflip
+ * camera follows an authored somersault BACKWARD; Link's forward roll
+ * (Player_Action_Roll) is the same move in the opposite sense and the user asked
+ * for the camera to follow it too. Two values because the camera needs both
+ * halves: whether the roll is running, and how long the roll's own animation
+ * says it lasts, so the view's revolution ends when the roll does instead of
+ * on a constant somebody guessed. gSohVRRollSeconds is written once, at
+ * Player_SetupRoll, from the animation's real end frame and play speed. */
+volatile int gSohVRRollActive = 0;
+volatile float gSohVRRollSeconds = 0.0f;
+// Diagnostics for `vr fp`: proof on device that the facing pin and the
+// kinematic override actually ran, rather than inferring it from feel.
+volatile int gSohVRPinnedYaw = 0;
+volatile int gSohVRDirectTicks = 0;
+volatile int gSohVRKinematicTicks = 0;
+// The pad the GAME sees this tick, and the C bits the right stick had set
+// (overlay 0039 rev3). A turn that leaves pad_c_masked non-zero while pad_cur's
+// C bits stay clear is the 1.0.1.3 wedge, asserted rather than felt.
+volatile int gSohVRPadCur = 0;
+volatile int gSohVRPadCMasked = 0;
+
+// AUDIO LIVENESS (overlay 0044, VR R3). 1.0.1.3 shipped silent on the Vision
+// Pro with no crash and no log line, and nothing in the round's diff touched
+// audio: SoH's producer guard skips whenever the backend queue is full, and a
+// device that has STOPPED DRAINING is indistinguishable from a full queue. These
+// counters are what `vr audio` reads, so the next session proves audio in one
+// line instead of listening for it. beats = the audio thread ran at all.
+volatile unsigned long long gSohAudioBeats = 0;
+volatile unsigned long long gSohAudioProduced = 0;
+volatile unsigned long long gSohAudioSkipped = 0;
+volatile unsigned long long gSohAudioQueueFails = 0;
+volatile unsigned long long gSohAudioQueueBytes = 0;
+volatile unsigned long long gSohAudioRecoveries = 0;
+volatile int gSohAudioBuffered = 0;
+volatile int gSohAudioDesired = 0;
+
+// --- R14: THE SILENT LAUNCH ------------------------------------------------
+//
+// the user, on 1.0.1.17: "Sometimes I launch and there's no audio. I have to
+// force quit and then there's audio. Not often, every once in a while."
+//
+// 0044's watchdog cannot see this failure, and the reason is arithmetic. It
+// fires when the queue STOPS FALLING -- samples_left + 1584 > 2480, i.e. more
+// than ~896 frames sitting in the backend for a whole second. If the device
+// never OPENED (SDL_OpenAudioDevice failed, which on this platform means
+// AVAudioSession activation failed), SDL_GetQueuedAudioSize(0) returns 0
+// forever: samples_left is pinned at ZERO, the stall counter resets on every
+// tick, produce_and_play runs at full rate, and every SDL_QueueAudio call fails
+// into a device id of 0. Perfectly silent, perfectly invisible to a watchdog
+// that only knows how to recognise a FULL queue -- and cured by a relaunch,
+// because the next activation usually succeeds. That is the user's sentence, in
+// full.
+//
+// A second latch made it worse than transient: Audio::InitAudioPlayer responds
+// to a failed Init() by calling SetCurrentAudioBackend(NUL), which WRITES
+// "null" into the config and saves it. One unlucky activation could therefore
+// make an install permanently silent. Overlay 0053 stops that on iOS.
+//
+// So R14 adds the three things 0044 has no way to do:
+//   * the session is PREPARED (category/mode/active) before SDL is allowed to
+//     open a device, and the open is retried rather than accepted;
+//   * a LAUNCH WATCHDOG that measures the only thing that actually proves
+//     audio is leaving the process -- bytes accepted by the device -- and
+//     reopens the device when none have been for ~3 s after the first frame;
+//   * every one of those events is COUNTED and written into vr-mem.log, so a
+//     later pull says whether it fired instead of the user having to notice.
+volatile int gSohAudioDeviceId = 0;         // SDL_AudioDeviceID, 0 = not open
+volatile int gSohAudioBackend = -1;         // Ship::AudioBackend as published by 0053
+volatile unsigned long long gSohAudioOpenTries = 0;
+volatile unsigned long long gSohAudioOpenFails = 0;
+volatile unsigned long long gSohAudioReopens = 0;      // full close+open cycles
+volatile unsigned long long gSohAudioThreadFaults = 0; // exceptions caught in OTRAudio_Thread
+volatile unsigned long long gSohAudioSessionFails = 0; // AVAudioSession activation failures
+volatile int gSohAudioReopenReq = 0;        // serviced by the audio thread
+volatile int gSohAudioWatchdogRestarts = 0;
+volatile int gSohAudioWatchdogState = 0;    // 0 waiting, 1 healthy, 2 unhealthy, 3 gave up
+
+// --- R17 part B: THE WATCHDOG'S OWN FALSE POSITIVE, AND THE FAULT IT MISSED --
+//
+// vr-mem.log, 1.0.1.21, FOUR launches out of four:
+//
+//   90995.969 AUDIO watchdog restarted the device directly (audio thread not
+//             beating) dev=2 beats=586 bytes=441280 fails=0 reopens=0 restarts=1
+//   90996.705 AUDIO device reopened dev=2 beats=587 bytes=441280 fails=141292
+//             reopens=1 restarts=1
+//
+// The heartbeat above it is t=90991.955, so that is t+4.01 s into EVERY launch,
+// with the device OPEN (dev=2), no queue call ever having failed (fails=0), and
+// the audio thread beating again 0.7 s later (586 -> 587). It is a pure false
+// positive, and its cause is one line of R14's own: `lastBeats` was sampled
+// immediately before the loop read `beats`, so the first iteration compared a
+// value with itself and `deadThread` was unconditionally true. The consequence
+// is not cosmetic: the direct call closes and reopens the device from the
+// WATCHDOG thread while OTRAudio_Thread is inside SDL_QueueAudio -- the exact
+// race the request path exists to prevent -- 0.25 s before the mode=vr flip
+// races AVAudioSession against the spatial re-anchor. 141,292 queue failures
+// (19,700 spdlog lines in 80 ms) is what that reopen produced.
+//
+// So R17 part B: the window comes FIRST, a dead thread must be dead across TWO
+// consecutive windows with the failure counter unchanged, the beat count is
+// re-read immediately before any direct call, a restart is deferred while an
+// immersive transition is in flight, and the fault nobody was testing for --
+// a queue pinned FULL while the recovery fires to no effect -- is named.
+volatile int gSohAudioSaturations = 0;   // "unit not draining" episodes acted on
+volatile int gSohAudioWatchdogSkips = 0; // decisions deferred (transition in flight)
+// 1 while a visionOS immersive space is opening or dismissing. Set by Swift
+// around openImmersiveSpace/dismissImmersiveSpace; the audio watchdog refuses to
+// close a device inside that window because the session is being re-anchored.
+volatile int gSohVRTransition = 0;
+// R17 part B item 2: the VR entry watchdog's counters, printed by `vr room`.
+volatile int gSohVREntryStalls = 0;
+volatile int gSohVREntryHeals = 0;
+
+// HUD PLANE (spec D7, overlays 0043 + 0031 rev15). gSohVROverlayDL is the
+// overlay display list the game hands over in VR gameplay; gSohVRHudPlane is
+// the shell's A/B (0 puts the HUD back on the world list, i.e. 1.0.1.2's
+// doubled behaviour, which is the red control for the fix).
+volatile int gSohVRHudPlane = 1;
+void* volatile gSohVROverlayDL = NULL;
+volatile int gSohVRHudW = 1600, gSohVRHudH = 1200; // 4:3 — see 0031 rev15
+volatile int gSohVRHudFrames = 0;
+// R7 verdict 9: the live scene id, published by overlay 0039's per-tick block
+// so the crash record and the heartbeat can say WHERE the app was. -1 until the
+// first gameplay tick (title screen, file select, or a non-VR build).
+volatile int gSohVRSceneNum = -1;
+// R7 verdict 8: the skybox's per-eye A.V.P -- head ROTATION only, seated at the
+// game camera, scaled out to effective infinity. See SohImmersive.m's
+// composition site for why the sky pulsated without it.
+// R11 verdict 1: the sky pose's translation is now ZERO (see SohImmersive.m).
+volatile float gSohVRSkyVP[2][2][16];
+// R11 verdict 1: the MODEL translation overlay 0031 drops for a skybox draw --
+// `play->view.eye` as Fast3D interpolated it for THIS host frame -- and how many
+// skybox draws it has dropped it from. Published so `vr sky` can print the
+// residual the construction refuses to carry instead of arguing about it.
+volatile float gSohVRSkyMDrop[3] = { 0.0f, 0.0f, 0.0f };
+volatile unsigned int gSohVRSkyDrops = 0;
+volatile float gSohVRSkyMP[16];
+// R8 part B: THE RIGHT-GRIP C-CHORD IS RETIRED. R7 made the right stick the
+// C-pad while the right grip was held, because on a Sense pair the C items had
+// nothing else to live on. The item wheel now owns that grip and covers them
+// properly, and the user's ruling on the stick is flat: "we still have the right
+// joystick sometimes acting like c buttons" -- it turns, and does nothing else.
+// The global stays defined at a constant 0 so the dump keeps its shape and any
+// stale reader sees "no chord" rather than a link error.
+volatile int gSohVRGripChord = 0;
+// R7 verdict 4: how many times overlay 0042 rev5 refused the authored attack
+// state machine because motion combat covers the weapon, the live button-stab
+// window in game ticks, and how many stabs have been asked for.
+volatile int gSohVRAuthoredSuppressed = 0;
+volatile int gSohVRStabTicks = 0;
+volatile int gSohVRStabs = 0;
+// R8 part B: the Z-TARGET OVERHEAD CHOP -- A while Z-targeting, which rev5's
+// withdrawal of func_8083BB20 retired along with every other authored attack.
+// Same shape as the stab: overlay 0042 rev7 opens a window and counts it down,
+// the shell drives the pose envelope off the counter, overlay 0048 rev4 damages
+// through it at the jump-slash tier.
+volatile int gSohVRChopTicks = 0;
+volatile int gSohVRChops = 0;
+// R19 item 1: THE MEGATON HAMMER'S CHOP. the user, wearing 1.0.1.23: "The Megaton
+// hammer works with either trigger and I see the wind/swish animation, but the
+// hammer doesn't do the hitting-the-ground swing animation. It stays in my arm,
+// upright."
+//
+// Same shape as the stab and the chop above, and for the same reason: R18 gave
+// the hammer back vanilla's AUTHORED swing, and an authored swing moves the ARM
+// while the arm in VR is the controller (overlay 0042's limb pin), so the mesh
+// never went anywhere. Overlay 0042 rev20 bumps this once per hammer swing
+// STARTED, at func_80837948 -- the game's one melee-animation site, which both
+// the trigger path and the hand-swing path pass through -- and the shell drives
+// its own hammer envelope off it.
+//
+// gSohVRHammerHits counts vanilla's ground hit (func_80842A28: the quake, the
+// rumble, NA_SE_IT_HAMMER_HIT) and nothing about that effect is reimplemented:
+// vanilla builds the collider quad and the ground line test through the L_HAND
+// limb matrix, which in VR is the controller, so both follow the envelope for
+// free. The two counters rising TOGETHER is the whole claim.
+volatile int gSohVRHammers = 0;
+volatile int gSohVRHammerHits = 0;
+// R20 item 1c: GAME UNITS the hammer's ground line test is extended BEYOND the
+// tip, in VR with motion hands and holding the hammer, and nowhere else.
+//
+// R19 dropped the grip 40 cm through the strike so the head reached the floor.
+// R20 takes that back to zero -- the user: "like you're holding it, only the
+// hammer end swings down" -- and the head therefore finishes wherever the
+// wearer's hand is, which at a comfortable waist-height chop is 20-40 cm above
+// the ground. Vanilla's func_80842DF4 line-tests from 10 units behind the
+// weapon's BASE to its TIP and no further, so that chop would swing through
+// nothing and no quake, rumble or shockwave would fire. 15 units is 0.44 m at
+// the shipped world scale (34 units/m). `vr set hammerprobe 0..40`; 0 restores
+// vanilla's reach exactly.
+volatile float gSohVRHammerProbe = 15.0f;
+// R8 part B: 1 while Link is in the shield stance (vanilla's own flag, or R
+// held with a shield the physical-shield predicate says is on the arm). The
+// shell lowers the EYE by a fraction of standing eye height while it is set --
+// "you are crouching as well, so the perspective should go down a little".
+volatile int gSohVRCrouch = 0;
+// --- R9 part B -------------------------------------------------------------
+// How many ticks the VR shield stance refused to let the kinematic override
+// move Link. the user, on 1.0.1.12: "the left grip shield crouch lowers your
+// height but now you can move around, which you're not supposed to."
+volatile int gSohVRShieldStops = 0;
+// The harness override for the stance predicate: -1 follows the game, 0/1 force.
+// Owning a shield, having it on the arm and standing somewhere it can be raised
+// are all things a simulator cannot promise; "he stops walking, and only then"
+// is a property of the code regardless.
+volatile int gSohVRShieldStanceForce = -1;
+// How many times overlay 0042 rev8 went through vanilla's own meleeWeaponState
+// setter (func_80833A20) rather than writing the field -- i.e. how many swing
+// sounds and yells were played. Audio is not observable in the simulator; the
+// SETTER PATH is, and that is what the suite asserts.
+volatile int gSohVRSwingSfx = 0;
+// How many times VANILLA's Z-target jump slash ran under motion combat.
+//
+// R9 part B REFUSED it (Player_ActionHandler_10 reaches func_8083BA90 directly
+// and never consults func_8083BB20, so every Z+A press ran the authored jump
+// slash alongside the chop: two attacks, one of them invisible on a pinned
+// hand and audible because func_8083BA90 yells).
+//
+// R10 verdict 4 lets it run again, for its BODY: the user, on 1.0.1.13, *"the
+// jump attack when Z-targeting, the camera should reflect a JUMP attack -- some
+// vertical movement of the camera. It should match vanilla."* The eye is
+// anchored on the actor root, so the only way it leaps is if Link does, and the
+// only thing that makes Link leap is vanilla's own action. What R9 was right
+// about -- one attack, one sound -- is kept by other means: the authored sword
+// animation is invisible (the hand limb is pinned), its melee quads are refused
+// by z_player_lib.c while covered, and the yell is counted here so the shell's
+// chop path does not play a second one.
+volatile int gSohVRJumpSlashVanilla = 0;
+// How many times the chop path played its OWN yell because vanilla's action did
+// not run (a side-hop, a floor vanilla refuses to jump from, no melee weapon).
+// One press yields exactly one of these two counters, never both and never
+// neither -- which is the assertion, since audio itself is unobservable here.
+volatile int gSohVRChopYells = 0;
+// Link's own speed, position and melee animation index, published every tick so
+// "the shield stopped him" and "no vanilla jump slash ran" are numbers.
+volatile float gSohVRLinkVel = 0.0f;
+volatile float gSohVRLinkPos[3] = { 0.0f, 0.0f, 0.0f };
+volatile int gSohVRMeleeAnim = 0;
+// The ocarina profile: what overlay 0047 rev4 is actually using, and the
+// harness override (-1 follows the game, 0/1 force). The ocarina profile is
+// otherwise unreachable from a simulator suite -- it needs an ocarina, a song
+// and a textbox -- and it is now the ONLY place a stick may become a C button.
+volatile int gSohVROcarinaOut = 0;
+volatile int gSohVROcarinaForce = -1;
+// R7 verdict 4: how many stab cross-section quads overlay 0048 rev3 registered.
+volatile int gSohVRStabQuads = 0;
+// R7 verdict 4: 1 while motion combat covers the held weapon. Read by
+// z_player_lib.c, which cannot see z_player.c's file-static predicate, to keep
+// VANILLA's fattened melee AT quads from coming back to life alongside the
+// physical blade now that meleeWeaponState is mirrored from the swing tier.
+volatile int gSohVRMotionCovered = 0;
+volatile int gSohVRVanillaQuadsSkipped = 0;
+// R7 review: how many times motion coverage fell away and overlay 0042 rev6
+// handed meleeWeaponState back to vanilla in a known-zero state. Without that
+// edge the field stuck at 1 or -1 for the rest of the session.
+volatile int gSohVRCoverDrops = 0;
+// R7 verdict 5: 1 while VANILLA lock-on is engaged -- which is when the facing
+// pin stands down so strafe, side-hop and backflip work as they do flat.
+volatile int gSohVRZTarget = 0;
+// R7 verdict 5: which lock-on hop Link is in the middle of -- -1 none, 0
+// forward, 1 left, 2 BACKFLIP, 3 right. Drives the shell's flip camera.
+volatile int gSohVRHopKind = -1;
+// R6: how many times the HUD display-list pointer CHANGED between the
+// gate that admitted it and the interpreter call that ran it (overlay
+// 0031 rev17). That race, lost, hands Fast::Interpreter::Run a NULL
+// display list and it faults on the first command word -- R5's rapid
+// enter/exit SIGSEGV. It exists so "we fixed it" is a number in
+// `vr room` rather than an argument.
+volatile int gSohVRHudDLRaces = 0;
+
+// Diagnostics: the active camera's `setting` (overlay 0037 rev2). z_room.c
+// draws a pre-rendered background ONLY under CAM_SET_PREREND_FIXED, so this is
+// what tells `vr room` whether the green-floored placeholder mesh is showing
+// because the fixed camera was disabled.
+volatile int gSohVRCamSetting = -1;
+
+// --- R4: MOTION HANDS + MOTION COMBAT (VR-DONOR-MAP 3 + 8) -------------------
+// The two hand matrices, in GAME units, row-vector order (out[i*4+j] =
+// m.columns[i][j] -- OoT's own MtxF convention and gSohVREyeVP's). Published
+// into the slot the engine is NOT reading and made visible by the SAME
+// gSohVRPoseSeq bump as the eye pair, so a frame's two eyes and two hands are
+// always one instant of one pose.
+volatile int gSohVRHandValid[2] = { 0, 0 };
+volatile float gSohVRHandMat[2][2][16];
+
+// Donor gVrMotionHands, default 1: the hand limbs are pinned to the controller
+// poses and the shoulders and forearms are hidden, because a floating hand
+// attached to an arm that is not there is worse than no arm at all. When no
+// Sense pair is connected the limb override falls back to R3's ANIMATED hand
+// positions on its own -- gSohVRHandValid is the whole test -- so this stays 1
+// and the settings sheet says why the hands are not tracking.
+volatile int gSohVRMotionHands = 1;
+// Donor gVrLeftHanded 0: the player's RIGHT controller drives the SWORD hand,
+// which is Link's LEFT hand model (Link is left-handed). Mirroring per hand,
+// donor gVrHandMirrorSword / gVrHandMirrorShield, both default 1: the
+// reflection that flips a mesh's handedness also mirrors held items' face
+// designs -- the sword survives that, the shield's crest reads upside-down --
+// so it is toggleable per hand rather than globally.
+volatile int gSohVRLeftHanded = 0;
+volatile int gSohVRHandMirrorSword = 1;
+volatile int gSohVRHandMirrorShield = 1;
+
+// The swing detector's output (SohVrPhys.c, headset rate) as the 20 Hz game
+// side reads it. gSohVRSwingSeq bumps ONCE per rising edge into HOT; the game
+// compares it against its own last-seen value, which is what makes "one swing,
+// one attack" survive a 90/120 Hz producer feeding a 20 Hz consumer.
+volatile unsigned int gSohVRSwingSeq[2] = { 0, 0 };
+volatile float gSohVRSwingSpeed[2] = { 0.0f, 0.0f }; // m/s at the edge
+volatile float gSohVRSwingMid[2] = { 0.0f, 0.0f };   // live blade-midpoint speed
+volatile float gSohVRSwingHand[2] = { 0.0f, 0.0f };  // live raw hand speed
+volatile int gSohVRSwingJump[2] = { 0, 0 };          // that edge cleared 8 m/s
+volatile int gSohVRSwingTier[2] = { 0, 0 };          // 0 idle / 1 armed / 2 hot
+
+// The six-input taxonomy (DONOR-MAP 8 `padmgr.c`), merged into the ONE pad
+// snapshot by overlay 0047 at the same tick boundary overlay 0039 owns.
+volatile int gSohVRSenseActive = 0;
+volatile unsigned int gSohVRSenseBtn[2] = { 0, 0 };
+volatile float gSohVRSenseStickX[2] = { 0.0f, 0.0f };
+volatile float gSohVRSenseStickY[2] = { 0.0f, 0.0f };
+// R10 verdict 5: 1 while the merge is running OUTSIDE VR -- the flat window or
+// the 3D panel, where the pair is an ordinary N64 pad with the right stick on
+// the C buttons. Published by the pump below and read by overlay 0047, which is
+// where the profile actually differs.
+volatile int gSohVRSenseFlat = 0;
+
+// The item TRIGGER reservation (DONOR-MAP 8, HANDOFF-ITEM-TRIGGER.md). When
+// the hand holding an item has a trigger, that trigger mirrors the item's OWN
+// N64 button as raw pad STATE rather than a press -- press nocks the bow, hold
+// keeps it drawn, release looses, and every vanilla rule (ammo, magic, bottles,
+// aim-and-throw) applies with nothing re-implemented. Non-zero here means that
+// hand's trigger is spoken for and the generic binding table must not also
+// claim it. Published by the game side (overlay 0045), read by overlay 0047.
+volatile unsigned short gSohVRItemTriggerMask[2] = { 0, 0 };
+
+// R18 item 2 (overlay 0042 rev19 -> 0047 rev7): and whether BOTH triggers drive
+// it. the user, on 1.0.1.22: "it's counterintuitive to use the RIGHT trigger when
+// the slingshot is in the LEFT hand." Narrower than the mask above on purpose --
+// the mask is every non-sword C item (a bottle, a mask, the ocarina), while this
+// is only the items whose ACTION is a trigger pull (Player_VrTriggerItem: the
+// bows, slingshot, hookshot, longshot, boomerang, Megaton hammer, Deku stick).
+// While it is set, both triggers mirror the mask as raw state and NEITHER is Z
+// or B, so Z-targeting is unavailable while such an item is out -- the user's call.
+volatile int gSohVRItemTriggerBoth = 0;
+
+// R18 item 1: how many times the equip press was denied vanilla's
+// VB_USE_HELD_ITEM_AFTER_CHANGE free use. "As soon as you select the boomerang
+// it throws once, every time" was that free use meeting R16's direct throw; a
+// bow select spent an arrow the same way. Rising here with
+// gSohVRBoomDirectThrows standing still is the fix working.
+volatile unsigned int gSohVREquipNoUse = 0;
+
+// --- R12 item 4: THE HELD ITEM'S OWN SEAT IN THE HAND ------------------------
+//
+// the user, on 1.0.1.15: the slingshot is about 90 degrees off and aimed
+// sideways; the ocarina is held upright with its mouthpiece pointing away. He
+// asked whether the correction has to be per item, and the answer is yes -- per
+// item AND per configuration.
+//
+// WHY. Vanilla does not attach an item to a generic hand: the hand and the item
+// it holds are ONE display list (`gPlayerLeftHandDLists` / the right-hand set),
+// chosen by `leftHandType` / `rightHandType`, and each one was modelled with
+// the fist in whatever pose that item wants. On a screen that is invisible,
+// because the arm's authored animation puts the fist where the mesh expects.
+// In VR the hand limb is pinned to the controller by ONE calibration, and that
+// calibration was dialled against the SWORD's fist. Every other mesh inherits
+// the sword's seat and comes out turned by the difference between its own
+// authored fist and the sword's.
+//
+// So the key is the MODEL TYPE, which is exactly the thing that names the mesh
+// -- and it names the hand with it (`PLAYER_MODELTYPE_LH_*` is Link's left
+// hand, the sword hand; `..._RH_*` is his right, the off hand), which is why
+// there is no separate hand-role axis: the role is implied by the index. The
+// axis that does vary independently is the CONFIGURATION, because overlay 0042
+// applies its mesh mirror only in right-handed play, and a reflection changes
+// the sign of two of the three angles.
+//
+// The correction is applied to the LIMB (there is nothing else to apply it to
+// -- the item is not a separate draw), after the pin and after the mirror, so
+// it moves Link's hand as well as the thing in it. That is the right outcome
+// and not a compromise: the wearer's own hands are hidden, and what he is
+// looking at is the item.
+//
+// Indices: [PLAYER_MODELTYPE_*][config] where config 0 = sword on the RIGHT.
+// Values: yaw, pitch, roll in degrees, then x, y, z offset in GAME UNITS at
+// Link's scale (the pin has already folded actor.scale in, so these are the
+// same units the rest of z_player_lib.c uses). Defaults live in SohImmersive.m
+// beside the hand calibration for the same reason that one does.
+// SOHVR_ITEMCAL_N is PLAYER_MODELTYPE_MAX minus the sheath/waist tail; the
+// canonical definition is in SohImmersive.h, which this file does not import.
+#ifndef SOHVR_ITEMCAL_N
+#define SOHVR_ITEMCAL_N 16
+#endif
+// R17 item 4: the aim trims need ONE MORE ROW than there are mesh slots,
+// because the bow and the slingshot share slot 11/12 (Q-VR30) and the user's
+// numbers for them differ. The canonical definition is in SohImmersive.h.
+#ifndef SOHVR_AIMTRIM_N
+#define SOHVR_AIMTRIM_SLINGSHOT SOHVR_ITEMCAL_N
+#define SOHVR_AIMTRIM_N (SOHVR_ITEMCAL_N + 1)
+#endif
+volatile int gSohVRItemCal = 1;
+volatile float gSohVRItemRotDeg[SOHVR_ITEMCAL_N][2][3];
+volatile float gSohVRItemOffU[SOHVR_ITEMCAL_N][2][3];
+// Published BY the pin, per VR hand (0 = left controller): the model type that
+// hand is currently drawing, or -1. This is what lets the settings sheet name
+// the item the user is holding while he dials it, and what lets the suite assert
+// that equipping the slingshot actually reached the hand.
+volatile int gSohVRHeldModel[2] = { -1, -1 };
+
+// --- R13 (Q-VR28): THE AIM, AND WHY IT WAS NEVER THE MIRROR -----------------
+//
+// the user, on 1.0.1.16: "I can fire now, but it shoots way up HIGH and to the
+// RIGHT (sword on right) / HIGH and to the LEFT (sword on left). It needs to
+// follow where my aiming is -- the middle of the slingshot band, wherever it's
+// pointed."
+//
+// R12 predicted the cause would be the mesh MIRROR: a rotation Euler-extracted
+// from a reflected matrix is not the rotation of the un-reflected frame, and
+// the sword hand carries a reflection in right-handed play only. THAT
+// PREDICTION IS WRONG, and the arithmetic that retires it is worth keeping:
+//
+//   * `Matrix_MtxFToYXZRotS` computes yaw = atan2(mf->xz, mf->zz) and
+//     pitch = atan2(-mf->yz, hypot(mf->xz, mf->zz)) -- i.e. from the matrix's
+//     THIRD COLUMN and nothing else.
+//   * `Actor_SetProjectileSpeed` flies the actor along
+//     (sin y cos x, -sin x, cos y cos x), which IS that third column.
+//   * A reflection applied as `Matrix_Scale(-1, 1, 1)` negates column ZERO.
+//
+// So vanilla's aim extraction is reflection-safe by construction; only the ROLL
+// it also writes (atan2(mf->yx, mf->yy)) is corrupted, and roll is the arrow's
+// cosmetic spin. Verified host-side to 5.6e-16 over 2000 random poses, mirrored
+// and not (scripts/vr-aim-check.py).
+//
+// THE ACTUAL CAUSE is the fixed authored correction that sits between the limb
+// matrix and the extraction. In `Player_PostLimbDrawGameplay`'s L_HAND branch
+// vanilla applies `Matrix_RotateZYX(0x69E8, -0x5708, 0x458E)` before reading the
+// column, and that rotation carries the arrow's axis to
+//
+//     (0.413, 0.787, 0.459) in the L_HAND limb frame
+//     == 42 degrees to the RIGHT of and 52 degrees ABOVE the limb's own +Z.
+//
+// It is authored for the ANIMATED bow-draw pose, where the limb sits in one
+// known orientation. In VR the limb matrix IS the controller, so those two
+// numbers land on the controller's own frame: "high, and to the right". And the
+// mirror explains the flip between configurations after all -- not through the
+// extraction, but because the fixed correction MIXES 0.413 of column ZERO into
+// the composed third column, and the mirror negates column zero in right-handed
+// play only. High and to the RIGHT becomes high and to the LEFT.
+//
+// THE FIX. When a hand is pinned and an aimable item is in it, the projectile's
+// direction is the item's own forward axis carried through the pinned,
+// calibrated hand pose -- taken as a VECTOR through the matrix columns, never
+// Euler-decomposed -- and vanilla's fixed correction is not applied at all.
+//
+// The axis is per item and console-tunable, because a sign error here must be
+// correctable from the user's headset without a rebuild:
+//
+//     vr aim                        -- the direction in force, and the hand's
+//                                      own forward, so they can be compared
+//     vr set aimaxis <item> x y z   -- one row of the axis table
+//     vr set aimpitch <deg>         -- a trim, added to the computed pitch
+//     vr set aimyaw <deg>           -- the same, horizontally
+//     vr set aimframe 0|1           -- 0 = the calibrated HAND pose (shipped),
+//                                      1 = the ITEM-corrected pose
+//     vr set aimspawn <units>       -- push the spawn point along the aim
+//     vr set aim 0|1                -- off = vanilla's own arithmetic
+//
+// THE DEFAULT AXIS IS (1, 0, 0), and that is not arbitrary: the sword's blade
+// runs along the L_HAND limb's +X (`D_80126080 = {5000, 400, 0}` is a point
+// 5000 units up the blade), and the hand calibration is dialled against the
+// SWORD's fist. Limb +X is therefore, by construction, the direction the
+// wearer's controller points. The 400 in that vector is a 4.6-degree lift which
+// is deliberately NOT modelled -- `vr set aimpitch` exists for exactly that.
+//
+// aimframe SHIPS 0, and the assumption is stated rather than hidden: the item
+// correction (pitch -90, roll +45 on the slingshot) is a COSMETIC pose that
+// makes the item sit in the fist the way vanilla draws it, and vanilla's own
+// aim is not along the item mesh either. Aiming along the calibrated hand is
+// "where my aiming is". If the user reports the nut leaving the band sideways,
+// `vr set aimframe 1` is the one-command A/B.
+#ifndef SOHVR_AIMFRAME_N
+#define SOHVR_AIMFRAME_N 2
+#endif
+// --- R14: WHY R13 CHANGED NOTHING, AND WHAT THE TRIMS ARE NOW ---------------
+//
+// the user, on 1.0.1.17: "With the slingshot in my LEFT hand it still goes way UP
+// and to the LEFT. I see no change." He is exactly right, and the cause is
+// LIMB DRAW ORDER, not arithmetic.
+//
+// rev14 published each hand's aim basis from the PIN, which runs inside that
+// hand's own OverrideLimbDraw, and cleared both bases at limb 1 of every draw.
+// The bow and the slingshot live in Link's R_HAND (PLAYER_LIMB_R_HAND == 0x13)
+// and their NOCKED SEED is positioned from the L_HAND branch of
+// Player_PostLimbDrawGameplay (PLAYER_LIMB_L_HAND == 0x10). SkelAnime walks
+// limbs in index order, so post(L_HAND) runs THREE limbs BEFORE
+// override(R_HAND) publishes the basis the aim needs. gSohVRAimValid[off hand]
+// was therefore ZERO at the one site that aims a bow, every frame, in BOTH
+// configurations -- Player_VrAimHeld returned 0 and vanilla's own 42/52 degree
+// correction ran exactly as before. "I see no change" is the literal truth.
+//
+// rev15 publishes BOTH hands' bases once, at limb 1, from gSohVRHandMat -- the
+// same matrix the pin installs -- which owes nothing to the limb walk because
+// the pin REPLACES the limb matrix outright rather than composing onto it. The
+// draw order can never desynchronise it again.
+//
+// AND THE DEFAULT AXIS WAS ONLY RIGHT FOR ONE HAND. (1, 0, 0) is the direction
+// a calibrated controller points *in the SWORD hand's frame*, because that is
+// the fist the calibration was dialled against. The bow is in the OTHER hand,
+// whose calibration differs by as much as 90 degrees of yaw, so the same local
+// axis there is not the pointing direction at all. gSohVRAimHandFix carries
+// C_hand^-1 * C_sword (published by the shell, identity for the sword hand), so
+// the axis table stays expressed in the one frame it was reasoned about in.
+// `vr set aimhandfix 0` turns it off for an A/B.
+//
+// THE TRIMS ARE PER ITEM AND PER CONFIGURATION NOW, because the settings sheet
+// has sliders for them (R14 item 2) and a single pair of numbers could not tell
+// the slingshot from the hookshot. One writer, one table: `vr set aimyaw` and
+// the slider write the same row.
+// R15 (VR): THE AIM IS THE CONTROLLER'S OWN AIM RAY NOW. the user, on 1.0.1.18,
+// with the hook finally running ("24 hand / 0 vanilla"): "keeps going straight
+// into the ground off to the side... I need a pitch that goes much higher."
+// Both R13 and R14 derived the direction from the hand MESH calibration --
+// twenty-four numbers dialled so a sword sits in a fist and a shield sits on a
+// forearm -- and a frame dialled for how a mesh LOOKS is not a pointing
+// direction; the hand fix only carried one wrong axis into the other hand.
+// The Sense controller publishes a dedicated AIM location through ARKit
+// (ar_accessory_location_name_aim), the runtime's own answer to "where is
+// this thing pointing". The shell reads it beside the grip, seats it through
+// the same transform as the hand, and publishes a unit direction and an origin
+// per hand in game space: gSohVRAimRayDir / gSohVRAimRayOrg. Frame 2 is that
+// ray and ships as the default; frames 0 and 1 are the R13/R14 bases and stay
+// as the fallback for a hand the runtime has not answered for, and as the
+// A/B. `vr set aimray x y z` is the axis in the aim location's own frame
+// (-Z forward, the RealityKit convention) if the runtime's turns out to
+// differ.
+volatile int gSohVRAim = 1;       // master switch; 0 = vanilla's own arithmetic
+volatile int gSohVRAimFrame = 2;  // 0 = calibrated hand pose, 1 = item-corrected, 2 = the controller's aim ray
+volatile int gSohVRAimRayValid[2] = { 0, 0 };
+volatile float gSohVRAimRayDir[2][3] = { { 0, 0, 1 }, { 0, 0, 1 } };
+volatile float gSohVRAimRayOrg[2][3];
+volatile float gSohVRAimRayAxis[3] = { 0, 0, -1 };
+// R15: the aim crosshair (the user: "a little crosshair x of where it will go
+// ... an option for users"). Vanilla's hookshot reticle, drawn at the point
+// the aim ray meets the collision mesh, whenever a bow/slingshot is in hand.
+// Range in the limb's model units: 100000 = 1000 game units.
+volatile int gSohVRAimReticle = 1;
+volatile float gSohVRAimReticleRange = 100000.0f;
+// R17 item 2: "make the crosshair half the size." A MULTIPLIER on vanilla's
+// own distance term (which already grows the mark with depth to hold a
+// constant size on screen), so 0.5 is half the size at every distance and
+// nothing about the constant-size property changes. `vr set aimreticlescale`.
+volatile float gSohVRAimReticleScale = 0.5f;
+// R16 item 2: the boomerang throws on the PULL. Overlay 0047 mirrors the Sense
+// trigger's STATE onto the item's C button, so vanilla saw a held button and
+// entered its hold-to-aim -- first person, the camera-zoom chirp, the HUD fade
+// and a throw that waited for the release. With a controller aim ray there is
+// nothing the hold buys. 0 restores vanilla's hold (`vr set boomdirect 0`).
+volatile int gSohVRBoomDirect = 1;
+volatile unsigned int gSohVRBoomDirectThrows = 0;
+// R16 item 4: THE WORLD TURNS WITH LINK when the GAME turns him. The facing pin
+// in overlay 0042 stands down in the choreographed states (ladder, ledge, hang)
+// and nothing followed the 0x8000 snap a ladder descent writes, so the user
+// climbed down facing away from the ladder. The game side is ONE writer: a
+// signed s16 delta plus a sequence number, the pattern gSohVRFpEntered and
+// gSohVRBladeHitSeq already use. The shell eases its own world yaw by the
+// delta; `vr set ladderfollow 0` turns it off.
+volatile int gSohVRBodyYawSnapDelta = 0;
+volatile int gSohVRBodyYawSnapSeq = 0;
+volatile int gSohVRAimHandFixOn = 1;
+volatile float gSohVRAimSpawnU = 0.0f;
+// [model][config][0 = yaw, 1 = pitch], degrees. Applied to the WORLD direction
+// after it is composed, which is what makes "aims up" and "aims left" mean what
+// they say on a slider.
+volatile float gSohVRAimTrimDeg[SOHVR_AIMTRIM_N][2][2];
+// R17 item 4: the row Player_VrAimHeld last READ, which is the mesh slot for
+// everything except the slingshot (row SOHVR_AIMTRIM_SLINGSHOT). `vr set
+// aimyaw` writes this row, so a console dial and the game can never disagree
+// about which of the two numbers inside slot 11 is being moved.
+volatile int gSohVRAimTrimRow = -1;
+// R17 item 4: THE FROZEN AIM TRIMS. R14 shipped these as sliders and R15b as a
+// Swift default (-15 pitch); the user dialled the rest on 1.0.1.21 and the
+// section is gone, so the numbers live here -- the same move R14 made for the
+// hand calibration, and for the same reason: a settings row deleted without
+// moving what it DID is a constant that quietly stops being applied.
+//
+// [row][config][yaw, pitch]. config 0 = sword hand RIGHT. the user's numbers:
+//
+//   * BOW (rows 11/12): sword hand RIGHT -- the bow is in his LEFT hand --
+//     yaw +25, pitch -15. Sword hand LEFT: yaw 0, pitch -15. The asymmetry is
+//     his measurement, not a derivation, and it is the whole reason row 16
+//     exists.
+//   * SLINGSHOT (row 16): yaw 0, pitch -15, both configurations.
+//   * HOOKSHOT (15) and BOOMERANG (6): R15b's shipped trim, unchanged.
+//
+// Every other row is the same 0 / -15 so a slot that becomes aimable later
+// starts from the pitch that is right for the controller ray rather than from
+// zero. Nothing reads them today.
+static const float kSohVRAimTrim[SOHVR_AIMTRIM_N][2][2] = {
+    /* 0  lh_open   */ { { 0, -15 }, { 0, -15 } },
+    /* 1  lh_closed */ { { 0, -15 }, { 0, -15 } },
+    /* 2  sword     */ { { 0, -15 }, { 0, -15 } },
+    /* 3  sword2    */ { { 0, -15 }, { 0, -15 } },
+    /* 4  bgs       */ { { 0, -15 }, { 0, -15 } },
+    /* 5  hammer    */ { { 0, -15 }, { 0, -15 } },
+    /* 6  boomerang */ { { 0, -15 }, { 0, -15 } },
+    /* 7  bottle    */ { { 0, -15 }, { 0, -15 } },
+    /* 8  rh_open   */ { { 0, -15 }, { 0, -15 } },
+    /* 9  rh_closed */ { { 0, -15 }, { 0, -15 } },
+    /* 10 shield    */ { { 0, -15 }, { 0, -15 } },
+    /* 11 bow       */ { { 25, -15 }, { 0, -15 } },
+    /* 12 bow2      */ { { 25, -15 }, { 0, -15 } },
+    /* 13 ocarina   */ { { 0, -15 }, { 0, -15 } },
+    /* 14 oot       */ { { 0, -15 }, { 0, -15 } },
+    /* 15 hookshot  */ { { 0, -15 }, { 0, -15 } },
+    /* 16 slingshot */ { { 0, -15 }, { 0, -15 } },
+};
+
+// A constructor for the same reason sohvr_itemCalInit is one: the reader is the
+// game thread inside Player_VrAimHeld, where there is no safe point to notice
+// that a table has not been filled in yet, and a zeroed row would be a silently
+// untrimmed aim rather than a loud failure.
+__attribute__((constructor)) static void sohvr_aimTrimInit(void) {
+    for (int m = 0; m < SOHVR_AIMTRIM_N; m++) {
+        for (int c = 0; c < 2; c++) {
+            for (int i = 0; i < 2; i++) {
+                gSohVRAimTrimDeg[m][c][i] = kSohVRAimTrim[m][c][i];
+            }
+        }
+    }
+}
+// Published by the shell: the rotation that carries a vector expressed in the
+// SWORD hand's calibrated frame into hand h's own frame. Row-major 3x3;
+// identity for the sword hand by construction.
+volatile float gSohVRAimHandFix[2][9] = {
+    { 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+    { 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+};
+// R14: does the projectile that just left take the hand path or vanilla's?
+// gSohVRAimPath is the LAST nocked-seed frame's answer (1 = hand, 0 = vanilla);
+// the two counters are incremented once per RELEASED projectile, which is what
+// the settings read-out row shows so the user can see at a glance whether the
+// hook is even active.
+volatile int gSohVRAimPath = -1;
+volatile unsigned gSohVRAimShots = 0;
+volatile unsigned gSohVRAimVanillaShots = 0;
+// The per-item forward axis, in whichever frame gSohVRAimFrame selects.
+volatile float gSohVRAimAxis[SOHVR_ITEMCAL_N][3] = {
+    { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 },
+    { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 }, { 1, 0, 0 },
+};
+// Published BY the pin, per VR hand (0 = left controller): the calibrated hand
+// pose in WORLD space, as columns, un-reflected -- [hand][frame][0..2] = the
+// image of local +X, [3..5] of +Y, [6..8] of +Z -- plus its origin. frame 0 is
+// the hand itself; frame 1 has the held-item correction folded in.
+volatile int gSohVRAimValid[2] = { 0, 0 };
+volatile float gSohVRAimBasis[2][SOHVR_AIMFRAME_N][9];
+volatile float gSohVRAimOrigin[2][3];
+// Published BY the aim, for `vr aim`: the direction the projectile is being
+// given, the hand's own forward for comparison, and what produced them.
+volatile float gSohVRAimDirW[3];
+volatile float gSohVRAimFwdW[3];
+volatile float gSohVRAimPosW[3];
+volatile int gSohVRAimModel = -1;
+volatile int gSohVRAimHandUsed = -1;
+volatile int gSohVRAimSite = 0; // 1 = L_HAND nock, 2 = R_HAND held, 3 = boomerang
+volatile unsigned gSohVRAimHits = 0;
+
+// --- R12 item 6 (Q-VR26): A TEST-ONLY WAY TO PUT A SWORD BACK ON B ----------
+//
+// Q-VR26 has blocked two rounds of assertions: the suite reaches S21.5 with
+// `covered` = 0 more often than not, and every claim in that section is gated
+// on a melee weapon being IN HAND. The reason is not a VR bug at all -- it is
+// that `gSaveContext.equips.buttonItems[0]` is not a sword by the time the
+// suite gets there, and B equips whatever is ON B, so neither the wheel's UP
+// flick nor any number of B presses can bring the sword back. (The likely
+// culprit is S8's binding sweep, which presses START three times and pushes
+// sticks and buttons through whatever screen that opens.)
+//
+// So the harness gets a way to say "put a sword on B", which is a thing a
+// wearer does with the pause menu and a thing a simulator cannot. Precedent:
+// gSohVROcarinaForce, which exists for exactly this reason -- the ocarina
+// profile needs an ocarina, a song and a textbox, none of which a suite can
+// arrange. One-shot: the game side clears it the tick it acts on it, and it
+// ships 0, so nothing in a wearer's session can reach it.
+volatile int gSohVRForceSword = 0;
+volatile int gSohVRForcedSwords = 0;
+
+// --- R6: THE ALYX ITEM COMPASS (overlay 0051, donor VrItemSelect.cpp) ------
+// Hold the selector input, a compass of item icons appears anchored where
+// your hand was, FLICK the hand toward one, RELEASE to take it. Valve's
+// Half-Life: Alyx weapon menu almost verbatim -- chosen there over holsters
+// precisely because it never misses and never drops anything.
+//
+// The trigger-mirrors-the-item's-button half (gSohVRItemTriggerMask, R4)
+// stays exactly as it was: it is the FALLBACK, and it is what fires the item
+// the compass equips.
+volatile int gSohVRItemSel = 1;         // the feature
+volatile int gSohVRItemSelHandCfg = 0;  // 0 = sword hand holds the compass, 1 = off hand
+// R8 part B: the RIGHT GRIP (SOHSENSE_BTN_GRIP = 1 << 3), moved off the
+// thumbclick at the user's instruction -- "if you press the right joystick down,
+// you get a weapon wheel of your C button items. that's great! only let's move
+// it to the RIGHT GRIP. then pressing the right thumbstick down just does the
+// first person perspective (C UP)." The grip carries no N64 bit of its own in
+// overlay 0047 rev3, so the wheel is the only thing it can mean.
+volatile unsigned int gSohVRItemSelBtn = 8;
+volatile float gSohVRItemSelDistCm = 5.0f;   // donor gVrItemSelDistance: flick distance, cm
+// game -> shell. The shell suppresses that hand's stick while the compass is
+// open (a thumb resting on a clicked stick must not also turn the player) and
+// fires a haptic tick on every highlight change -- the Alyx confirmation tick.
+volatile int gSohVRItemSelOpen = 0;
+volatile int gSohVRItemSelHand = 0;
+volatile int gSohVRItemSelSector = 0; // 0 centre, 1 up, 2 down, 3 left, 4 right
+volatile unsigned int gSohVRItemSelTickSeq = 0;
+volatile int gSohVRItemSelOpens = 0;
+volatile int gSohVRItemSelPicks = 0;
+volatile int gSohVRItemSelDraws = 0;
+// Why the compass did not open, without a debugger: `calls` is the tick
+// hook firing at all, `avail` is the availability predicate's answer, and
+// `btn_seen` is the button word the GAME side read this tick. Between them
+// the three failures that look identical from a headset -- the feature is
+// off, the game says no, the controller said nothing -- are one line apart.
+volatile int gSohVRItemSelCalls = 0;
+volatile int gSohVRItemSelAvail = 0;
+volatile unsigned int gSohVRItemSelBtnSeen = 0;
+// R18 part C (D-070): the wheel draws the GAME'S OWN 3D "get item" models
+// instead of the donor's flat 32x32 gItemIcons quads -- the user, on 1.0.1.22:
+// "can our weapon wheel be improved? They look like 2D models -- could we use
+// 3D models that look better?" `wheel3d` 0 puts every slot back on the icon
+// quad, which is also what a slot with no get-item model falls back to.
+//
+// `wheelscale` multiplies the model size. The base is DERIVED, not guessed:
+// overlay 0051 measures a typical get-item model at 65 raw units (every
+// objects/object_gi_* Vtx resource in the extracted archive spans 45..80) and
+// scales it to ~0.62 of the gap between two adjacent slots, which comes out at
+// about 0.061 -- a quarter of the shop's Actor_SetScale(0.25f), because our
+// ring is a quarter of a shop pedestal's spacing. Nobody has WORN that number
+// yet, so it gets a dial: clamped 0.02 .. 4.0 on the game side.
+volatile int gSohVRWheel3D = 1;
+volatile float gSohVRWheelScale = 1.0f;
+// R19 part B (D-073): the SELECTED slot's marker. the user, on 1.0.1.23: "the
+// highlight is a big yellow square -- not pretty. A subtle border around the
+// object, or a subtle highlight of the object itself." It was an untextured
+// G_CC_PRIMITIVE quad about 8.6 units across, i.e. most of the gap between two
+// slots. 1 = a thin gold RING border (gameplay_keep's own gLensFlareRingTex,
+// which is a 64x64 annulus), 2 = a soft round glow (gUnknownCircle6Tex),
+// 0 = no marker at all, leaving only the scale breath.
+//
+// R20 (D-075): THE DEFAULT IS 0. the user wore R19's ring on 1.0.1.24 -- "remove
+// the orange circle that surrounds your selection; just make the size or zoom
+// of the object you're selecting a little bigger. That's enough UI feedback for
+// the user along with the haptics that are already there." So the marker is off
+// and the selected model's breath grows to 1.35 +/- 0.05 (SohVrSel_SelScale,
+// overlay 0051). Every line of the ring and glow path survives behind this
+// dial: `vr set wheelhalo 1` is the one-command A/B back to R19.
+volatile int gSohVRWheelHalo = 0;
+// Evidence without a headset: models actually EMITTED. `draws` climbing while
+// `models` stays at 0 is the wheel on screen with every slot on the 2D arm.
+volatile int gSohVRItemSelModels = 0;
+
+// --- R18 part B: THE LENS OF TRUTH IN VR (overlay 0055, D-071) ---------------
+// the user, on 1.0.1.22: "I select it; it should show the same red interface with
+// a circle like vanilla." The mask itself was never missing -- it is drawn per
+// eye, in the world list, by Actor_DrawLensOverlay -- but two things made it not
+// read as vanilla's lens: its circle was an oval with clipped sides (overlay
+// 0031 rev20's aspect fix, D-071), and vanilla's tint peaks at alpha 74/255,
+// which over a ~1900 px eye is very nearly nothing in a headset.
+//
+// `lenstint` is the multiplier on that alpha, realised as repeated passes of
+// the same rect (1 - (1-a)^n), so the CENTRE of the circle stays exactly clear
+// by construction: the mask is 0 there, and 0 stays 0 however many times it is
+// drawn. Default 2.2 (about 53 % opacity at the rim against vanilla's 29 %).
+// `lensscale` sizes the circle: 1.0 keeps vanilla's own proportion of the field
+// (its constants, re-derived, not a magic number), and a headset's field is far
+// wider than a TV's, so this is the dial that decides whether the lens reads as
+// a lens or as a tinted world. Nobody has worn either number.
+// `lenszfar` is item (c): vanilla's depth pass writes prim depth 0 (the NEAR
+// plane) with Z_UPD over the whole masked field, which 0031 rev13 then hands to
+// the compositor as this eye's depth -- so the compositor reprojects the
+// periphery as if it were centimetres from the face. 1 (default) re-writes that
+// same region to the FAR plane AFTER the invisible-actor pass has used it, so
+// the actor clipping still works and the compositor gets a sane field; 0 is
+// vanilla's behaviour exactly.
+// --- R19 part B (D-073): THE MASK IS A WORLD QUAD, NOT A SCREEN RECT ---------
+// the user, on 1.0.1.23: "I see doubled red circles in my eyes; it should be ONE
+// oval open space surrounded by red." A screen-space texrect is drawn at the
+// same PIXELS in both eyes, so it carries zero disparity and fuses at infinity
+// -- and worse, this device's per-eye frusta are asymmetric, so the centre of
+// the field is several degrees off the gaze axis in OPPOSITE directions per
+// eye. Two circles, exactly as described. `lensworld` 1 (default) draws the
+// same mask as a head-locked quad in the WORLD at `lensdist` metres, so both
+// eyes see the SAME world point and the circle fuses where the wearer's eyes
+// converge. `vr set lensworld 0` is the instant A/B back to the screen rect.
+volatile int gSohVRLensWorld = 1;
+volatile float gSohVRLensDist = 1.5f;
+volatile float gSohVRLensTint = 2.2f;
+volatile float gSohVRLensScale = 1.0f;
+volatile int gSohVRLensZFar = 1;
+// Evidence without a headset: rects EMITTED and the pass count of the last
+// tinted draw. `draws` climbing with the lens on is the overlay running.
+volatile int gSohVRLensDraws = 0;
+volatile int gSohVRLensPasses = 0;
+// The live world scale, game units per metre. The compass's flick distance is
+// specified in CENTIMETRES OF REAL HAND TRAVEL (it is a gesture, not a level
+// measurement), so the game side needs the same number the seat uses.
+volatile float gSohVRWorldScale = 34.0f;
+
+// Diagnostic: the N64 bits overlay 0047 OR'd into the pad this tick. It exists
+// because of a real interaction with overlay 0039: 0039 masks the C bits the
+// RIGHT STICK produced, by BIT, at the later merged snapshot -- so a
+// Sense-produced C-left and a simultaneous stick-left are indistinguishable
+// there and the Sense bit would be cleared with the stick's. Publishing what we
+// OR'd makes that collision visible in `vr hands` instead of silent.
+volatile int gSohVRSensePadBits = 0;
+
+// --- R5: THE PHYSICAL BLADE (VR-DONOR-MAP 8, the gVrPhysVisualMesh=0 path) --
+//
+// R4's honest headline gap was that damage landed along Link's AUTHORED sword
+// arc rather than where the hand was. R5 closes it: the game harvests its own
+// collision mesh around the blade and publishes it here; the shell converts to
+// tracking metres and runs the contact solver at HEADSET rate; the blade line
+// the solver produces comes back and becomes OoT's own swept AT quad.
+
+// Master switch. 1 = the physical blade. 0 = R4's behaviour verbatim (a swing
+// sets sUseHeldItem and Link's authored attack runs), kept because some players
+// will prefer the authored animation, and because it is the fallback the moment
+// the shell reports no hands.
+volatile int gSohVRBladeDamage = 1;
+
+// game -> shell: the harvested collision polys, GAME units, world space.
+// Written at draw, read every compositor frame (the geometry is static in game
+// space, so re-converting it per frame through the CURRENT seat is what keeps
+// it correct while Link moves between ticks).
+volatile int gSohVRMeshCount = 0;
+volatile float gSohVRMeshTri[32][9];
+volatile int gSohVRMeshId[32];
+// R6: the harvest is no longer triangles alone. gSohVRMeshShape says how to
+// read the nine floats above -- 0 TRI (three verts), 1 CAPSULE (two axis
+// endpoints in a/b), 2 SPHERE (centre in a) -- and gSohVRMeshRadius carries
+// the radius, in GAME UNITS like everything else here. Dynapoly probe hits are
+// triangles; an enemy's AC cylinder is a capsule; each JntSph element is a
+// sphere. Same array, same seq, same count: one publication, so a reader can
+// never catch the shapes and the verts from different frames.
+volatile int gSohVRMeshShape[32];
+volatile float gSohVRMeshRadius[32];
+volatile unsigned int gSohVRMeshSeq = 0;
+
+// shell -> game: the blade line the SIM pose implies -- base, tip, and the
+// SAME two from the previous solver step. Those four points ARE the swept
+// damage quad's corners, in the vanilla vertex order. Published into the pair
+// slot under the pose seq, like everything else a frame reads.
+volatile int gSohVRBladeValid[2] = { 0, 0 };
+volatile float gSohVRBladeLine[2][2][12];
+
+// shell -> game: the contact ring. The shell writes entry (seq & 7) and THEN
+// bumps the seq; the game consumes forward from its own last-seen value and
+// clamps to eight behind. A contact eight events old is not damage anyone is
+// waiting for.
+volatile unsigned int gSohVRContactSeq = 0;
+volatile float gSohVRContactPos[8][3];
+volatile float gSohVRContactNrm[8][3];
+volatile float gSohVRContactImpact[8];
+volatile int gSohVRContactHand[8];
+// R6: the prim id the contact was against, (kind << 12) | detail -- WALL
+// carries the surface's own sfx material, HARD the collider's colType,
+// FLESH nothing. It is what turns a contact into the right NOISE.
+volatile int gSohVRContactId[8];
+
+// game -> shell: a damage quad LANDED. The shell drops the swing tier
+// HOT -> ARMED on the change, which is the donor's entire "one strike per
+// swing" mechanism -- to strike again the blade must re-cross the hit speed,
+// which is what a second swing is.
+volatile unsigned int gSohVRBladeHitSeq[2] = { 0, 0 };
+
+// Diagnostics for `vr blade`. Separating these is what makes a failure
+// readable in one line from a headset: tris 0 means the harvest found nothing
+// (wrong scene, blade nowhere near geometry); quads 0 with tris nonzero means
+// the swing never went HOT or no melee weapon is held; hits 0 with quads
+// climbing means the quads are registering and missing.
+volatile int gSohVRBladeQuads = 0;
+volatile int gSohVRBladeHits = 0;
+volatile int gSohVRBladeTris = 0;
+// R6: how the published prim set breaks down. `tris` is the total; these
+// two say how many of them came from the dynapoly probe fan and from actor
+// colliders. A blade that passes through a door with dyna=0 is a probe
+// problem; the same with dyna=1 is a solver problem, and that is the whole
+// reason they are separate numbers.
+volatile int gSohVRBladeDyna = 0;
+volatile int gSohVRBladeBodies = 0;
+volatile int gSohVRBladeStrikes = 0;
+volatile int gSohVRBladeContacts = 0; // solver contacts published
+
+// --- R5: HANDS AT HEADSET RATE (overlay 0050) -------------------------------
+// R4's hands were pinned at DL-BUILD time, which is once per 20 Hz game tick,
+// and LUS then interpolated between two ticks' matrices for the frames in
+// between. The eyes were already at compositor rate; the hands were not.
+//
+// 0042 now tags the Mtx allocations that belong to each hand and publishes the
+// matrix it built them against; overlay 0050's interpreter hook re-seats them
+// onto THIS pair's live pose with D = inverse(record) * live, ahead of the
+// interpolation replacement map. Both eyes of a pair read the same slot, so the
+// R2a invariant (everything presented in a pair carries one pose) holds.
+//
+// gSohVRHandLive is the red control: `vr set handlive 0` restores R4's 20 Hz
+// interpolated hands, live, which is the only honest way to A/B this in a
+// headset.
+volatile int gSohVRHandLive = 1;
+volatile int gSohVRHandMtxTag = 0; // 0 = none, hand + 1, set only during the pin
+void* volatile gSohVRHandMtxPtr[2][4];
+volatile int gSohVRHandMtxCount[2] = { 0, 0 };
+volatile float gSohVRHandRecMat[2][16];
+volatile int gSohVRHandRecValid[2] = { 0, 0 };
+// Diagnostic: matrices actually re-seated. Zero with hands visibly tracking
+// means the registration never happened (0042 not rebuilt, or the tag cleared
+// too early) and the hands are silently back at 20 Hz -- which is exactly the
+// failure that looks like nothing at all.
+volatile int gSohVRHandLiveHits = 0;
+// Diagnostic: how many times the interpreter SEARCHED the table. R5 ran
+// that search on every GfxSpMatrix in every mode -- 2D and 3D-panel
+// included -- because its only gate was gSohVRHandLive, which defaults
+// to 1 and is never cleared. Overlay 0050 rev2 gates on VR first person;
+// this must read 0 outside VR.
+volatile int gSohVRHandLiveSearch = 0;
+
+// R6 (spec D9 -- EVERY EXIT RESTORES). The table above holds RAW
+// POINTERS into the graph pool, recorded during one VR session's limb
+// draw. R5 only ever cleared it inside the limb override itself, so a
+// session that ended anywhere else left stale addresses standing; the
+// arena reuses them, and the next session's pointer-identity search can
+// then match an unrelated display-list matrix and re-seat it onto a hand
+// delta. Cheap to prevent, invisible to diagnose: clear the whole table
+// at both ends of every session.
+// The loop thread's REQUEST. Set at VR exit; the game thread clears the table
+// itself, in overlay 0039's per-frame latch block. See that patch and
+// SohVR_ClearHandMtxTable below for why the loop thread must not do it.
+volatile int gSohVRHandMtxClearReq = 0;
+
+// ENTRY ONLY, and the distinction is load-bearing. This writes the table
+// directly, which is safe exactly once: at VR entry, before gSohVRFpActive has
+// been raised, no limb draw is registering anything and the game thread has no
+// interest in these words. At EXIT the game thread is still drawing, so the
+// same write would be a second owner -- gSohVRHandMtxClearReq is what the exit
+// path uses instead.
+void SohVR_ClearHandMtxTable(void) {
+    gSohVRHandMtxTag = 0;
+    for (int h = 0; h < 2; h++) {
+        gSohVRHandMtxCount[h] = 0; /* count FIRST: a concurrent reader
+                                    * that catches this mid-clear sees an
+                                    * empty table, never a live count over
+                                    * cleared pointers. */
+        gSohVRHandRecValid[h] = 0;
+        for (int i = 0; i < 4; i++) {
+            gSohVRHandMtxPtr[h][i] = NULL;
+        }
+        for (int i = 0; i < 16; i++) {
+            gSohVRHandRecMat[h][i] = 0.0f;
+        }
+    }
+}
+
+// --- R5: THE PARAMETRIC PHYSICAL SHIELD (overlay 0049) ----------------------
+// 1 = the shield rides the off-hand controller full time, with the donor's
+// parametric trapezoid quad, and R never enters a stance. 0 = R4's behaviour:
+// the vanilla square quad in its vanilla place, raised with R.
+//
+// THE DONOR HAS NO RAISE GESTURE and neither do we. "Hold it up and you block"
+// is emergent: the quad IS the visible shield at your hand, so an attack that
+// misses it misses it, and the 65-degree facing cone (overlay 0046) rejects a
+// shield that is not pointing at the attacker. Inventing a discrete raise test
+// would be new design, not a port.
+volatile int gSohVRShieldPhysical = 1;
+
+// The nine sliders, in the donor's own order and at its shipped defaults
+// (VrShield.cpp:114-123). Widths and height are FULL dimensions in game units
+// (the game side halves them into the x100 model space); shifts are game units;
+// pitch/yaw/roll are degrees. NONE of these has been seen in a headset by
+// anyone in this program -- they are PCVR numbers tuned against a different
+// controller in a different hand, and the -90 roll is the one most likely to be
+// wrong for a Sense unit.
+volatile float gSohVRShieldQuad[9] = {
+    21.2f, // width top
+    11.9f, // width bottom
+    18.0f, // height
+    -1.1f, // shift across  (in the collider's OWN tilted frame)
+    -0.8f, // shift up      (likewise)
+    -2.5f, // shift out     (likewise)
+    -4.0f, // pitch, deg
+    0.0f,  // yaw, deg
+    -90.0f // roll, deg
+};
+
+// Diagnostics for `vr shield`. `held` is the game side's own held predicate as
+// of its last tick -- the one number that separates "the shield is not physical"
+// from "the shield is physical and the attack simply missed the quad", which
+// from a headset look identical.
+volatile int gSohVRShieldHeld = 0;
+volatile int gSohVRShieldVetoes = 0;
+volatile int gSohVRShieldBlocks = 0;
+
+// The physical shield's facing cone, degrees (donor gVrPhysShieldFacingDeg,
+// default 65; >= 179 disables). Overlay 0046 vetoes a hit on Link's shield quad
+// whose attacker sits outside this cone about the quad's own outward normal.
+volatile float gSohVRShieldFacingDeg = 65.0f;
+
+// Diagnostic: swings the GAME SIDE actually acted on. The shell's
+// gSohVRSwingSeq counts detected edges; this counts the ones that became an
+// attack. A gap between them is the melee-only gate doing its job (a swing with
+// the bow out) or the 20 Hz consumer never running -- and telling those two
+// apart from a headset needs both numbers, not one.
+volatile int gSohVRSwingsTaken = 0;
+
+// Diagnostic: how many hand LIMBS the override actually pinned. Two per frame
+// while both hands track. Zero with a live pose published is the one failure
+// that looks exactly like "the hands do not work" from a headset and has a
+// completely different cause (the override never selected, or hideBody off).
+volatile int gSohVRHandPins = 0;
+
+// Diagnostics for the melee gate. A swing that does not become an attack is
+// otherwise indistinguishable from a swing that was never detected, and these
+// two numbers separate them in one line: what is in Link's hand right now, and
+// what pressing B would use.
+volatile int gSohVRHeldAction = -1;
+volatile int gSohVRBItem = -1;
+
+// The interface handshake. The donor's game side refuses to run when its
+// compiled-against VR_PHYS_INTERFACE_VERSION does not match what LUS reports,
+// because its two halves live in separate repos that can drift; ours live in
+// one repo but on either side of the pristine-vendor seam, which drifts the
+// same way when a patch is regenerated and the shell is not rebuilt. 0 until
+// the VR loop starts -- absence is a mismatch too.
+volatile int gSohVRPhysVersion = 0;
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <SDL.h>
@@ -55,6 +1228,12 @@ volatile int gSoh3DDbgCurW = 0, gSoh3DDbgCurH = 0;   // interpreter mCurDimensio
 
 #include <arpa/inet.h>
 #include <execinfo.h>
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#include <os/proc.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -298,7 +1477,15 @@ static void SohIos_InstallConfigPersist(void) {
     // that broke URL delivery). Observe both notification names so the flush
     // fires whichever lifecycle the runtime uses; the scene delegate below
     // also calls SohIos_FlushConfig directly as a third path.
-    void (^flush)(NSNotification*) = ^(NSNotification* note) { SohIos_FlushConfig("notif"); };
+    void (^flush)(NSNotification*) = ^(NSNotification* note) {
+        SohIos_FlushConfig("notif");
+        // R8 part C: say goodbye in the same breath as the settings write. A
+        // heartbeat file with no exit marker is how the NEXT launch knows the
+        // last one was killed rather than closed -- and a swipe-kill is a
+        // SIGKILL too, so this is the last code that runs either way.
+        extern void SohIos_MarkCleanExit(const char* why);
+        SohIos_MarkCleanExit("resign");
+    };
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
                                                     object:nil
                                                      queue:NSOperationQueue.mainQueue
@@ -309,29 +1496,839 @@ static void SohIos_InstallConfigPersist(void) {
                                                 usingBlock:flush];
 }
 
-// Crash backtraces persisted to Documents/crash.txt — springboard sessions
-// are otherwise invisible (predecessor pattern).
-static void SohIos_CrashHandler(int sig) {
-    void* frames[64];
-    int n = backtrace(frames, 64);
-    char path[1024];
+// --- Crash and last-breath capture (VR R7 verdict 9) -------------------------
+//
+// THE EVIDENCE THIS EXISTS FOR. the user's app died mid-play in the headset on
+// 2026-09-04 and left NOTHING: `Documents/crash.txt` was still July's SIGABRT,
+// and `idevicecrashreport` on the paired device produced no .ips of any kind
+// for soh and no JetsamEvent naming it. An exit that leaves neither an in-app
+// signal record nor a system report is not a signal crash at all — the live
+// candidates are a CompositorServices abort path, an uncaught ObjC or C++
+// exception on a non-main thread, or the immersive scene being invalidated and
+// the process exiting "cleanly" on its way out.
+//
+// So the capture is widened on five fronts, and every one of them answers a
+// different way of dying:
+//
+//   1. Signals, on EVERY thread, with an ALTERNATE STACK. The old handler had
+//      no sigaltstack, so a stack-overflow SIGSEGV — the one a deep interpreter
+//      recursion produces — could not run a handler at all. It also missed
+//      SIGTRAP (a Swift/ObjC runtime trap) and SIGSYS.
+//   2. `std::terminate` (C++) and `NSSetUncaughtExceptionHandler` (ObjC). An
+//      uncaught throw calls abort() only AFTER the terminate handler, and the
+//      ObjC one runs before any abort at all — both leave a NAMED reason,
+//      which a bare SIGABRT backtrace does not.
+//   3. Metal command-buffer errors, reported by the render loop.
+//   4. Compositor-layer invalidation, with its reason string.
+//   5. A HEARTBEAT. The failure mode above leaves no record BY DEFINITION, so
+//      the answer cannot be a better death notice — it has to be a running
+//      one. `Documents/vr-heartbeat.txt` is rewritten every 5 s with the frame
+//      counter, the mode, the scene, and available memory; whatever the app
+//      does on the way out, that file is its last known state. It is written
+//      with O_TRUNC + a single write and fsync'd, so it is never half a record.
+//
+// MEMORY is the prime suspect and is therefore measured, not assumed:
+// `os_proc_available_memory()` is logged at VR entry and in every heartbeat,
+// and appended to `Documents/vr-mem.log` so a downward slope is visible after
+// the fact. Two 4096-square colour+depth eye targets plus the HUD framebuffer
+// plus a 4K texture pack's cache is a real jetsam budget.
+
+// The build stamp, cached as C string at arm time: the signal handler must not
+// touch Foundation, and Info.plist is where the CMake-injected version lives
+// (there is no compile-time SOH_IOS_VERSION macro in this translation unit).
+static char sSohBuildStamp[128];
+static char sSohCrashPath[1024];
+static char sSohHeartPath[1024];
+static char sSohMemPath[1024];
+static char sSohCrashNote[256]; // set by the non-signal reporters, read by them
+static volatile int sSohCrashWritten = 0;
+
+static void SohIos_CrashPaths(void) {
+    if (sSohCrashPath[0] != '\0') {
+        return;
+    }
     const char* home = getenv("HOME");
-    snprintf(path, sizeof(path), "%s/Documents/crash.txt", home ? home : "/tmp");
-    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (home == NULL) {
+        home = "/tmp";
+    }
+    snprintf(sSohCrashPath, sizeof(sSohCrashPath), "%s/Documents/crash.txt", home);
+    snprintf(sSohHeartPath, sizeof(sSohHeartPath), "%s/Documents/vr-heartbeat.txt", home);
+    snprintf(sSohMemPath, sizeof(sSohMemPath), "%s/Documents/vr-mem.log", home);
+    NSDictionary* info = NSBundle.mainBundle.infoDictionary;
+    snprintf(sSohBuildStamp, sizeof(sSohBuildStamp), "%s (%s)",
+             [info[@"CFBundleShortVersionString"] ?: @"?" UTF8String],
+             [info[@"CFBundleVersion"] ?: @"?" UTF8String]);
+}
+
+// --- R8 part C: the numbers a jetsam is actually made of ---------------------
+//
+// The 2026-09-05 deaths were memory kills, not crashes: rpages x 16 KB = 4.90 GB
+// resident, no signal, no handler, nothing to catch. So the instrumentation goes
+// first and the fixes follow it. Six fields, each answering one hypothesis:
+//
+//   phys_mb      task_info(TASK_VM_INFO).phys_footprint -- the number JETSAM
+//                itself uses. avail_mem_mb is a derived difference, and it
+//                returns 0 outright in the simulator, which is exactly where
+//                this had to be reproducible.
+//   mtl_mb       MTLDevice currentAllocatedSize. Splits GPU from CPU in one
+//                field: plateauing while phys_mb climbs proves the leak is CPU.
+//   texcache     Fast3D's GPU texture cache, bytes and entries (overlay 0020).
+//   rescache     LUS's ResourceManager cache, bytes and entries (overlay 0045).
+//                THIS is the decisive counter -- monotonic growth here with no
+//                fall is the unbounded strong-pointer map, and it is the one
+//                that survives leaving VR.
+//   pendmips     sSohIosPendingMips.size(), which must be 0 between frames.
+//                Any steady non-zero value is the 0031 drain leak, outright.
+//   trims        how many times the governor fired and what it freed.
+//
+// Every one of these is a plain C symbol out of libultraship (overlay 0045), so
+// they are declared here rather than dragging a C++ header into the shell.
+extern void SohIos_TexCacheStats(unsigned long long* outBytes, unsigned long long* outCount);
+extern void SohIos_ResCacheStats(unsigned long long* outBytes, unsigned long long* outCount);
+extern unsigned long long SohIos_MetalAllocatedBytes(void);
+extern unsigned long long SohIos_PendingMipsCount(void);
+extern unsigned long long SohIos_MipOrphans(void);
+extern volatile int gSohIosMemTrimReq;
+extern volatile int gSohIosMemTrims;
+extern volatile int gSohIosMemTrimFreedMB;
+extern volatile int gSohIosMemTrimEvicted;
+
+long SohIos_PhysFootprintMB(void) {
+    // MANDATORY, and not a nicety: os_proc_available_memory() returns 0 in the
+    // simulator (no per-process limit), so the slope this whole round is about
+    // is invisible there without task_info. task_info works everywhere.
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return (long)(info.phys_footprint / (1024 * 1024));
+}
+
+// One line, one format, three readers: the heartbeat file, vr-mem.log, and the
+// console's `vr mem`. A second format would drift from the first.
+int SohIos_MemFields(char* buf, size_t cap) {
+    unsigned long long texBytes = 0, texCount = 0, resBytes = 0, resCount = 0;
+    SohIos_TexCacheStats(&texBytes, &texCount);
+    SohIos_ResCacheStats(&resBytes, &resCount);
+    // The engine's own device first; if it has not been registered yet (the
+    // renderer has not initialised) fall back to the system default, which on
+    // Apple platforms is the same object. Reporting 0 for both is the honest
+    // answer and is what the visionOS SIMULATOR does -- its Metal layer does
+    // not account currentAllocatedSize. On the headset it is a real number,
+    // which is the only place the GPU/CPU split actually has to be read.
+    unsigned long long mtlBytes = SohIos_MetalAllocatedBytes();
+    if (mtlBytes == 0) {
+        static id<MTLDevice> sSohIosFallbackDevice;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ sSohIosFallbackDevice = MTLCreateSystemDefaultDevice(); });
+        mtlBytes = sSohIosFallbackDevice != nil ? (unsigned long long)sSohIosFallbackDevice.currentAllocatedSize : 0;
+    }
+    return snprintf(buf, cap,
+                    "phys_mb=%ld mtl_mb=%llu texcache_mb=%llu texcache_n=%llu "
+                    "rescache_mb=%llu rescache_n=%llu pendmips_n=%llu mip_orphans=%llu "
+                    "trims=%d trim_freed_mb=%d trim_evicted=%d",
+                    SohIos_PhysFootprintMB(), mtlBytes / (1024ull * 1024ull),
+                    texBytes / (1024ull * 1024ull), texCount, resBytes / (1024ull * 1024ull), resCount,
+                    SohIos_PendingMipsCount(), SohIos_MipOrphans(), (int)gSohIosMemTrims,
+                    (int)gSohIosMemTrimFreedMB, (int)gSohIosMemTrimEvicted);
+}
+
+long SohIos_AvailableMemoryMB(void) {
+    // os_proc_available_memory returns 0 when the process has no memory limit
+    // (the simulator, and some debugger attachments). 0 is reported honestly
+    // rather than papered over as "plenty".
+    return (long)(os_proc_available_memory() / (1024 * 1024));
+}
+
+// R8 part C: crash.txt is APPEND-ONLY now, with a cap.
+//
+// It used to be O_TRUNC, and that is how the file the user sent back was still
+// July's SIGABRT while five memory kills had happened since: a truncating
+// writer keeps only the LAST record, and a jetsam writes no record at all, so
+// the file simply never changed. History is what makes a dated file useful, so
+// records accumulate; past 256 KB the file starts over with a line that says so,
+// exactly as vr-mem.log already does, because this file is in Documents and the
+// user sees it in Files.
+static int SohIos_OpenCrashAppend(void) {
+    SohIos_CrashPaths();
+    struct stat st;
+    if (stat(sSohCrashPath, &st) == 0 && st.st_size > (off_t)(256 * 1024)) {
+        int tfd = open(sSohCrashPath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (tfd >= 0) {
+            dprintf(tfd, "--- crash.txt rolled at 256 KB (%s) ---\n", sSohBuildStamp);
+            close(tfd);
+        }
+    }
+    return open(sSohCrashPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+}
+
+// THE ONE THING A SIGKILL LEAVES BEHIND. A memory kill cannot be caught -- no
+// handler runs, no backtrace exists -- so the only evidence a jetsam can
+// possibly produce is the fact that the PREVIOUS run never said goodbye. The
+// heartbeat file is rewritten every 5 s and a clean shutdown appends an exit
+// marker to it; so at launch, a heartbeat file with no marker means the last run
+// ended without exiting, and its last line carries the mode, the scene and the
+// memory at the moment before it disappeared. That gets appended to crash.txt,
+// which is the dated file the user actually looks at.
+static void SohIos_RecordPreviousRun(void) {
+    SohIos_CrashPaths();
+    int fd = open(sSohHeartPath, O_RDONLY);
+    if (fd < 0) {
+        return; // first ever launch, or the user cleared Documents
+    }
+    char prev[1024];
+    ssize_t got = read(fd, prev, sizeof(prev) - 1);
+    close(fd);
+    if (got <= 0) {
+        return;
+    }
+    prev[got] = '\0';
+    if (strstr(prev, "exit=clean") != NULL) {
+        return; // the last run said goodbye; nothing to report
+    }
+    // Strip the trailing newline so the record reads as one line.
+    for (ssize_t i = got - 1; i >= 0 && (prev[i] == '\n' || prev[i] == '\r'); i--) {
+        prev[i] = '\0';
+    }
+    long availMb = -1;
+    const char* avail = strstr(prev, "avail_mem_mb=");
+    if (avail != NULL) {
+        availMb = strtol(avail + 13, NULL, 10);
+    }
+    long physMb = -1;
+    const char* phys = strstr(prev, "phys_mb=");
+    if (phys != NULL) {
+        physMb = strtol(phys + 8, NULL, 10);
+    }
+    int cfd = SohIos_OpenCrashAppend();
+    if (cfd < 0) {
+        return;
+    }
+    dprintf(cfd, "=== previous run ended without exit ===\n");
+    dprintf(cfd, "detected_by=%s build=%s\n", "vr-heartbeat.txt with no exit marker", sSohBuildStamp);
+    dprintf(cfd, "last_heartbeat=%s\n", prev);
+    // The verdict, spelled out, because the whole point is that the user should
+    // not have to know what a jetsam is to read this file.
+    if ((availMb >= 0 && availMb < 400) || (physMb > 3000)) {
+        dprintf(cfd, "likely=MEMORY KILL (jetsam). The system reclaimed the app; no crash "
+                     "handler can run for this. avail_mem_mb=%ld phys_mb=%ld\n",
+                availMb, physMb);
+    } else {
+        dprintf(cfd, "likely=unknown. Memory was not low at the last heartbeat "
+                     "(avail_mem_mb=%ld phys_mb=%ld), so this was a hang, a watchdog "
+                     "kill, or a swipe-close.\n",
+                availMb, physMb);
+    }
+    dprintf(cfd, "\n");
+    fsync(cfd);
+    close(cfd);
+    NSLog(@"[soh] previous run ended without an exit marker; recorded in crash.txt (avail=%ld phys=%ld)",
+          availMb, physMb);
+}
+
+// The other half: say goodbye. Appended to the heartbeat file so the next launch
+// can tell a clean shutdown from a kill.
+void SohIos_MarkCleanExit(const char* why) {
+    SohIos_CrashPaths();
+    int fd = open(sSohHeartPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd >= 0) {
-        dprintf(fd, "signal %d\n", sig);
-        backtrace_symbols_fd(frames, n, fd);
+        dprintf(fd, "exit=clean why=%s t=%.3f\n", why ? why : "?", CACurrentMediaTime());
+        fsync(fd);
         close(fd);
     }
+}
+
+// Async-signal-safe enough for a handler: no malloc, no NSLog, no stdio.
+// dprintf is not formally async-signal-safe either, but it is what the shipped
+// predecessor used and it is the only thing that gets symbol names out.
+static void SohIos_WriteCrashRecord(const char* kind, int sig, const char* note) {
+    SohIos_CrashPaths();
+    if (__sync_lock_test_and_set(&sSohCrashWritten, 1) != 0) {
+        return; // first writer wins: a terminate handler that then aborts must
+                // not overwrite the named reason with a bare SIGABRT
+    }
+    void* frames[96];
+    int n = backtrace(frames, 96);
+    int fd = SohIos_OpenCrashAppend();
+    if (fd < 0) {
+        return;
+    }
+    dprintf(fd, "=== %s ===\n", "record");
+    dprintf(fd, "kind=%s signal=%d\n", kind, sig);
+    dprintf(fd, "build=%s\n", sSohBuildStamp);
+    dprintf(fd, "mode=%s scene=%d hud_frames=%d\n", gSohVRMode ? "vr" : "flat-or-panel",
+            (int)gSohVRSceneNum, (int)gSohVRHudFrames);
+    dprintf(fd, "avail_mem_mb=%ld phys_mb=%ld\n", SohIos_AvailableMemoryMB(), SohIos_PhysFootprintMB());
+    dprintf(fd, "thread=%s\n", pthread_main_np() ? "main" : "non-main");
+    if (note != NULL && note[0] != '\0') {
+        dprintf(fd, "note=%s\n", note);
+    }
+    dprintf(fd, "--- backtrace ---\n");
+    backtrace_symbols_fd(frames, n, fd);
+    fsync(fd);
+    close(fd);
+}
+
+// A plain C function, not a block: NSSetUncaughtExceptionHandler takes a
+// function pointer (NSUncaughtExceptionHandler*), and a block is not one.
+static void SohIos_ObjCExceptionHandler(NSException* e) {
+    char note[256];
+    snprintf(note, sizeof(note), "NSException %s: %s", e.name.UTF8String ?: "?", e.reason.UTF8String ?: "");
+    SohIos_WriteCrashRecord("objc-exception", 0, note);
+}
+
+// R17 part B item 5. 1.0.1.21's crash.txt carries TWO of these on the main
+// thread with empty backtraces and no type -- "std::terminate (uncaught C++
+// exception)" and nothing else, which is not attributable to anything.
+//
+// The type IS still available here: __cxa_current_exception_type() is a plain C
+// entry point of the Itanium C++ ABI and returns the std::type_info* of the
+// exception being handled. Reading a NAME off it is the part that needs care,
+// because std::type_info::name() is inline in libc++ and therefore not a symbol
+// this Objective-C translation unit could call, and the object's layout is not
+// something to guess at inside a handler that is already running after a fatal
+// fault. So: every typeinfo object is a NAMED GLOBAL SYMBOL (_ZTISt13runtime_error
+// and friends), dladdr() reads that name out of the image's symbol table with no
+// layout assumption at all, and __cxa_demangle -- also a plain C entry point --
+// turns it into text. A type whose typeinfo is local or stripped simply gives
+// dladdr nothing, and the record says so instead of dereferencing anything.
+//
+// what() is NOT reached this way, and the honest reason is that it needs a catch
+// clause: it is a virtual call on the exception OBJECT, and getting at that from
+// C means either a C++ translation unit or a guess about libc++'s layout. The
+// type name is what makes the next record attributable, and that is this item's
+// whole claim -- the cause is explicitly not chased here.
+static void SohIos_TerminateHandler(void) {
+    char note[320];
+    snprintf(note, sizeof(note), "std::terminate (uncaught C++ exception, type unknown)");
+    extern void* __cxa_current_exception_type(void);
+    extern char* __cxa_demangle(const char* mangled, char* buf, size_t* len, int* status);
+    void* ti = __cxa_current_exception_type();
+    if (ti != NULL) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(ti, &info) != 0 && info.dli_sname != NULL) {
+            int status = -1;
+            char* pretty = __cxa_demangle(info.dli_sname, NULL, NULL, &status);
+            snprintf(note, sizeof(note), "std::terminate (uncaught C++ exception): %s",
+                     (status == 0 && pretty != NULL) ? pretty : info.dli_sname);
+            free(pretty);
+        } else {
+            snprintf(note, sizeof(note), "std::terminate (uncaught C++ exception): typeinfo at %p, unnamed", ti);
+        }
+    }
+    SohIos_WriteCrashRecord("cxx-terminate", 0, note);
+}
+
+static void SohIos_CrashHandler(int sig) {
+    SohIos_WriteCrashRecord("signal", sig, sSohCrashNote);
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
-static void SohIos_InstallCrashHandler(void) {
-    int sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE };
-    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        signal(sigs[i], SohIos_CrashHandler);
+// R7: publicly callable so the render loop can report a Metal command-buffer
+// error or a compositor invalidation through the SAME record. Neither of those
+// is fatal by itself, so this does NOT abort — it records and returns, and the
+// note survives into whatever kills us next.
+void SohIos_ReportFatalContext(const char* kind, const char* detail) {
+    SohIos_CrashPaths();
+    snprintf(sSohCrashNote, sizeof(sSohCrashNote), "%s: %s", kind ? kind : "?", detail ? detail : "");
+    NSLog(@"[soh] FATAL CONTEXT %s: %s", kind ? kind : "?", detail ? detail : "");
+    // Appended, not truncated: several of these in a row before the exit is
+    // itself the diagnosis.
+    int fd = open(sSohMemPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd >= 0) {
+        dprintf(fd, "%.3f CONTEXT %s: %s avail_mb=%ld\n", CACurrentMediaTime(), kind ? kind : "?",
+                detail ? detail : "", SohIos_AvailableMemoryMB());
+        close(fd);
     }
+}
+
+// The heartbeat. Rewritten whole every 5 s on its own thread, so a hang in the
+// game loop stops it and the STOPPED TIMESTAMP is itself evidence.
+static void* SohIos_HeartbeatThread(void* unused) {
+    (void)unused;
+    pthread_setname_np("soh-heartbeat");
+    SohIos_CrashPaths();
+    for (;;) {
+        // While backgrounded the heartbeat must NOT rewrite the file: the
+        // clean-exit marker was just appended to it, and one O_TRUNC beat
+        // between resign-active and suspension would erase it, turning the
+        // next launch's record into a false memory kill. The first foreground
+        // beat overwrites the marker, which is exactly when it stops being true.
+        if (gSohIosBackgrounded) {
+            sleep(5);
+            continue;
+        }
+        long mb = SohIos_AvailableMemoryMB();
+        char mem[512];
+        SohIos_MemFields(mem, sizeof(mem));
+        char buf[1024];
+        int n = snprintf(buf, sizeof(buf),
+                         "t=%.3f build=%s mode=%s scene=%d hud_frames=%d avail_mem_mb=%ld %s\n",
+                         CACurrentMediaTime(), sSohBuildStamp,
+                         gSohVRMode ? "vr" : "flat-or-panel", (int)gSohVRSceneNum,
+                         (int)gSohVRHudFrames, mb, mem);
+        int fd = open(sSohHeartPath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd >= 0) {
+            (void)!write(fd, buf, (size_t)n);
+            fsync(fd);
+            close(fd);
+        }
+        // CAPPED, and it has to be: this file is in Documents, which is
+        // UIFileSharingEnabled — the user sees it in Files — and it is appended
+        // to every five seconds for as long as the app runs. About 90 bytes a
+        // beat is 65 KB an hour, which is nothing for one session and tens of
+        // megabytes of somebody's Zelda folder over months. The slope only
+        // needs the recent past, so past the cap the file starts over with a
+        // line saying so, rather than growing forever or being silently
+        // truncated mid-record.
+        {
+            struct stat st;
+            if (stat(sSohMemPath, &st) == 0 && st.st_size > (off_t)(512 * 1024)) {
+                int tfd = open(sSohMemPath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (tfd >= 0) {
+                    dprintf(tfd, "--- vr-mem.log rolled at 512 KB (%s) ---\n", sSohBuildStamp);
+                    close(tfd);
+                }
+            }
+        }
+        fd = open(sSohMemPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        if (fd >= 0) {
+            (void)!write(fd, buf, (size_t)n);
+            close(fd);
+        }
+        usleep(5 * 1000 * 1000);
+    }
+    return NULL;
+}
+
+// R8 part C: THE MEMORY PRESSURE HOOK, which did not exist at all. A repo-wide
+// grep for DISPATCH_SOURCE_TYPE_MEMORYPRESSURE and didReceiveMemoryWarning
+// returned nothing before this round: the app rode straight into jetsam with no
+// warning acted on, and gfx_texture_cache_clear() had zero callers.
+//
+// The source fires on a background queue, and NOTHING here may free a texture
+// or a resource from that queue -- the game thread owns both caches, and a
+// resource destructor can load other resources. So the handler does exactly two
+// things: it REQUESTS a trim (a flag the game thread services at the top of its
+// next frame, overlay 0045) and it writes a line into vr-mem.log, so a pressure
+// event that preceded a death is visible after the fact.
+static dispatch_source_t sSohIosPressureSource;
+
+void SohIos_RequestMemoryTrim(const char* why) {
+    gSohIosMemTrimReq = 1;
+    SohIos_CrashPaths();
+    char mem[512];
+    SohIos_MemFields(mem, sizeof(mem));
+    int fd = open(sSohMemPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd >= 0) {
+        dprintf(fd, "%.3f PRESSURE %s avail_mem_mb=%ld %s\n", CACurrentMediaTime(), why ? why : "?",
+                SohIos_AvailableMemoryMB(), mem);
+        close(fd);
+    }
+    NSLog(@"[soh] memory pressure (%s): trim requested. %s", why ? why : "?", mem);
+}
+
+static void SohIos_InstallMemoryPressure(void) {
+    if (sSohIosPressureSource != nil) {
+        return;
+    }
+    dispatch_queue_t q = dispatch_queue_create("soh.ios.mempressure", DISPATCH_QUEUE_SERIAL);
+    sSohIosPressureSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                                   DISPATCH_MEMORYPRESSURE_WARN |
+                                                       DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                                   q);
+    dispatch_source_set_event_handler(sSohIosPressureSource, ^{
+        unsigned long flags = dispatch_source_get_data(sSohIosPressureSource);
+        SohIos_RequestMemoryTrim((flags & DISPATCH_MEMORYPRESSURE_CRITICAL) ? "critical" : "warn");
+    });
+    dispatch_resume(sSohIosPressureSource);
+
+    // The UIKit-side second net. It arrives on the main thread and on a
+    // different schedule from the dispatch source, and on some deaths it is the
+    // only one that arrives at all.
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                                                    object:nil
+                                                     queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification* note) {
+                                                    SohIos_RequestMemoryTrim("uikit-warning");
+                                                }];
+    NSLog(@"[soh] memory pressure hook armed (dispatch warn+critical, UIKit warning)");
+}
+
+// --- R14: THE AUDIO LAUNCH WATCHDOG ----------------------------------------
+//
+// The reasoning is beside gSohAudioDeviceId above. Three pieces live here:
+//
+//   SohIos_AudioPrepareSession()  the AVAudioSession work SDL does not do for
+//                                 us and cannot be asked to retry. Called from
+//                                 overlay 0053 BEFORE every SDL_OpenAudioDevice.
+//   SohIos_AudioNote()            one line into vr-mem.log, the same file the
+//                                 heartbeat writes, so a later pull shows
+//                                 whether the watchdog fired without anybody
+//                                 having to be listening at the time.
+//   SohIos_AudioWatchdogThread()  the watchdog itself.
+//
+// The watchdog measures BYTES ACCEPTED BY THE DEVICE (gSohAudioQueueBytes),
+// which is the only counter that distinguishes "audio is leaving the process"
+// from "the audio thread is busy". beats can climb, produced can climb, and the
+// game can still be silent; queue_bytes cannot climb while it is.
+//
+// It never reopens a device that is fine: the test is bytes NOT advancing over
+// a whole window while the audio thread IS beating, or the device id being 0.
+// A full queue is explicitly not unhealthy -- that is 0044's stall case and
+// 0044 owns it.
+void SohIos_AudioNote(const char* what) {
+    SohIos_CrashPaths();
+    int fd = open(sSohMemPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd >= 0) {
+        dprintf(fd, "%.3f AUDIO %s dev=%d beats=%llu bytes=%llu fails=%llu reopens=%llu restarts=%d\n",
+                CACurrentMediaTime(), what ? what : "?", (int)gSohAudioDeviceId,
+                (unsigned long long)gSohAudioBeats, (unsigned long long)gSohAudioQueueBytes,
+                (unsigned long long)gSohAudioQueueFails, (unsigned long long)gSohAudioReopens,
+                (int)gSohAudioWatchdogRestarts);
+        close(fd);
+    }
+    NSLog(@"[audio] %s dev=%d beats=%llu bytes=%llu fails=%llu reopens=%llu restarts=%d", what ? what : "?",
+          (int)gSohAudioDeviceId, (unsigned long long)gSohAudioBeats, (unsigned long long)gSohAudioQueueBytes,
+          (unsigned long long)gSohAudioQueueFails, (unsigned long long)gSohAudioReopens,
+          (int)gSohAudioWatchdogRestarts);
+}
+
+// R17 part B item 2: THE SAME DOOR, FOR THE IMMERSIVE PATH. Every `[imm]` and
+// `[SohVR]` breadcrumb in the VR entry path was NSLog only, which is to say
+// invisible the moment the headset comes off -- and that is why a black VR
+// entry, twice in four launches of 1.0.1.21, left NO evidence at all. This
+// writes into the same vr-mem.log the heartbeat and SohIos_AudioNote write, so
+// one pull carries audio, memory and the immersive handshake in timestamp
+// order, which is the only way to see that the audio restart landed 0.25 s
+// before the mode flip.
+void SohIos_VrNote(const char* what, const char* detail) {
+    SohIos_CrashPaths();
+    int fd = open(sSohMemPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd >= 0) {
+        dprintf(fd, "%.3f VR %s %s\n", CACurrentMediaTime(), what ? what : "?", detail ? detail : "");
+        close(fd);
+    }
+    NSLog(@"[SohVR] %s %s", what ? what : "?", detail ? detail : "");
+}
+
+// The transition gate. Swift raises it before openImmersiveSpace and drops it
+// after the space is open (or refused), and likewise around the dismiss. It is a
+// COUNTER, not a flag, because the 3 s re-anchor timer and a Crown dismissal can
+// overlap an entry -- a bool would be cleared by whichever finished first.
+static volatile int sSohVRTransitionDepth = 0;
+void SohIos_SetVrTransition(int on) {
+    if (on) {
+        sSohVRTransitionDepth = sSohVRTransitionDepth + 1;
+    } else if (sSohVRTransitionDepth > 0) {
+        sSohVRTransitionDepth = sSohVRTransitionDepth - 1;
+    }
+    gSohVRTransition = (sSohVRTransitionDepth > 0);
+}
+
+// Called from libultraship (overlay 0053) on whichever thread is opening the
+// device. Returns 1 if the session is active for playback, 0 if it is not --
+// and 0 is worth logging rather than swallowing, because it is the shape of
+// the user's silent launch.
+int SohIos_AudioPrepareSession(void) {
+    AVAudioSession* s = AVAudioSession.sharedInstance;
+    NSError* err = nil;
+    if (s.category != AVAudioSessionCategoryPlayback) {
+        if (![s setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&err]) {
+            gSohAudioSessionFails = gSohAudioSessionFails + 1ull;
+            NSLog(@"[audio] setCategory(playback) failed: %@", err);
+        }
+    }
+    err = nil;
+    if (![s setActive:YES error:&err]) {
+        gSohAudioSessionFails = gSohAudioSessionFails + 1ull;
+        NSLog(@"[audio] setActive:YES failed: %@", err);
+        return 0;
+    }
+    return 1;
+}
+
+// The watchdog. 500 ms cadence; it does nothing at all until the first rendered
+// frame, which it reads off gSohAudioBeats -- OTRAudio_Thread blocks on the gfx
+// thread's first wake before it beats even once, so "beats > 0" IS "a frame has
+// been rendered", with no second frame counter to keep in step.
+#define SOHVR_AUDIO_WD_MAX_RESTARTS 4
+static void* SohIos_AudioWatchdogThread(void* unused) {
+    (void)unused;
+    pthread_setname_np("soh-audio-watchdog");
+    // Wait for the first frame to drive the audio thread. 60 s is generous: an
+    // O2R first launch extracts before it renders anything.
+    for (int i = 0; i < 120 && gSohAudioBeats == 0; i++) {
+        usleep(500 * 1000);
+    }
+    if (gSohAudioBeats == 0) {
+        gSohAudioWatchdogState = 3;
+        SohIos_AudioNote("watchdog: audio thread never beat -- no first frame, or the thread is not alive");
+        return NULL;
+    }
+    // ~3 s of grace after the first frame, then one health decision every 3 s.
+    usleep(3 * 1000 * 1000);
+    unsigned long long lastBytes = gSohAudioQueueBytes;
+    unsigned long long lastBeats = gSohAudioBeats;
+    unsigned long long lastFails = gSohAudioQueueFails;
+    unsigned long long satRecoveryMark = gSohAudioRecoveries;
+    int deadStreak = 0;   // consecutive windows with no beat at all
+    int satStreak = 0;    // consecutive windows with the queue pinned full
+    int satActed = 0;     // one reopen per saturation episode, not one per window
+    int statePrev = -1;
+    int firstWindow = 1;  // R17: the first pass decides NOTHING (see below)
+    for (;;) {
+        // THE WINDOW COMES FIRST, and this ordering IS the R17 fix. R14 read
+        // `beats` at the top of the body having sampled `lastBeats` a few
+        // nanoseconds earlier, so the first comparison was a value against
+        // itself: deadThread was always true and every launch reopened a
+        // perfectly healthy device at t+4 s. Sleeping first makes every
+        // comparison span a real 3 s window; `firstWindow` is belt and braces
+        // on top of it, so that even a future edit that moves this sleep back
+        // to the bottom cannot resurrect the false positive.
+        usleep(3 * 1000 * 1000);
+        unsigned long long bytes = gSohAudioQueueBytes;
+        unsigned long long beats = gSohAudioBeats;
+        unsigned long long fails = gSohAudioQueueFails;
+        int backgrounded = gSohIosBackgrounded;
+        int transition = gSohVRTransition;
+        int noDevice = (gSohAudioDeviceId == 0);
+        int deadThread = (beats == lastBeats);
+        // Bytes standing still is only a fault if the audio thread is running
+        // and the queue is NOT full: a full queue is 0044's stall case, and a
+        // backgrounded app is not supposed to be producing anything.
+        int starved = (bytes == lastBytes) && !backgrounded && !deadThread &&
+                      ((gSohAudioBuffered + 1584) <= gSohAudioDesired);
+        // (d) THE THIRD FAULT, and the one that was invisible by construction.
+        // When a reopened unit never starts, the queue saturates: buffered rides
+        // at or above desired forever, which the `starved` test above reads as
+        // HEALTHY, while 0044's in-thread recover fires every second to no
+        // effect and logs only to spdlog. Two consecutive windows is >5 s.
+        int saturated = !backgrounded && (gSohAudioDesired > 0) && (gSohAudioBuffered >= gSohAudioDesired);
+        deadStreak = deadThread ? (deadStreak + 1) : 0;
+        if (saturated) {
+            satStreak = satStreak + 1;
+        } else {
+            satStreak = 0;
+            satActed = 0;
+            satRecoveryMark = gSohAudioRecoveries;
+        }
+        // TWO CONSECUTIVE WINDOWS, AND THE FAILURE COUNTER UNCHANGED. A thread
+        // that is genuinely not turning cannot be calling SDL_QueueAudio, so a
+        // moving `fails` is positive proof the thread is alive whatever the beat
+        // counter says. Both halves had to hold to make the 1.0.1.21 line
+        // impossible: it had one window and fails=0 sitting still, but the
+        // thread beat again 0.7 s later, which the second window would have
+        // seen.
+        int deadConfirmed = (deadStreak >= 2) && (fails == lastFails);
+        int satConfirmed = (satStreak >= 2) && !satActed && (gSohAudioRecoveries != satRecoveryMark);
+
+        int fault = 0;
+        const char* what = NULL;
+        if (!backgrounded && !firstWindow) {
+            if (noDevice) {
+                fault = 1;
+                what = "watchdog restarted (device never opened)";
+            } else if (deadConfirmed) {
+                fault = 1;
+                what = "watchdog restarted (audio thread not beating for two windows)";
+            } else if (starved) {
+                fault = 1;
+                what = "watchdog restarted (no bytes accepted)";
+            } else if (satConfirmed) {
+                fault = 1;
+                what = "saturated, unit not draining";
+            }
+        }
+        // (c) NEVER RESTART DURING AN IMMERSIVE TRANSITION. The open/dismiss
+        // re-anchors the audio session (setIntendedSpatialExperience), and a
+        // close+open racing that is how 1.0.1.21's reopen landed 0.25 s before
+        // the mode=vr flip. The decision is deferred a window; the streaks are
+        // kept, so a REAL fault is acted on 3 s later instead of being lost.
+        if (fault && transition) {
+            gSohAudioWatchdogSkips = gSohAudioWatchdogSkips + 1;
+            SohIos_AudioNote("watchdog deferred a restart -- immersive transition in flight");
+            fault = 0;
+        }
+        if (fault) {
+            gSohAudioWatchdogState = 2;
+            if (gSohAudioWatchdogRestarts >= SOHVR_AUDIO_WD_MAX_RESTARTS) {
+                gSohAudioWatchdogState = 3;
+                SohIos_AudioNote("watchdog gave up -- restart budget spent, audio stays silent this run");
+                return NULL;
+            }
+            gSohAudioWatchdogRestarts = gSohAudioWatchdogRestarts + 1;
+            if (satConfirmed) {
+                gSohAudioSaturations = gSohAudioSaturations + 1;
+                satActed = 1;
+            }
+            // (b) RE-READ THE BEATS IMMEDIATELY BEFORE THE DIRECT CALL. The
+            // direct close+open is only safe while the audio thread is not
+            // turning, and "not turning" is a fact about NOW, not about a
+            // decision taken up to three seconds ago. If it moved in between,
+            // the one-writer request path is used instead -- which is what
+            // 1.0.1.21 would have done, and it would have done nothing at all,
+            // correctly.
+            int direct = 0;
+            if (deadConfirmed && !noDevice) {
+                if (gSohAudioBeats == beats) {
+                    direct = 1;
+                } else {
+                    SohIos_AudioNote("watchdog: the thread woke between decision and act -- using the request path");
+                }
+            }
+            SohIos_AudioNote(what);
+            if (direct) {
+                // The audio thread is not turning, so it can never service a
+                // request flag -- and for the same reason nothing else is
+                // inside SDL's device right now, which is what makes calling
+                // the reopen from HERE safe. This is the only path that does.
+                extern void SohIos_AudioReopenDevice(void);
+                SohIos_AudioReopenDevice();
+            } else {
+                // The audio thread is alive: IT does the reopen, at the top of
+                // its next tick, because SDL_CloseAudioDevice underneath a live
+                // SDL_QueueAudio is a race and one writer is the rule.
+                gSohAudioReopenReq = 1;
+            }
+        } else if (!backgrounded) {
+            gSohAudioWatchdogState = 1;
+        }
+        // The state, and the session counters, reach vr-mem.log ON CHANGE --
+        // not every window (that would bury the heartbeat) and not never (which
+        // is what R14 shipped, so `session_fails` climbing was only ever
+        // visible to a console nobody had attached).
+        if (gSohAudioWatchdogState != statePrev) {
+            static const char* const kSohWdNames[4] = { "waiting", "healthy", "unhealthy", "gave-up" };
+            char detail[192];
+            snprintf(detail, sizeof(detail),
+                     "watchdog state -> %s (session_fails=%llu recoveries=%llu saturations=%d skips=%d)",
+                     kSohWdNames[(gSohAudioWatchdogState >= 0 && gSohAudioWatchdogState < 4)
+                                     ? gSohAudioWatchdogState
+                                     : 0],
+                     (unsigned long long)gSohAudioSessionFails, (unsigned long long)gSohAudioRecoveries,
+                     (int)gSohAudioSaturations, (int)gSohAudioWatchdogSkips);
+            SohIos_AudioNote(detail);
+            statePrev = gSohAudioWatchdogState;
+        }
+        lastBytes = bytes;
+        lastBeats = beats;
+        lastFails = fails;
+        firstWindow = 0;
+    }
+    return NULL;
+}
+
+// --- R17 part B (e): THE OBSERVERS THAT DID NOT EXIST -----------------------
+//
+// grep for AVAudioSessionInterruptionNotification across app/ios before this
+// round: nothing. The app prepared the session and opened a device and then
+// never listened again -- so an interruption (Siri, a FaceTime call, another
+// app taking the route) left SDL's device paused with nobody to unpause it, and
+// a media-services reset left a device id that no longer names anything. All
+// three are recoverable, and all three are recovered through the ONE-WRITER
+// request path: the audio thread does the reopen at the top of its next tick.
+// Nothing here closes a device on the main thread.
+static void SohIos_InstallAudioObservers(void) {
+    NSNotificationCenter* nc = NSNotificationCenter.defaultCenter;
+    [nc addObserverForName:AVAudioSessionInterruptionNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification* note) {
+                    NSNumber* type = note.userInfo[AVAudioSessionInterruptionTypeKey];
+                    if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
+                        SohIos_AudioPrepareSession();
+                        gSohAudioReopenReq = 1;
+                        SohIos_AudioNote("session interruption ENDED -- session prepared, reopen requested");
+                    } else {
+                        SohIos_AudioNote("session interruption BEGAN");
+                    }
+                }];
+    [nc addObserverForName:AVAudioSessionRouteChangeNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification* note) {
+                    NSNumber* reason = note.userInfo[AVAudioSessionRouteChangeReasonKey];
+                    // A route change does NOT invalidate the device, so this
+                    // prepares the session and says so; it does not reopen.
+                    // Reopening on every route change would fight the 3 s
+                    // spatial re-anchor timer in Swift.
+                    SohIos_AudioPrepareSession();
+                    char detail[96];
+                    snprintf(detail, sizeof(detail), "route change (reason=%lu) -- session prepared",
+                             (unsigned long)reason.unsignedIntegerValue);
+                    SohIos_AudioNote(detail);
+                }];
+    [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification* note) {
+                    // The only case where the device id is meaningless rather
+                    // than merely paused: everything must be rebuilt.
+                    SohIos_AudioPrepareSession();
+                    gSohAudioReopenReq = 1;
+                    SohIos_AudioNote("mediaServicesWereReset -- forced full reopen requested");
+                }];
+    NSLog(@"[audio] session observers armed (interruption, route change, media services reset)");
+}
+
+static void SohIos_InstallCrashHandler(void) {
+    SohIos_CrashPaths();
+    // BEFORE the heartbeat thread starts: it opens the heartbeat file O_TRUNC,
+    // and the previous run's last line is the entire evidence a memory kill
+    // leaves behind.
+    SohIos_RecordPreviousRun();
+    SohIos_InstallMemoryPressure();
+    // An alternate signal stack, per thread that matters most (this one), so a
+    // stack-overflow SIGSEGV still has somewhere to run the handler.
+    static char sSohAltStack[SIGSTKSZ * 4];
+    stack_t ss = { .ss_sp = sSohAltStack, .ss_size = sizeof(sSohAltStack), .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
+
+    int sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS };
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SohIos_CrashHandler;
+        sa.sa_flags = SA_ONSTACK | SA_RESETHAND;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sigs[i], &sa, NULL);
+    }
+
+    // ObjC: runs BEFORE any abort, and carries a name and a reason a bare
+    // SIGABRT backtrace does not.
+    NSSetUncaughtExceptionHandler(SohIos_ObjCExceptionHandler);
+
+    // C++: an uncaught throw reaches std::terminate first and abort() second,
+    // and the terminate handler is the only place the exception is still
+    // available to name. This translation unit is Objective-C, not C++, so
+    // <exception> is not includable here; the Itanium ABI mangling of
+    // `std::set_terminate(void(*)())` is stable and is what libc++ exports on
+    // every Apple platform, so it is declared by asm name rather than moving
+    // the whole shell to ObjC++ (which would change how several thousand lines
+    // compile to install one handler).
+    {
+        typedef void (*soh_terminate_fn)(void);
+        extern soh_terminate_fn soh_set_terminate(soh_terminate_fn) __asm("__ZSt13set_terminatePFvvE");
+        soh_set_terminate(SohIos_TerminateHandler);
+    }
+
+    pthread_t th;
+    pthread_create(&th, NULL, SohIos_HeartbeatThread, NULL);
+    pthread_detach(th);
+    // R14: the audio launch watchdog rides the same arm point. It costs one
+    // sleeping thread and it is the only thing in the program that can notice a
+    // silent launch while the launch is still happening.
+    pthread_create(&th, NULL, SohIos_AudioWatchdogThread, NULL);
+    pthread_detach(th);
+    // R17 part B: and the session observers, which have to exist before the
+    // first interruption rather than after the first report of one.
+    SohIos_InstallAudioObservers();
+    NSLog(@"[soh] crash capture armed (signals+terminate+objc+heartbeat+audio watchdog), avail_mem=%ld MB",
+          SohIos_AvailableMemoryMB());
 }
 
 #pragma mark - Input trace (Documents/input-trace.txt)
@@ -831,6 +2828,28 @@ static NSString* SohIos_HandleConsoleLine(NSString* line) {
     if ([cmd isEqualToString:@"thermal"]) {
         return [NSString stringWithFormat:@"ok thermal=%d", SohIos_ThermalState()];
     }
+    // R2a: the build stamp, over the bridge. The spec asks for a stamp
+    // asserted at launch; the device dev loop needs the same answer from the
+    // Mac, because "did my build actually get installed and started" is the
+    // first question of every headset session and the ONLY way to be sure the
+    // dumps that follow come from the build under test.
+    if ([cmd isEqualToString:@"ver"]) {
+        NSDictionary* sohInfo = NSBundle.mainBundle.infoDictionary;
+        int sohMode = 0;
+#if TARGET_OS_VISION
+        // The tri-state (spec D1) exists only where the immersive shell is
+        // compiled; SohIosShell.m is linked on iPhone too, where an unguarded
+        // reference would not resolve.
+        extern int Soh_GetMode(void);
+        sohMode = Soh_GetMode();
+#endif
+        return [NSString stringWithFormat:@"ok ver=%@ build=%@ bundle=%@ os=%@ %@ mode=%d",
+                                          sohInfo[@"CFBundleShortVersionString"] ?: @"?",
+                                          sohInfo[@"CFBundleVersion"] ?: @"?",
+                                          sohInfo[@"CFBundleIdentifier"] ?: @"?",
+                                          UIDevice.currentDevice.systemName,
+                                          UIDevice.currentDevice.systemVersion, sohMode];
+    }
     if ([cmd isEqualToString:@"drawable"]) {
         float t = 0;
 #if TARGET_OS_VISION
@@ -999,6 +3018,15 @@ static NSString* SohIos_HandleConsoleLine(NSString* line) {
                              gSoh3DDbgConv, gSoh3DDbgSep, gSoh3DDrainTicks, gSoh3DGcdProbe, gSoh3DDbgMenuVis,
                              gSoh3DDbgMenuBuilds, gSoh3DDbgMenuVtx, gSoh3DDbgMenuDraws];
     }
+    if ([cmd isEqualToString:@"vr"]) {
+        // VR-spec D10: the diagnostics dump family. Never dispatch_sync from
+        // a bridge handler — every path below reads published state or sets a
+        // flag the compositor loop consumes.
+        extern NSString* SohVR_HandleCommand(NSArray<NSString*>* args);
+        NSArray<NSString*>* args =
+            tok.count >= 2 ? [tok subarrayWithRange:NSMakeRange(1, tok.count - 1)] : @[];
+        return SohVR_HandleCommand(args);
+    }
 #endif
     if ([cmd isEqualToString:@"logtail"]) {
         int lines = tok.count >= 2 ? MAX(10, MIN(400, tok[1].intValue)) : 80;
@@ -1081,6 +3109,20 @@ static NSString* SohIos_HandleConsoleLine(NSString* line) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
             SohIos_PadAxis(SDL_CONTROLLER_AXIS_LEFTX, 0);
             SohIos_PadAxis(SDL_CONTROLLER_AXIS_LEFTY, 0);
+        });
+        return @"ok";
+    }
+    // VR R3: the RIGHT stick, so the turn (and the C-button provenance mask that
+    // overlay 0039 rev3 applies to it) can be driven and asserted from the
+    // simulator. Same shape as `stick`.
+    if ([cmd isEqualToString:@"rstick"] && tok.count >= 3) {
+        float x = tok[1].floatValue, y = tok[2].floatValue;
+        int ms = tok.count >= 4 ? tok[3].intValue : 500;
+        SohIos_PadAxis(SDL_CONTROLLER_AXIS_RIGHTX, (Sint16)(MAX(-1.f, MIN(1.f, x)) * 32767));
+        SohIos_PadAxis(SDL_CONTROLLER_AXIS_RIGHTY, (Sint16)(MAX(-1.f, MIN(1.f, y)) * 32767));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            SohIos_PadAxis(SDL_CONTROLLER_AXIS_RIGHTX, 0);
+            SohIos_PadAxis(SDL_CONTROLLER_AXIS_RIGHTY, 0);
         });
         return @"ok";
     }
@@ -1285,10 +3327,15 @@ static int SohIos_EventFilter(void* userdata, SDL_Event* event) {
 }
 - (void)sceneWillResignActive:(UIScene*)scene {
     SohIos_FlushConfig("sceneWillResignActive"); // swipe-kill safety
+    // R8 review: the clean-exit marker was only on the UIApplication
+    // notification path; this scene path is the one that actually fires on a
+    // swipe-kill, so without it every backgrounded run read as a memory kill.
+    SohIos_MarkCleanExit("sceneWillResignActive");
     [self fwd:@selector(applicationWillResignActive:)];
 }
 - (void)sceneDidEnterBackground:(UIScene*)scene {
     SohIos_FlushConfig("sceneDidEnterBackground");
+    SohIos_MarkCleanExit("sceneDidEnterBackground");
     SohIos_SetBackgrounded(1); // gate Metal rendering (overlay 0016)
     [self fwd:@selector(applicationDidEnterBackground:)];
 }
@@ -3264,4 +5311,53 @@ void SohIos_OnWindowCreated(struct SDL_Window* sdlWindow) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(),
                        ^{ SohIos_InstallOverlayWhenReady(window, 0); });
     });
+}
+
+// ---------------------------------------------------------------------------
+// R10 verdict 5: THE SENSE PAIR IN 2D
+// ---------------------------------------------------------------------------
+//
+// the user, on 1.0.1.13: *"The VR controllers no longer work in 2D mode. Is there
+// a way to allow it in 2D without messing up VR?"*
+//
+// Two mechanisms in series took them away, and BOTH were correct on their own.
+// Overlay 0052 removed a spatial controller from SDL's gamepad enumeration,
+// because SDL's MFi backend accepts any GCController with a physicalInputProfile
+// and SoH's default mapping then bound the Sense right stick to the four C
+// buttons -- the complaint that survived two rounds. Overlay 0047's merge, which
+// is what a Sense unit reaches the game through instead, was gated on
+// `gSohVRMode != 0`. Outside VR, therefore: not a gamepad, and not merged.
+// Nothing polled them at all.
+//
+// The tracking half genuinely needs VR (an ARKit session, a head pose, an
+// anchor); the BUTTONS AND STICKS need none of it -- they are ordinary
+// GameController inputs. So this pump reads exactly that half, on the game
+// thread, from overlay 0047's own hook, and publishes into the same words the VR
+// loop publishes. The VR loop OWNS those words while it runs, so the pump stands
+// down for it: one producer at a time, whichever mode is live.
+//
+// TARGET_OS_VISION, because SohSense.m is only compiled into the visionOS
+// target; on iPhone this is a no-op and the call from overlay 0047 still links.
+void SohVR_SenseFlatPump(void) {
+#if TARGET_OS_VISION
+    extern volatile int gSohVRRunning;
+    if (gSohVRRunning) {
+        // The compositor loop is publishing these words this frame. Nothing to
+        // do, and writing them from here would be two producers on one datum.
+        gSohVRSenseFlat = 0;
+        return;
+    }
+    SohSense_UpdateFlat();
+    for (int h = 0; h < 2; h++) {
+        float sx = 0.0f, sy = 0.0f;
+        gSohVRSenseBtn[h] = SohSense_HandButtons(h);
+        SohSense_HandStick(h, &sx, &sy);
+        gSohVRSenseStickX[h] = sx;
+        gSohVRSenseStickY[h] = sy;
+    }
+    gSohVRSenseActive = SohSense_Active();
+    gSohVRSenseFlat = gSohVRSenseActive;
+#else
+    gSohVRSenseFlat = 0;
+#endif
 }

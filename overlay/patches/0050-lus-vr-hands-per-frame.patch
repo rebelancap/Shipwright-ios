@@ -1,0 +1,305 @@
+Overlay patch 0050: HANDS AT HEADSET RATE (VR R5, VR-DONOR-MAP 10's last
+line -- "hand-matrix substitution by pointer identity ordered ahead of the
+interpolation replacement map").
+
+THE PROBLEM, which is R4's gap 5 and is a headset question R4 could not answer.
+Overlay 0042 pins the two hand limbs to the controller pose, but it does so
+during Play_Draw, which runs ONCE PER GAME TICK. LUS then re-executes that same
+recorded display list for every intermediate frame with a per-frame matrix
+REPLACEMENT MAP, blending the last two ticks' matrices. So the hands you see are
+20 Hz of hand motion, interpolated, inside a 90 or 120 Hz frame: up to 50 ms of
+lag and a stair-step no amount of filtering upstream can remove. The eyes
+already run at compositor rate. The hands did not.
+
+THE FIX, and it is the donor's: tag the hand's Mtx by POINTER at record time and
+substitute the LIVE pose for it at interpretation time, ORDERED AHEAD OF the
+interpolation map -- if a pointer is a hand's, the interpolated value is never
+consulted. Since our 0031 interprets the whole list once per EYE and both eyes
+of a pair run inside one compositor frame, that makes the hands step at
+compositor rate for free, and keeps them coherent with the eyes because both
+read the SAME pair slot (the R2a invariant: everything presented in a pair
+carries one pose).
+
+WHY A DELTA AND NOT A SUBSTITUTION. The hand limb's Mtx is not the hand pose --
+it is scale * mirror * handPose, and the HELD ITEM draws on a second Mtx that is
+itemOffset * scale * mirror * handPose. Replacing either outright would throw
+away the local part. So we publish, alongside the pointers, the hand matrix that
+was USED to build them (H_rec), and at interpretation compute
+
+    D = inverse(H_rec) * H_live      and      M' = M * D
+
+in row-vector convention, which is exactly right for both: (L * H_rec) * D
+= L * H_live for any local L. The sword follows the hand for free, which is what
+made 0042's "held items ride the hand matrix" true in the first place.
+
+WHERE THE POINTERS COME FROM. `play->flexLimbOverrideMTX` is set by
+SkelAnime_DrawFlexLimbOpa immediately BEFORE it calls the override, and points at
+the Mtx slot this limb is about to be written into. So the override knows the
+address without touching z_skelanime.c. The held item's Mtx comes from a
+different allocation entirely (Matrix_NewMtx out of the graph pool, inside
+PostLimbDraw), so instead of guessing it we TAG: the override sets
+gSohVRHandMtxTag while it is pinning a hand, and Matrix_ToMtx -- the single
+funnel every Mtx in the game passes through -- registers whatever is produced
+while the tag is live. The tag is cleared on the next override call, and the draw
+order (override -> the limb's own Mtx -> PostLimbDraw's item Mtx -> next limb's
+override) is exactly the span that wants covering. Two allocations per hand is
+the normal case; the table holds four.
+
+THE ONE INVARIANT THIS MUST NOT BREAK. The eyes of a pair must see identical
+hands. They do: the substitution reads gSohVRHandMat[gSohVRPairSlot], which 0031
+latches once for the pair, and gSohVRPairSlot does not move between eye 0 and eye
+1. It moves between PAIRS, which is precisely the rate we want.
+
+FAILURE MODES, all of which fall back to exactly today's behaviour: the tag
+table empty (nothing registered -- no VR, no hands, the override never ran);
+gSohVRHandRecValid 0 (no record matrix, so no delta is computable); a
+non-invertible record matrix (guarded; a zero-determinant basis returns
+unchanged); gSohVRHandLive 0 (the red control -- `vr set handlive 0` reproduces
+R4's 20 Hz hands for an A/B in the headset).
+
+Two files: soh/src/code/sys_matrix.c (the registration funnel) and
+libultraship/src/fast/interpreter.cpp (the substitution). z_player.c's tag
+set/clear rides in overlay 0042's own regeneration, not here, because it lives
+inside text 0042 inserted.
+
+A NOTE ON THE SHAPE OF THE interpreter.cpp EDIT, because the first version of
+this patch got it wrong and the failure was instructive: it originally SPLIT
+GfxSpMatrix into a front half and a GfxSpMatrixApply back half. That is cleaner
+C++ and it broke the overlay -- overlay 0031 also inserts into this function,
+near its end, and the split moved 0031's context out from under its own reverse
+probe, so `apply-overlay.sh` could no longer tell an applied 0031 from an
+unapplied one and the second run failed. The shipped version adds ONE branch
+ahead of the existing if/else and touches nothing else, which is the general
+rule the spec already states for stacked patches: prefer the edit that leaves
+every other patch's context alone, even when it reads slightly worse.
+
+--- a/soh/src/code/sys_matrix.c
++++ b/soh/src/code/sys_matrix.c
+@@ -545,16 +545,58 @@
+         cmf->yx = 0.0f;
+     }
+     FrameInterpolation_RecordMatrixSetTranslateRotateYXZ(translateX, translateY, translateZ, rot);
++}
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0050, VR R5): HAND MATRIX REGISTRATION. Matrix_ToMtx is
++ * the single funnel every Mtx in the game passes through (Matrix_NewMtx
++ * calls it), so tagging around the hand limb's draw catches BOTH the limb's
++ * own matrix and the held item's, which PostLimbDraw allocates separately
++ * out of the graph pool. Overlay 0042 sets the tag; it is cleared on the
++ * next override call, which is exactly the span that wants covering. */
++extern volatile int gSohVRHandMtxTag; /* 0 = none, hand + 1 */
++extern void* volatile gSohVRHandMtxPtr[2][4];
++extern volatile int gSohVRHandMtxCount[2];
++
++static void SohVrRegisterHandMtx(Mtx* dest) {
++    s32 sohHand = gSohVRHandMtxTag - 1;
++    s32 sohN;
++
++    if ((sohHand < 0) || (sohHand > 1) || (dest == NULL)) {
++        return;
++    }
++    sohN = gSohVRHandMtxCount[sohHand];
++    if ((sohN < 0) || (sohN >= 4)) {
++        return;
++    }
++    gSohVRHandMtxPtr[sohHand][sohN] = (void*)dest;
++    /* Count published AFTER the pointer, so a reader that catches the write
++     * in progress catches a smaller table, never a garbage pointer. */
++    gSohVRHandMtxCount[sohHand] = sohN + 1;
+ }
++#endif
+ 
+ Mtx* Matrix_MtxFToMtx(MtxF* src, Mtx* dest) {
+     FrameInterpolation_RecordMatrixMtxFToMtx(src, dest);
++#ifdef __IOS__
++    /* One of the two routes into an Mtx; Matrix_ToMtx below is the other.
++     * Both are registered, because the held item's matrix can come through
++     * either depending on how the actor draws it. */
++    if (gSohVRHandMtxTag != 0) {
++        SohVrRegisterHandMtx(dest);
++    }
++#endif
+     guMtxF2L(src, dest);
+     return dest;
+ }
+ 
+ Mtx* Matrix_ToMtx(Mtx* dest, char* file, s32 line) {
+     FrameInterpolation_RecordMatrixToMtx(dest, file, line);
++#ifdef __IOS__
++    if (gSohVRHandMtxTag != 0) {
++        SohVrRegisterHandMtx(dest);
++    }
++#endif
+     guMtxF2L(Matrix_CheckFloats(sCurrentMatrix, file, line), dest);
+     return dest;
+     // return Matrix_MtxFToMtx(MATRIX_CHECKFLOATS(sCurrentMatrix), dest);
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -1429,11 +1429,166 @@
+     Interpreter::TransposedMatrixMul(coeffs, light_dir,
+                                      mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+     Interpreter::NormalizeVector(coeffs);
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0050, VR R5): HANDS AT HEADSET RATE. See the patch
++// header. The recorded matrices are built once per GAME TICK; these let
++// GfxSpMatrix re-seat the two hands -- and everything drawn on their
++// matrices, the held sword and shield included -- onto the live pose of
++// THIS pair, ahead of the interpolation replacement map.
++//
++// gSohVRPairSlot is also declared by overlay 0031 further down this file; a
++// repeated extern of the same type is legal and is preferable to anchoring
++// this patch on text another patch inserted. The block carries C linkage:
++// the shell defines these in Objective-C, and a C++-mangled declaration
++// inside namespace Fast compiles perfectly and then fails to link.
++extern "C" {
++extern volatile int gSohVRPairSlot;
++extern volatile int gSohVRHandLive;
++extern volatile float gSohVRHandMat[2][2][16];
++extern volatile int gSohVRHandValid[2];
++extern void* volatile gSohVRHandMtxPtr[2][4];
++extern volatile int gSohVRHandMtxCount[2];
++extern volatile float gSohVRHandRecMat[2][16];
++extern volatile int gSohVRHandRecValid[2];
++extern volatile int gSohVRHandLiveHits;
++extern volatile int gSohVRHandLiveSearch;
++extern volatile int gSohVRMode;
++extern volatile int gSohVRFpActive;
+ }
+ 
++// Interpreter::MatrixMul is a private static member and these are free
++// functions, so this is its body, verbatim (interpreter.cpp:1535-1543).
++static void Soh3DMatMul(float res[4][4], const float a[4][4], const float b[4][4]) {
++    float tmp[4][4];
++    for (int i = 0; i < 4; i++) {
++        for (int j = 0; j < 4; j++) {
++            tmp[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
++        }
++    }
++    memcpy(res, tmp, sizeof(tmp));
++}
++
++// The delta that carries a matrix recorded against the TICK's hand pose onto
++// this compositor frame's hand pose: D = inverse(H_rec) * H_live, row-vector,
++// so (L * H_rec) * D == L * H_live for any local part L. That identity is why
++// the held item follows the hand with no extra work -- its matrix carries the
++// same H_rec on the right and a different L on the left.
++//
++// H is an affine transform with a rotation-and-uniform-scale basis, so the
++// inverse is the 3x3 adjugate over the determinant plus the transformed
++// translation. A zero determinant means the published matrix is garbage:
++// return false and the caller takes the ordinary path, which is exactly R4's
++// behaviour. Every failure here degrades to R4, never to a missing hand.
++static bool Soh3DHandDelta(int hand, float out[4][4]) {
++    if (gSohVRHandLive == 0 || hand < 0 || hand > 1 || gSohVRHandValid[hand] == 0 ||
++        gSohVRHandRecValid[hand] == 0) {
++        return false;
++    }
++    int slot = gSohVRPairSlot & 1;
++    float R[4][4];
++    float L[4][4];
++    for (int i = 0; i < 4; i++) {
++        for (int j = 0; j < 4; j++) {
++            R[i][j] = gSohVRHandRecMat[hand][i * 4 + j];
++            L[i][j] = gSohVRHandMat[slot][hand][i * 4 + j];
++        }
++    }
++    float det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) -
++                R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
++                R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
++    if (det > -1e-12f && det < 1e-12f) {
++        return false;
++    }
++    float id = 1.0f / det;
++    float inv[4][4] = { { 0 } };
++    inv[0][0] = (R[1][1] * R[2][2] - R[1][2] * R[2][1]) * id;
++    inv[0][1] = (R[0][2] * R[2][1] - R[0][1] * R[2][2]) * id;
++    inv[0][2] = (R[0][1] * R[1][2] - R[0][2] * R[1][1]) * id;
++    inv[1][0] = (R[1][2] * R[2][0] - R[1][0] * R[2][2]) * id;
++    inv[1][1] = (R[0][0] * R[2][2] - R[0][2] * R[2][0]) * id;
++    inv[1][2] = (R[0][2] * R[1][0] - R[0][0] * R[1][2]) * id;
++    inv[2][0] = (R[1][0] * R[2][1] - R[1][1] * R[2][0]) * id;
++    inv[2][1] = (R[0][1] * R[2][0] - R[0][0] * R[2][1]) * id;
++    inv[2][2] = (R[0][0] * R[1][1] - R[0][1] * R[1][0]) * id;
++    // Row-vector: the translation ROW of the inverse is -t * inv3.
++    for (int j = 0; j < 3; j++) {
++        inv[3][j] = -(R[3][0] * inv[0][j] + R[3][1] * inv[1][j] + R[3][2] * inv[2][j]);
++    }
++    inv[3][3] = 1.0f;
++    Soh3DMatMul(out, inv, L);
++    return true;
++}
++
++// Fill `matrix` with the recorded matrix re-seated onto this pair's live hand
++// pose, or return false and leave it alone. Pointer identity, at most eight
++// compares, and outside VR the very first test fails.
++static bool Soh3DHandMatrix(const int32_t* addr, float matrix[4][4]) {
++    // rev2 (VR R6): SCOPED TO VR FIRST PERSON. The rev1 gate was
++    // gSohVRHandLive alone -- a knob that defaults to 1 and is never
++    // cleared -- so the pointer search below ran on every GfxSpMatrix in
++    // the flat window and the 3D panel too, where there are no hands and
++    // the table is meaningless. It is also the second half of the stale-
++    // pointer fix: the shell clears the table at both ends of a session,
++    // and outside a session this never looks at it at all.
++    if (gSohVRHandLive == 0 || gSohVRMode == 0 || gSohVRFpActive == 0) {
++        return false;
++    }
++    gSohVRHandLiveSearch = gSohVRHandLiveSearch + 1;
++    int hand = -1;
++    for (int h = 0; h < 2 && hand < 0; h++) {
++        int n = gSohVRHandMtxCount[h];
++        if (n > 4) {
++            n = 4;
++        }
++        for (int i = 0; i < n; i++) {
++            if (gSohVRHandMtxPtr[h][i] == (const void*)addr) {
++                hand = h;
++                break;
++            }
++        }
++    }
++    if (hand < 0) {
++        return false;
++    }
++    float d[4][4];
++    if (!Soh3DHandDelta(hand, d)) {
++        return false;
++    }
++    float rec[4][4];
++#ifndef GBI_FLOATS
++    for (int i = 0; i < 4; i++) {
++        for (int j = 0; j < 4; j += 2) {
++            int32_t ip = addr[i * 2 + j / 2];
++            uint32_t fp = addr[8 + i * 2 + j / 2];
++            rec[i][j] = (int32_t)((ip & 0xffff0000) | (fp >> 16)) / 65536.0f;
++            rec[i][j + 1] = (int32_t)((ip << 16) | (fp & 0xffff)) / 65536.0f;
++        }
++    }
++#else
++    memcpy(rec, addr, sizeof(rec));
++#endif
++    Soh3DMatMul(matrix, rec, d);
++    gSohVRHandLiveHits = gSohVRHandLiveHits + 1;
++    return true;
++}
++#endif
++
+ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
+     float matrix[4][4];
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0050, VR R5): ORDERED AHEAD OF THE INTERPOLATION MAP,
++    // deliberately. The interpolated value blends two GAME TICKS of hand
++    // pose, which is the 20 Hz stair-step this patch exists to remove; the
++    // recorded matrix plus THIS pair's live delta is the whole point. Both
++    // eyes of a pair read gSohVRPairSlot, which 0031 latches once for the
++    // pair, so the R2a one-pose-per-frame invariant holds.
++    if (Soh3DHandMatrix(addr, matrix)) {
++        // matrix is already filled; fall through to the stack work below.
++    } else
++#endif
+     if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
+         for (int i = 0; i < 4; i++) {
+             for (int j = 0; j < 4; j++) {

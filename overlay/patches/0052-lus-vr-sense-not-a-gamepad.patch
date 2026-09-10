@@ -1,0 +1,135 @@
+Overlay patch 0052 (VR R9 part B): A SENSE CONTROLLER IS NOT AN SDL GAMEPAD.
+
+the user, on 1.0.1.12: "The right joystick is STILL sometimes triggering C
+buttons! Stop this! It should ONLY trigger C buttons when you're holding
+ocarina."
+
+THE CAUSE, and none of it is in an overlay we owned. Three stock mechanisms in
+series:
+
+  1. SDL's MFi joystick backend accepts ANY GCController that has a
+     physicalInputProfile (build-visionos/_deps/sdl2-src/src/joystick/iphoneos/
+     SDL_mfijoystick.m:488-492 -- stock, unpatched). A PS VR2 Sense has one, so
+     each unit of the pair is ALSO an ordinary SDL game controller.
+  2. LUS hands every SDL gamepad it finds to port 0
+     (ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads, this file:
+     the loop ignores instance ids for ports 1..3 only).
+  3. SoH's default mapping binds RIGHTX/RIGHTY to BTN_CLEFT / BTN_CRIGHT /
+     BTN_CUP / BTN_CDOWN at the global 25% axis threshold
+     (libultraship/src/libultraship/controller/controldevice/controller/mapping/
+     ControllerDefaultMappings.cpp:86-102).
+
+So the Sense pair played the game TWICE: once through overlay 0047's six-input
+taxonomy, and once as an anonymous gamepad whose right stick is the C-pad.
+"Sometimes" is exactly right -- it depended on which unit SDL enumerated and
+whether its stick crossed 25%.
+
+WHY OVERLAY 0039'S MASK CANNOT CLOSE IT, which is the part worth recording. 0039
+clears the C bits a right-stick deflection produced, and it looks like the
+natural home for this. It is not, for three independent reasons:
+
+  * SCALE. 0039 tests the raw pad axis against 21 = 25% of MAX_AXIS_RANGE 85,
+    because that is the threshold the LUS mapping uses on its own axis scale.
+    The pad's own stick bytes are +/-127. The two thresholds are not the same
+    deflection, so a mask written against one cannot exactly cancel bits set
+    against the other.
+  * PROVENANCE. rev5 made the mask exempt Sense-produced bits deliberately (a
+    Sense C-left must survive a simultaneous stick-left). A C bit the SDL path
+    raised FROM a Sense stick is Sense-produced by every test 0039 can make, so
+    the exemption protects the very bits we want gone.
+  * REACH. 0039 is gated on `gSohVRMode != 0 && flat_latch == 0`, i.e. VR
+    gameplay only. Menus, the pause screen and the ocarina snapshot
+    (Audio_GetOcaInput takes its own PadMgr_RequestPadData) all see the raw C
+    bits. the user's report is "STILL sometimes", and those are the sometimes.
+
+THE FIX IS AT THE SOURCE: the pair never becomes an SDL gamepad at all. One test
+immediately after SDL_IsGameController, under __IOS__, asking the shell whether
+this device index names a SPATIAL controller. The shell's predicate
+(SohSense_IsSpatialControllerName, app/ios/SohSense.m) matches against the set of
+GCController.vendorNames that GameController itself reported as
+GCProductCategorySpatialController, which is exact, and falls back to a
+conservative substring ("Sense", "PlayStation VR2") for the one ordering we
+cannot rule out -- an enumeration that runs before any connect notification has
+landed. SDL_JoystickNameForIndex returns GCController.vendorName verbatim on this
+platform, which is what makes a name a sufficient identity here.
+
+WHAT MUST KEEP WORKING, and is asserted rather than assumed: a real gamepad.
+Nothing about this test can reach a device GameController does not call spatial,
+so an MFi/Xbox/DualSense pad enumerates, opens, maps and plays exactly as before
+-- in VR and everywhere else. The suite asserts the PREDICATE directly (`vr
+sensename NAME`), because the simulator has no controller to enumerate, and
+reports the live counts from `vr sdlpads`.
+
+The skip is COUNTED (SohSense_NoteSdlSpatialSkip) so "the pair was excluded" is a
+number in `vr sdlpads` rather than an inference from silence, and logged once per
+device so a headset log says which name was skipped.
+
+__IOS__-only, and the whole block is a no-op on every desktop build.
+
+rev2 (VR R18 part B): THE iPHONE BUILD DID NOT LINK. __IOS__ is defined for the
+iPhone build too (overlay 0022 flips CMAKE_SYSTEM_NAME to "iOS" for visionOS, so
+both platforms take every iOS path), but SohSense.m -- which DEFINES
+SohSense_IsSpatialControllerName and SohSense_NoteSdlSpatialSkip -- is compiled
+only under SOH_VISIONOS (soh/CMakeLists.txt: the visionOS block beside
+SohImmersive.m and SohVrPhys.c). So rev1 made libultraship reference two symbols
+the iPhone link has no definition for, and scripts/build-ios.sh has failed at the
+link step ever since. A release ships both IPAs, so this blocked the release.
+The guard is TARGET_OS_VISION rather than SOH_VISIONOS because SOH_VISIONOS is a
+soh-target define and this file is in libultraship, which never sees it;
+TARGET_OS_VISION comes from the SDK's own TargetConditionals.h (1 on xros, 0 on
+iphoneos) and is therefore exactly as reliable as the SDK. There is nothing to
+stub on iPhone: a PS VR2 Sense pair is a visionOS-only input path, so on iPhone
+the vanilla enumeration is what is wanted, byte for byte.
+
+--- a/libultraship/src/ship/controller/physicaldevice/ConnectedPhysicalDeviceManager.cpp
++++ b/libultraship/src/ship/controller/physicaldevice/ConnectedPhysicalDeviceManager.cpp
+@@ -1,6 +1,21 @@
+ #include "ship/controller/physicaldevice/ConnectedPhysicalDeviceManager.h"
+ #include <spdlog/spdlog.h>
+ 
++#ifdef __IOS__
++#include <TargetConditionals.h>
++#endif
++#if defined(__IOS__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
++/* SOH_IOS (overlay 0052 rev2, VR R9 part B): the shell's spatial-controller
++ * predicate. Defined in app/ios/SohSense.m, which soh/CMakeLists.txt compiles
++ * ONLY for visionOS -- so the reference has to be visionOS-only too, or the
++ * iPhone link fails on two undefined symbols (rev1 did exactly that). A Sense
++ * pair is a visionOS-only input path; iPhone keeps the vanilla enumeration.
++ * TARGET_OS_VISION, not SOH_VISIONOS: this file is libultraship, which never
++ * sees soh's target defines. */
++extern "C" int SohSense_IsSpatialControllerName(const char* name);
++extern "C" void SohSense_NoteSdlSpatialSkip(void);
++#endif
++
+ namespace Ship {
+ ConnectedPhysicalDeviceManager::ConnectedPhysicalDeviceManager() {
+ }
+@@ -76,6 +91,27 @@
+             continue;
+         }
+ 
++#if defined(__IOS__) && defined(TARGET_OS_VISION) && TARGET_OS_VISION
++        /* SOH_IOS (overlay 0052, VR R9 part B): A SPATIAL CONTROLLER IS NOT A
++         * GAMEPAD. SDL's MFi backend accepts any GCController with a
++         * physicalInputProfile, so each PS VR2 Sense unit arrives here as an
++         * ordinary game controller -- and SoH's default mapping binds its right
++         * stick to the four C buttons at 25%. That is the user's "the right
++         * joystick is STILL sometimes triggering C buttons", and it is upstream
++         * of every mask we own. The pair reaches the game through overlay 0047's
++         * own taxonomy; it must not also reach it as an anonymous pad. */
++        {
++            const char* sohJoyName = SDL_JoystickNameForIndex(i);
++            if (SohSense_IsSpatialControllerName(sohJoyName)) {
++                SohSense_NoteSdlSpatialSkip();
++                SPDLOG_INFO("SDL joystick '{}' (GUID: {}) is a SPATIAL controller -- not enumerating it as a "
++                            "gamepad; it plays through the VR Sense path instead.",
++                            sohJoyName != nullptr ? sohJoyName : "(null)", deviceGuidCStr);
++                continue;
++            }
++        }
++#endif
++
+         auto gamepad = SDL_GameControllerOpen(i);
+         if (gamepad == nullptr) {
+             SPDLOG_ERROR("SDL GameControllerOpen error (GUID: {}): {}", deviceGuidCStr, SDL_GetError());

@@ -1,0 +1,432 @@
+Overlay patch 0044 (VR R3): MAKE AUDIO SILENCE IMPOSSIBLE TO MISS, AND
+RECOVERABLE.
+
+THE REGRESSION. Build 1.0.1.3 had no audio at all on the Vision Pro
+("sound no longer works. couldn't hear any audio." -- the user, 2026-09-03);
+1.0.1.2 had audio. A full audit of 3a540e8..231f09a found that NOTHING in that
+diff touches the audio path, the audio session, or any thread audio uses:
+`Graph_ProcessGfxCommands` is called unconditionally from RunFrame after
+Graph_Update returns, `func_800F3054()` (the whole audio update) sits OUTSIDE
+graph.c's `if (!problem)` block, G_RDPFULLSYNC is a stubbed command handler, the
+[2]->[3] eye arrays agree at all six declaration sites, and the CVar stash names
+no gAudio* key. So the silence arrives through a RESOURCE or SESSION side
+effect, and SoH has exactly one funnel where that produces total silence with no
+crash and no log line:
+
+    OTRGlobals.cpp, the producer guard
+      if (AudioPlayer_Buffered() + SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE >
+          AudioPlayer_GetDesiredBuffered()) { audio.processing = false; }
+
+The audio thread self-pumps every 5 ms and is NOT gated on rendering, so a slow
+or hung game thread cannot silence it. It can only go quiet if
+AudioPlayer_Buffered() -- SDL_GetQueuedAudioSize -- stops FALLING, i.e. the
+CoreAudio device has stopped draining the queue. On visionOS entering a full
+ImmersiveSpace re-anchors the audio session (SohVisionApp.swift's
+setIntendedSpatialExperience, re-applied on a 3 s timer) and can interrupt the
+device; SDL neither notices nor resumes. The queue then sits permanently at
+capacity, the guard skips forever, and the game is silent with no diagnostic.
+
+Compounding it: SDLAudioPlayer::DoPlay THROWS AWAY SDL_QueueAudio's return
+value, so if the queue call fails (allocation failure under the +375 MB
+framebuffer step that 1.0.1.3's 4096 eye budget, HUD framebuffers and 8-slot
+vertex pool introduced) it fails completely invisibly.
+
+WHAT THIS PATCH DOES. Three things, all __IOS__-only -- the macOS build and
+every desktop build compile byte-for-byte vanilla.
+
+(a) DoPlay checks SDL_QueueAudio's return and counts failures. A failing queue
+    can never again be silent in both senses of the word.
+(b) A STALL WATCHDOG in the audio thread. If the backend queue has been at or
+    above the desired level for more than one second -- which, with a healthy
+    device draining at 32 kHz, cannot happen -- the device is not draining. The
+    watchdog clears the stale queue and re-issues SDL_PauseAudioDevice(dev, 0),
+    which is exactly what recovers a device an interruption left paused. It
+    counts its own recoveries so `vr audio` can say whether it ever fired.
+(c) COUNTERS, published as plain globals the shell's `vr audio` reads:
+    beats (the thread is alive at all), produced, skipped-by-the-guard, queue
+    failures, watchdog recoveries, and the buffered/desired pair. the user's next
+    session proves audio in one line instead of listening for it.
+
+The counters live in the shell (app/ios/SohIosShell.m) so the iPhone build links
+them too; nothing outside __IOS__ references them.
+
+--- rev2 (VR R14): THE SILENT LAUNCH, WHICH THIS WATCHDOG COULD NOT SEE -------
+
+the user, on 1.0.1.17: "Sometimes I launch and there's no audio. I have to force
+quit and then there's audio. Not often, every once in a while."
+
+The stall watchdog above fires when the queue STOPS FALLING -- samples_left +
+SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE > desired, which with 528, R_UPDATE_RATE 3
+and DesiredBuffered 2480 means more than ~896 frames sitting in the device for a
+whole second. That is the right test for a device that opened and then stopped
+draining. It is exactly the WRONG test for a device that never opened at all: if
+SDL_OpenAudioDevice failed, mDevice is 0, SDL_GetQueuedAudioSize(0) returns 0
+forever, samples_left is pinned at ZERO, the stall counter resets every tick,
+produce_and_play runs at full rate and every SDL_QueueAudio call fails into a
+device id of 0. Silent, and invisible to a watchdog that only knows how to
+recognise a FULL queue. A relaunch cures it because the next AVAudioSession
+activation usually succeeds -- which is the user's sentence, in full.
+
+AND A ONE-SHOT FAILURE COULD LATCH FOREVER. Audio::InitAudioPlayer answers a
+failed Init() with SetCurrentAudioBackend(AudioBackend::NUL), which writes
+"null" into Window.AudioBackend and SAVES the config. One unlucky launch would
+make an install permanently silent, with no UI anywhere in the app to undo it.
+On iOS that latch is refused now.
+
+rev2 adds four things:
+
+(d) THE SESSION IS PREPARED BEFORE THE DEVICE IS OPENED, AND THE OPEN RETRIES.
+    SDL's coreaudio backend activates AVAudioSession itself and gives up on the
+    first refusal. SohIos_AudioPrepareSession (app/ios/SohIosShell.m) sets the
+    playback category and activates the session, counting and logging failures;
+    DoInit calls it before each of five attempts spread over ~1 s.
+(e) THE DEVICE CAN BE REOPENED. SohIos_AudioReopenDevice does DoClose + Init,
+    which is what recovers a device whose audio unit never started -- something
+    SDL_PauseAudioDevice(dev, 0) cannot do, because there is nothing to unpause.
+    Serialised by its own mutex, and harmless when audio was in fact fine: it
+    reopens a working device to a working device.
+(f) THE AUDIO THREAD SERVICES THE REQUEST. gSohAudioReopenReq is set by the
+    shell's launch watchdog and consumed at the top of this loop, for the same
+    one-writer reason the stall recovery lives here: closing a device underneath
+    a live SDL_QueueAudio is a race. The watchdog calls the reopen itself only
+    when the thread has stopped beating -- in which case nothing else is inside
+    SDL and that call is the only one there is.
+(g) AN EXCEPTION NO LONGER KILLS THE PROCESS. An uncaught throw under
+    OTRAudio_Thread reaches std::terminate and aborts -- the `OTRAudio_Thread`
+    cxx-terminate this project has carried as an open item since R10. The
+    producer block is wrapped, the fault is COUNTED, and the thread keeps
+    running.
+
+The device id and the live backend are published too, so `vr audio` can say
+"the device is 0" rather than leaving it to be inferred from a byte counter.
+
+--- rev3 (VR R17 part B): THE ERROR LINE THAT DESTROYED THE EVIDENCE ----------
+
+rev2's (a) made a failing queue impossible to miss. On 1.0.1.21 it made it
+impossible to see anything else. The shell's launch watchdog fired a false
+positive on every launch and reopened a healthy device; the reopened unit did not
+play; every subsequent SDL_QueueAudio failed; and this SPDLOG_ERROR wrote 19,700
+records in 80 milliseconds. The device's soh1.log came back as 10 MB carrying
+nothing but that line, with spdlog's 10-file rotation having discarded the
+session's entire history behind it -- so the round that needed the engine log had
+none.
+
+rev3 rate-limits it: the first 20 failures, then every thousandth, each carrying
+the running total. Nothing else in the patch changes. gSohAudioQueueFails is
+still incremented on every failure, so `vr audio` and the watchdog's two-window
+rule (which reads it as proof the audio thread is alive) see every one of them --
+only the log line is thinned, and it is thinned on the counter rather than on a
+clock so the thinning is deterministic and testable on the host.
+
+--- a/libultraship/src/ship/audio/SDLAudioPlayer.cpp
++++ b/libultraship/src/ship/audio/SDLAudioPlayer.cpp
+@@ -1,6 +1,37 @@
+ #include "ship/audio/SDLAudioPlayer.h"
+ #include <spdlog/spdlog.h>
++#ifdef __IOS__
++// SOH_IOS (overlay 0044 rev2, VR R14): the reopen serialises against
++// itself. The declaration block below moved up here in rev2 as well --
++// DoInit uses those symbols now, and DoInit is defined first.
++#include <mutex>
++#endif
++#ifdef __IOS__
++// SOH_IOS (overlay 0044, VR R3): audio silence must never be invisible.
++// See the patch header -- 1.0.1.3 went silent on the Vision Pro with no
++// crash and no log line, because SDL_QueueAudio's return was discarded
++// and a device that stops draining looks exactly like a full queue.
++extern "C" {
++extern volatile unsigned long long gSohAudioQueueFails;
++extern volatile unsigned long long gSohAudioQueueBytes;
++extern volatile unsigned long long gSohAudioRecoveries;
++/* rev2 (VR R14): the launch watchdog's half of the contract. */
++extern volatile unsigned long long gSohAudioOpenTries;
++extern volatile unsigned long long gSohAudioOpenFails;
++extern volatile unsigned long long gSohAudioReopens;
++extern volatile int gSohAudioDeviceId;
++int SohIos_AudioPrepareSession(void);
++void SohIos_AudioNote(const char* what);
++}
++// Called by the stall watchdog in OTRAudio_Thread. Clearing the stale
++// queue and re-issuing the unpause is what recovers a device that an
++// audio-session interruption left paused -- the failure mode entering a
++// full ImmersiveSpace can produce, which SDL neither notices nor undoes.
++extern "C" void SohIos_AudioRecoverDevice(void);
++static Ship::SDLAudioPlayer* sSohIosAudioPlayer = nullptr;
++#endif
+ 
++
+ namespace Ship {
+ 
+ SDLAudioPlayer::~SDLAudioPlayer() {
+@@ -37,7 +68,28 @@
+     want.samples = this->GetSampleLength();
+     want.callback = NULL;
+ 
++#ifdef __IOS__
++    // rev2 (VR R14): THE SILENT LAUNCH. AVAudioSession activation can be
++    // refused at launch (the app is not yet permitted to play), SDL fails
++    // the open with no retry, and a device id of 0 is a permanently silent
++    // run the stall watchdog cannot see -- a closed device reports a queue
++    // size of 0 forever, which reads as "empty", never as "stalled".
++    // Prepare the session, and try more than once.
++    for (int sohTry = 0; sohTry < 5; sohTry++) {
++        gSohAudioOpenTries = gSohAudioOpenTries + 1ull;
++        SohIos_AudioPrepareSession();
++        mDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
++        if (mDevice != 0) {
++            break;
++        }
++        gSohAudioOpenFails = gSohAudioOpenFails + 1ull;
++        SPDLOG_ERROR("SOH_IOS: SDL_OpenAudioDevice attempt {} failed: {}", sohTry + 1, SDL_GetError());
++        SDL_Delay(200);
++    }
++    gSohAudioDeviceId = (int)mDevice;
++#else
+     mDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
++#endif
+     if (mDevice == 0) {
+         SPDLOG_ERROR("SDL_OpenAudio error: {}", SDL_GetError());
+         return false;
+@@ -54,9 +106,65 @@
+ }
+ 
+ void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
++#ifdef __IOS__
++    sSohIosAudioPlayer = this;
+     if (Buffered() < 6000) {
++        if (SDL_QueueAudio(mDevice, buf, len) != 0) {
++            gSohAudioQueueFails = gSohAudioQueueFails + 1ull;
++            // rev3 (VR R17 part B): RATE-LIMITED, and this is not tidying.
++            // A device whose audio unit never started fails EVERY queue
++            // call, and this one line wrote 19,700 records in 80 ms: the
++            // device's soh1.log is 10 MB of nothing else, which rotated
++            // the whole 1.0.1.21 session history away and left the round
++            // with no engine log at all. The first 20 are the diagnosis;
++            // after that one in a thousand, carrying the running total so
++            // the VOLUME is still legible from a single line.
++            if (gSohAudioQueueFails <= 20ull || (gSohAudioQueueFails % 1000ull) == 0ull) {
++                SPDLOG_ERROR("SOH_IOS: SDL_QueueAudio failed ({} bytes, {} failures total): {}",
++                             (unsigned)len, (unsigned long long)gSohAudioQueueFails, SDL_GetError());
++            }
++        } else {
++            gSohAudioQueueBytes = gSohAudioQueueBytes + (unsigned long long)len;
++        }
++    }
++#else
++    if (Buffered() < 6000) {
+         // Don't fill the audio buffer too much in case this happens
+         SDL_QueueAudio(mDevice, buf, len);
+     }
++#endif
+ }
++
++#ifdef __IOS__
++extern "C" void SohIos_AudioRecoverDevice(void) {
++    if (sSohIosAudioPlayer == nullptr) {
++        return;
++    }
++    SDL_AudioDeviceID sohDev = sSohIosAudioPlayer->SohIos_Device();
++    if (sohDev == 0) {
++        return;
++    }
++    SDL_ClearQueuedAudio(sohDev);
++    SDL_PauseAudioDevice(sohDev, 0);
++    gSohAudioRecoveries = gSohAudioRecoveries + 1ull;
++    SPDLOG_ERROR("SOH_IOS: audio device was not draining -- queue cleared and device unpaused");
++}
++
++// rev2 (VR R14): THE FULL REOPEN, which the recovery above cannot do.
++// Unpausing a device whose audio unit never started has nothing to
++// unpause; closing it and opening it again re-activates the session and
++// starts a new unit. Serialised against itself, so it can never
++// double-open, and safe when audio was in fact fine.
++extern "C" void SohIos_AudioReopenDevice(void) {
++    static std::mutex sSohIosReopenMutex;
++    std::lock_guard<std::mutex> sohLock(sSohIosReopenMutex);
++    if (sSohIosAudioPlayer == nullptr) {
++        SohIos_AudioNote("reopen skipped -- no SDL player has ever been constructed");
++        return;
++    }
++    gSohAudioReopens = gSohAudioReopens + 1ull;
++    gSohAudioDeviceId = 0;
++    SohIos_AudioNote(sSohIosAudioPlayer->SohIos_Reopen() ? "device reopened" : "device reopen FAILED");
++}
++#endif
+ } // namespace Ship
+--- a/libultraship/include/ship/audio/SDLAudioPlayer.h
++++ b/libultraship/include/ship/audio/SDLAudioPlayer.h
+@@ -28,6 +28,20 @@
+      * Used by the audio subsystem to decide how many frames to produce per game tick.
+      */
+     int Buffered() override;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0044): the device id, for the stall watchdog's
++    // recovery path. Read-only accessor; nothing else is exposed.
++    SDL_AudioDeviceID SohIos_Device() const {
++        return mDevice;
++    }
++    // rev2 (VR R14): the launch watchdog's reopen. DoClose / DoInit are
++    // protected, and this is the ONE public door to them, so there is
++    // still exactly one piece of code that knows how to open a device.
++    bool SohIos_Reopen() {
++        DoClose();
++        return Init();
++    }
++#endif
+ 
+   protected:
+     /**
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -1018,6 +1018,25 @@
+ extern "C" int AudioPlayer_GetDesiredBuffered(void);
+ std::unordered_map<std::string, ExtensionEntry> ExtensionCache;
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0044, VR R3): the audio-liveness counters `vr audio`
++// reads, and the stall watchdog. See the patch header.
++extern "C" {
++extern volatile unsigned long long gSohAudioBeats;
++extern volatile unsigned long long gSohAudioProduced;
++extern volatile unsigned long long gSohAudioSkipped;
++extern volatile int gSohAudioBuffered;
++extern volatile int gSohAudioDesired;
++void SohIos_AudioRecoverDevice(void);
++/* rev2 (VR R14): the launch watchdog's request flag, the full-reopen
++ * entry point, and the exception counter. See the patch header. */
++extern volatile int gSohAudioReopenReq;
++extern volatile unsigned long long gSohAudioThreadFaults;
++void SohIos_AudioReopenDevice(void);
++void SohIos_AudioNote(const char* what);
++}
++#endif
++
+ void OTRAudio_Thread() {
+ #define SAMPLES_HIGH 560
+ #define SAMPLES_LOW 528
+@@ -1079,6 +1098,38 @@
+             std::unique_lock<std::mutex> Lock(audio.mutex);
+             int samples_left = AudioPlayer_Buffered();
+             u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
++#ifdef __IOS__
++            /* SOH_IOS (overlay 0044): liveness + the stall watchdog. The
++             * guard below is correct, but it is also the exact shape of a
++             * PERMANENT silence: if the backend stops DRAINING, buffered
++             * never falls, the guard skips forever, and nothing anywhere
++             * says so. With a healthy device at 32 kHz the queue cannot
++             * stay at capacity for a whole second, so that is the test. */
++            gSohAudioBeats = gSohAudioBeats + 1ull;
++            gSohAudioBuffered = samples_left;
++            gSohAudioDesired = AudioPlayer_GetDesiredBuffered();
++            /* rev2 (VR R14): the launch watchdog asks; THIS thread does
++             * it. Closing the device underneath a live SDL_QueueAudio is
++             * a race, and this loop is the only writer. */
++            if (gSohAudioReopenReq != 0) {
++                gSohAudioReopenReq = 0;
++                SohIos_AudioReopenDevice();
++            }
++            {
++                static int sSohStallTicks = 0;
++                if (samples_left + (int)(SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE) >
++                    AudioPlayer_GetDesiredBuffered()) {
++                    sSohStallTicks++;
++                    /* the loop self-pumps every 5 ms; 200 ticks is ~1 s */
++                    if (sSohStallTicks >= 200) {
++                        sSohStallTicks = 0;
++                        SohIos_AudioRecoverDevice();
++                    }
++                } else {
++                    sSohStallTicks = 0;
++                }
++            }
++#endif
+ 
+             // Producer guard (banteg/Shipwright#6594): skip advancing the audio
+             // engine if the backend ring cannot accept the smallest next burst.
+@@ -1086,9 +1137,15 @@
+             // audible as a click. The pre-buffer loop below will catch up once
+             // the backend drains enough.
+             if (AudioPlayer_Buffered() + SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE > AudioPlayer_GetDesiredBuffered()) {
++#ifdef __IOS__
++                gSohAudioSkipped = gSohAudioSkipped + 1ull;
++#endif
+                 audio.processing = false;
+             } else {
+                 produce_and_play(num_audio_samples);
++#ifdef __IOS__
++                gSohAudioProduced = gSohAudioProduced + 1ull;
++#endif
+                 audio.processing = false;
+             }
+         }
+@@ -1098,6 +1155,13 @@
+         // Safe for BGM — the N64 sequencer advances independently of gameplay.
+         // The producer guard (same as above) prevents advancing the audio engine
+         // when the backend ring is already at capacity.
++#ifdef __IOS__
++        /* rev2 (VR R14): an uncaught throw anywhere under this loop
++         * reaches std::terminate and aborts the PROCESS -- the
++         * `OTRAudio_Thread` cxx-terminate this project has carried as an
++         * open item since R10. Counted and survived instead. */
++        try {
++#endif
+         while (audio.running && AudioPlayer_Buffered() < AudioPlayer_GetDesiredBuffered()) {
+             if (AudioPlayer_Buffered() + SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE > AudioPlayer_GetDesiredBuffered()) {
+                 break;
+@@ -1106,6 +1170,16 @@
+             u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+             produce_and_play(num_audio_samples);
+         }
++#ifdef __IOS__
++        } catch (const std::exception& sohEx) {
++            gSohAudioThreadFaults = gSohAudioThreadFaults + 1ull;
++            SohIos_AudioNote("audio thread caught an exception -- kept running");
++            SPDLOG_ERROR("SOH_IOS: OTRAudio_Thread exception: {}", sohEx.what());
++        } catch (...) {
++            gSohAudioThreadFaults = gSohAudioThreadFaults + 1ull;
++            SohIos_AudioNote("audio thread caught an unknown exception -- kept running");
++        }
++#endif
+     }
+ }
+ 
+--- a/libultraship/src/ship/audio/Audio.cpp
++++ b/libultraship/src/ship/audio/Audio.cpp
+@@ -8,6 +8,12 @@
+ #include "ship/config/Config.h"
+ #include "ship/controller/controldeck/ControlDeck.h"
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0044 rev2, VR R14): which backend actually ended up
++// live, for `vr audio`. Defined in app/ios/SohIosShell.m.
++extern "C" volatile int gSohAudioBackend;
++#endif
++
+ namespace Ship {
+ 
+ Audio::~Audio() {
+@@ -35,10 +41,24 @@
+     }
+ 
+     if (mAudioPlayer && !mAudioPlayer->Init()) {
++#ifdef __IOS__
++        // rev2 (VR R14): DO NOT LATCH. On iOS a failed Init() means
++        // AVAudioSession refused to activate, which is TRANSIENT at
++        // launch -- and SetCurrentAudioBackend(NUL) writes "null" into
++        // Window.AudioBackend and SAVES it, so one unlucky launch would
++        // make the install permanently silent with no UI anywhere in the
++        // app to undo it. The player stays the SDL one and the launch
++        // watchdog reopens its device.
++        SPDLOG_ERROR("SOH_IOS: audio player Init() failed -- keeping the SDL backend for the watchdog");
++#else
+         // Failed to initialize system audio player.
+         // Fallback to Null if the native system player does not work.
+         SetCurrentAudioBackend(AudioBackend::NUL);
++#endif
+     }
++#ifdef __IOS__
++    gSohAudioBackend = (int)GetCurrentAudioBackend();
++#endif
+ }
+ 
+ void Audio::Init() {

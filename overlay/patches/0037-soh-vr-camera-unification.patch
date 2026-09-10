@@ -1,0 +1,130 @@
+Overlay patch 0037: VR camera unification (VR-spec D5, VR-DONOR-MAP §5).
+Two halves at the tail of Camera_Update, and the ORDER between them is the
+whole point.
+
+(a) EXPORT the game camera's own eye + forward BEFORE anything VR touches the
+    view. The shell seats VR's A matrix on this pair, never on play->view.eye
+    -- which half (b) is about to overwrite. Anchoring VR on the view would
+    chase our own HMD offset in a feedback loop; the donor records exactly
+    that trap in its third-person block ("anchor from the camera's own eye,
+    not play->view.eye", z_play.c:1483-1499). 0032's gSoh3DCam* export is
+    taken inside z_view.c AFTER func_800AA358 and is therefore the polluted
+    one -- it stays correct for the 3D panel (no VR write) and unusable as a
+    VR anchor, which is why VR gets its own export here.
+
+(b) In VR, replace the view's eye/at/up/fov with the shell's composed head
+    pose (donor's 32-line Camera_Update push, z_camera.c:7731-7761). Rendering
+    is unaffected -- the interpreter builds clip space from the per-eye A.V.P
+    that 0031 substitutes -- so the game View is used purely CPU-side: frustum
+    culling, actor->projectedPos (audio panning) and LOD. Without this the
+    game culls and draws its skybox from the GAME camera while the player
+    looks from somewhere else, and everything outside the game frustum turns
+    black the moment the head moves (VR-R0-FINDINGS finding 7, artifact 10).
+    That is why spec D5 was promoted from "early and cheap" to BLOCKING for
+    the first head-tracked frame.
+
+Culling FOV comes from the shell already padded (donor VR_GetCullingFovy
+shape: widest eye's vertical FOV x1.3, clamped to 90..160 deg) -- erring wide
+costs a little geometry, erring narrow reintroduces edge pop-in. View scale is
+forced back to 1.0 because the Hyrule Field 0.79 zoom just above would crop
+the padded frustum again.
+
+camDir/inputDir are deliberately NOT touched: they are computed from
+eyeAtAngle further up, off the game camera's own eye/at, so third-person stick
+steering stays camera-relative exactly as in flat play (donor's own note).
+
+rev2 (VR R2b): the active camera's `setting` is exported too, purely as a
+diagnostic -- `vr room` needs it to say whether an image-backed room is being
+drawn under CAM_SET_PREREND_FIXED (background drawn) or under something else
+(bare placeholder geometry, the green floor).
+
+rev3 (VR R3) -- THE GREEN FLOOR, ESTABLISHED RATHER THAN INFERRED. R2b blamed
+the DisableFixedCamera enhancement for Link's house showing a bare, untextured
+green floor on the panel, and forced that enhancement off in room mode 0. That
+was inference, and it was at best incomplete: the actual mechanism is HERE.
+
+Half (b) overwrote the game View with the HEAD POSE whenever gSohVRMode != 0 --
+including in a FLAT-SCREEN context. A pre-rendered room (Link's house, the
+shops, Kakariko interiors) is presented on the world-locked panel precisely so
+its authored 2D art reads correctly, and that art was authored FOR THE FIXED
+CAMERA. Driving the View from the head there means the frame the panel shows is
+no longer the frame the artwork belongs to: the background image and the room
+geometry disagree, and what survives is the placeholder mesh -- whose floor in
+Link's house is an untextured green quad.
+
+Camera unification exists to stop geometry popping as you turn your head in an
+immersive frame. A flat context has no immersive frame; the panel IS the game
+camera's own picture. So rev3 gates half (b) on gSohVRFlatLatch == 0, the same
+tick-boundary latch overlays 0039/0041/0043 use, and the panel gets the game
+camera's frame byte for byte. Half (a), the basis export, is unconditional as
+before -- it is a read.
+
+__IOS__-only; the macOS build and the iPhone build compile the export half
+with gSohVRMode permanently 0, so half (b) never fires there.
+
+--- a/soh/src/code/z_camera.c
++++ b/soh/src/code/z_camera.c
+@@ -7721,7 +7721,63 @@
+         View_SetScale(&camera->play->view, 0.79f);
+     } else {
+         View_SetScale(&camera->play->view, 1.0f);
++    }
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0037, VR-spec D5 / VR-DONOR-MAP 5): camera
++     * unification. (a) export the GAME camera's basis for VR's A matrix
++     * BEFORE (b) overwrites the view with the head pose -- anchoring VR on
++     * the view it just wrote is a feedback loop. See the patch header. */
++    {
++        extern volatile int gSohVRMode;
++        extern volatile int gSohVRFlatLatch;
++        extern volatile int gSohVRCamValid;
++        extern volatile int gSohVRAnchorValid;
++        extern volatile float gSohVRAnchorEye[3];
++        extern volatile float gSohVRAnchorFwd[3];
++        extern volatile float gSohVRCamEye[3];
++        extern volatile float gSohVRCamFwd[3];
++        extern volatile float gSohVRCamUp[3];
++        extern volatile float gSohVRCamFovy;
++        extern volatile int gSohVRCamSetting;
++        /* rev2 (VR R2b): the active camera's SETTING, for diagnostics. z_room.c
++         * draws a pre-rendered background only when this is CAM_SET_PREREND_FIXED
++         * (func_80096680), so `vr room` reading anything else in an image-backed
++         * room is the whole explanation for a bare, green-floored placeholder
++         * mesh on the panel. One store per Camera_Update, no behaviour. */
++        gSohVRCamSetting = (int)camera->setting;
++        float sohVRdx = viewAt.x - viewEye.x;
++        float sohVRdy = viewAt.y - viewEye.y;
++        float sohVRdz = viewAt.z - viewEye.z;
++        float sohVRlen = sqrtf(sohVRdx * sohVRdx + sohVRdy * sohVRdy + sohVRdz * sohVRdz);
++        if (sohVRlen > 0.001f) {
++            gSohVRAnchorEye[0] = viewEye.x;
++            gSohVRAnchorEye[1] = viewEye.y;
++            gSohVRAnchorEye[2] = viewEye.z;
++            gSohVRAnchorFwd[0] = sohVRdx / sohVRlen;
++            gSohVRAnchorFwd[1] = sohVRdy / sohVRlen;
++            gSohVRAnchorFwd[2] = sohVRdz / sohVRlen;
++            gSohVRAnchorValid = 1;
++        }
++        /* rev3 (VR R3): NEVER in a flat-screen context -- the panel must show
++         * the GAME camera's own frame, which is what the pre-rendered art was
++         * authored for. See the patch header. */
++        if ((gSohVRMode != 0) && (gSohVRCamValid != 0) && (gSohVRFlatLatch == 0)) {
++            viewEye.x = gSohVRCamEye[0];
++            viewEye.y = gSohVRCamEye[1];
++            viewEye.z = gSohVRCamEye[2];
++            viewAt.x = viewEye.x + (gSohVRCamFwd[0] * 100.0f);
++            viewAt.y = viewEye.y + (gSohVRCamFwd[1] * 100.0f);
++            viewAt.z = viewEye.z + (gSohVRCamFwd[2] * 100.0f);
++            viewUp.x = gSohVRCamUp[0];
++            viewUp.y = gSohVRCamUp[1];
++            viewUp.z = gSohVRCamUp[2];
++            viewFov = gSohVRCamFovy;
++            /* no zoom: the Hyrule Field 0.79 scale above would crop the
++             * deliberately-padded culling frustum. */
++            View_SetScale(&camera->play->view, 1.0f);
++        }
+     }
++#endif
+     camera->play->view.fovy = viewFov;
+     func_800AA358(&camera->play->view, &viewEye, &viewAt, &viewUp);
+     camera->camDir.x = eyeAtAngle.pitch;

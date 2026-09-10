@@ -7,6 +7,18 @@ multiply gSohIos.MenuScale (default 0.85) INTO ScaleImGui's target on iOS
 and compare the combined float, so both the preset combobox and the iOS
 slider apply immediately, no restart. Also fatter slider grabs on iOS
 (fingers). Replaces the deleted LUS Gui.cpp patch.
+rev3 (VR R1, VR-spec D8 / VR-DONOR-MAP §7b): the VR sim-rate override lands
+HERE rather than in the VR patch series, because it must run at the very top of
+GetInterpolationFPS -- ahead of this patch's own MatchRefreshRate cap -- and
+this patch already owns that function's text. A separate patch inserting there
+would break rev2's reverse probe in apply-overlay.sh, which is exactly the
+"regenerate, do not stack, inside patch-inserted regions" rule.
+Why it matters: the interpolation system divides this rate by OoT's native
+20 fps to decide how many sub-frames per game tick, so in VR a mismatch makes
+the fixed-timestep logic advance at the wrong wall-clock speed -- Link in fast
+or slow motion. The donor flags it as "a correctness bug in waiting if missed".
+The shell publishes the MEASURED headset cadence (SohImmersive.m); we never
+assume 90, and an out-of-range value falls through to the normal path.
 
 --- a/soh/soh/OTRGlobals.cpp
 +++ b/soh/soh/OTRGlobals.cpp
@@ -42,9 +54,30 @@ slider apply immediately, no restart. Also fatter slider grabs on iOS
      previousImGuiScale = scale;
      previousImGuiScaleIndex = imGuiScaleIndex;
  }
-@@ -1002,7 +1019,18 @@
+@@ -1000,9 +1017,39 @@
+     return hasOriginal;
+ }
  
++#ifdef __IOS__
++// SOH_IOS (overlay 0015 rev3, VR-spec D8): the VR sim-rate override. FILE
++// scope with C linkage -- a block-scope extern in a C++ TU mangles into the
++// enclosing namespace and never resolves against SohIosShell.m (this project's
++// recurring linkage trap; overlay 0031 records the same lesson).
++extern "C" {
++extern volatile int gSohVRMode;
++extern volatile int gSohVRRefreshHz;
++}
++#endif
++
  uint32_t OTRGlobals::GetInterpolationFPS() {
++#ifdef __IOS__
++    // In VR the compositor is the only pacer, so interpolation must divide the
++    // MEASURED headset refresh -- not the window's, not a hardcoded 90. Out of
++    // range means the shell has not measured a cadence yet: fall through.
++    if ((gSohVRMode != 0) && (gSohVRRefreshHz >= 30) && (gSohVRRefreshHz <= 240)) {
++        return (uint32_t)gSohVRRefreshHz;
++    }
++#endif
      if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
 +#ifdef __IOS__
 +        // SOH_IOS (overlay 0015): battery-saver cap — gSohIos.MaxFps combo

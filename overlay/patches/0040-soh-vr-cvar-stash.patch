@@ -1,0 +1,196 @@
+Overlay patch 0040: the VR enhancement-CVar stash (VR-spec D9,
+VR-DONOR-MAP §5b).
+
+Pre-rendered 2D backdrops and fixed cameras are unusable in stereo -- they are
+a flat painting where the world should be, and a camera that refuses to follow
+the head. The donor ships both of SoH's existing replacement enhancements
+defaulted ON in VR. We ship only the 3DSceneRender half on by default --
+DisableFixedCamera is gated behind gSohIos.VrDisableFixedCamera (default 0)
+after R1 took a SIGSEGV inside Camera_Normal1 with it forced on; see the
+in-patch comment for the reasoning. We do NOT flip the shipped defaults (that would change the
+flat and 3D-panel builds); the shell asks for the override on VR entry and
+gives it back on exit. Because these enhancements install their hooks through
+RegisterShipInitFunc, setting the CVar is not enough -- ShipInit::Init must be
+re-run for that path, which is what SohIos_VRApplyEnhancementCVars does.
+
+CRASH-SAFE RESTORE (spec D9): iOS swipe-kill is SIGKILL, so a VR session
+that dies mid-flight would otherwise leave the user's flat game permanently
+overridden. The pre-VR values are stashed into gSohIos.VrStash.* and saved
+synchronously BEFORE the override; SohIos_VRRestoreStashedCVars() runs on boot,
+before the enhancements register, and puts them back if the stash is still
+armed.
+
+The VR sim-rate override that used to live here moved into overlay 0015 rev3:
+it has to sit at the very top of GetInterpolationFPS, ahead of 0015's own
+MatchRefreshRate cap, and a second patch inserting into text 0015 owns breaks
+0015's reverse probe in apply-overlay.sh. Same "regenerate, do not stack"
+rule 0031 records.
+
+rev2 (VR R2a, device round): 3DSceneRender NO LONGER DEFAULTS ON IN VR.
+R1 kept the donor's default-on for it on the grounds that it is "the
+stereo-critical one". The first headset build proved that backwards: SoH's own
+tooltip is "Enable this when using a mod that implements 3D backdrops for these
+areas", and with no such mod installed the enhancement draws the room's bare
+placeholder mesh -- the user's Link's house came back an all-green box. His
+Documents/mods holds a 4K TEXTURE pack, which is not that mod, and the donor
+ships no such mod either (its own SohMenuEnhancements.cpp just sets
+DefaultValue(true) on the same checkbox and keeps the same tooltip).
+So the enhancement is now driven by the shell's THREE-WAY room setting,
+gSohVRRoomMode -- 0 panel (default, overlay 0039 rev2 routes image-backed rooms
+to the world-locked panel), 1 flat, 2 3d -- and only mode 2 forces it on. The
+CVar stays fully available to the user in the enhancements menu; VR simply
+stops overriding it. The stash machinery is untouched and still crash-safe.
+
+This block is anchored ABOVE OTRGlobals::HasOriginal() precisely to stay clear
+of 0015's hunks. __IOS__-only.
+
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -995,7 +995,135 @@
+ bool OTRGlobals::HasMasterQuest() {
+     return hasMasterQuest;
+ }
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0040, VR-spec D9 / VR-DONOR-MAP 5b): the enhancement
++// CVars VR overrides, with a crash-safe stash. Anchored above HasOriginal() to
++// stay clear of overlay 0015's hunks in GetInterpolationFPS just below.
++// The two enhancements VR overrides (VR-DONOR-MAP 5b). Kept as a table so the
++// stash, the override and the restore can never drift apart.
++static const char* const kSohIosVrEnhancementCVars[] = {
++    CVAR_ENHANCEMENT("3DSceneRender"),      // pre-rendered 2D backdrops -> 3D
++    CVAR_ENHANCEMENT("DisableFixedCamera"), // fixed cameras -> follow the player
++};
++static const char* const kSohIosVrStashCVars[] = {
++    "gSohIos.VrStash.3DSceneRender",
++    "gSohIos.VrStash.DisableFixedCamera",
++};
++// Which of them VR actually forces, and the default for each.
++//
++// DisableFixedCamera defaults OFF, against the donor. R1 took a SIGSEGV in
++// Camera_Normal1 (NULL deref at +0x7f2, called from Camera_Update) during the
++// Kokiri intro with it forced on, and it is the only thing in the VR change
++// set that mutates camera state at runtime: its OnCameraState hook calls
++// Camera_ChangeSetting(CAM_SET_NORMAL0) + Camera_ChangeMode(CAM_MODE_NORMAL)
++// on the main camera, which reaches Camera_Normal1 in scenes that never
++// expected it. Causation is strongly indicated but not isolated, and a crash
++// nobody has reproduced deliberately is not something to ship into a headset,
++// so VR leaves the user's own setting alone until R2 proves or fixes it.
++// 3DSceneRender is the stereo-critical one (a flat painted backdrop where the
++// world should be) and keeps the donor's default-on.
++// rev3 (VR R2b): DisableFixedCamera is now forced OFF in room mode 0 -- see
++// SohIos_VRDesiredEnhancement below for why the green floor made that
++// necessary. The R1 SIGSEGV gate still governs modes 1 and 2.
++static const char* const kSohIosVrGateCVars[] = {
++    "gSohIos.VrScene3D", // rev2: superseded by gSohVRRoomMode, kept for the table's shape
++    "gSohIos.VrDisableFixedCamera",
++};
++static const int kSohIosVrGateDefaults[] = { 0, 0 };
++#define SOHIOS_VR_ENHANCEMENT_COUNT \
++    ((int)(sizeof(kSohIosVrEnhancementCVars) / sizeof(kSohIosVrEnhancementCVars[0])))
+ 
++// rev2: how VR treats a pre-rendered (image-backed) room -- 0 panel (default),
++// 1 flat, 2 3d. Owned by the shell (SohIosShell.m), read here and by overlay
++// 0039 rev2's flat-screen latch, so the two can never disagree about which
++// treatment is in force.
++extern "C" volatile int gSohVRRoomMode;
++
++// Does VR want to force enhancement `idx` on?
++//   idx 0, 3DSceneRender: ONLY in room mode 2 ("3d"), which is the mode that
++//     says "I have installed a 3D-backdrop mod". In every other mode the
++//     enhancement would replace authored 2D art with a placeholder mesh.
++//   idx 1, DisableFixedCamera: the R1 SIGSEGV gate, unchanged.
++// rev3 (VR R2b): the answer is a VALUE, not a boolean -- -1 means "leave the
++// user's own setting alone", 0 and 1 mean "force it there for the session".
++//   idx 0, 3DSceneRender: forced ON only in room mode 2 ("3d"), which is the
++//     mode that says "I have installed a 3D-backdrop mod". Otherwise untouched.
++//   idx 1, DisableFixedCamera: forced OFF in room mode 0, the shipped default.
++//     Reason, from the user's 1.0.1.2 screenshot of Link's house: z_room.c draws
++//     the authored pre-rendered background ONLY when the active camera is
++//     CAM_SET_PREREND_FIXED (func_80096680, the `sp9C` test) -- and it draws
++//     the room's own polygonDlist->opa geometry underneath it either way. This
++//     enhancement's OnCameraState hook changes the setting to CAM_SET_NORMAL0,
++//     so the background never draws and what shows instead is that bare
++//     geometry, whose floor in Link's house is an untextured GREEN quad. Room
++//     mode 0 exists to present the art AS AUTHORED on the panel, so it cannot
++//     also be disabling the camera the art was authored for. Modes 1 and 2 keep
++//     the R1 gate (the user's own gSohIos.VrDisableFixedCamera opt-in, still
++//     default-off behind the R1 Camera_Normal1 SIGSEGV).
++static int SohIos_VRDesiredEnhancement(int idx) {
++    if (idx == 0) {
++        return (gSohVRRoomMode == 2) ? 1 : -1;
++    }
++    if (gSohVRRoomMode == 0) {
++        return 0;
++    }
++    return (CVarGetInteger(kSohIosVrGateCVars[idx], kSohIosVrGateDefaults[idx]) != 0) ? 1 : -1;
++}
++
++// Restore anything a previous session left overridden (SIGKILL in VR). Runs
++// on boot, before the enhancements register their hooks.
++extern "C" void SohIos_VRRestoreStashedCVars(void) {
++    if (CVarGetInteger("gSohIos.VrStash.Active", 0) == 0) {
++        return;
++    }
++    for (int sohI = 0; sohI < SOHIOS_VR_ENHANCEMENT_COUNT; sohI++) {
++        CVarSetInteger(kSohIosVrEnhancementCVars[sohI], CVarGetInteger(kSohIosVrStashCVars[sohI], 0));
++        CVarClear(kSohIosVrStashCVars[sohI]);
++    }
++    CVarClear("gSohIos.VrStash.Active");
++    CVarSave();
++    SPDLOG_INFO("SOH_IOS VR: restored enhancement CVars stashed by a previous session");
++}
++
++// on=1: stash + override + re-register. on=0: restore + re-register.
++// MAIN THREAD ONLY (it re-runs ShipInit hooks and writes the config).
++extern "C" void SohIos_VRApplyEnhancementCVars(int on) {
++    if (on) {
++        if (CVarGetInteger("gSohIos.VrStash.Active", 0) != 0) {
++            return; // already overridden (idempotent entry)
++        }
++        for (int sohI = 0; sohI < SOHIOS_VR_ENHANCEMENT_COUNT; sohI++) {
++            CVarSetInteger(kSohIosVrStashCVars[sohI], CVarGetInteger(kSohIosVrEnhancementCVars[sohI], 0));
++        }
++        CVarSetInteger("gSohIos.VrStash.Active", 1);
++        CVarSave(); // the stash must survive a SIGKILL taken one line later
++        for (int sohI = 0; sohI < SOHIOS_VR_ENHANCEMENT_COUNT; sohI++) {
++            int sohWant = SohIos_VRDesiredEnhancement(sohI);
++            if (sohWant < 0) {
++                continue; // VR has no opinion: the user's own setting stands
++            }
++            if (CVarGetInteger(kSohIosVrEnhancementCVars[sohI], 0) == sohWant) {
++                continue; // already there; no need to re-run the hooks
++            }
++            CVarSetInteger(kSohIosVrEnhancementCVars[sohI], sohWant);
++            ShipInit::Init(kSohIosVrEnhancementCVars[sohI]);
++        }
++    } else {
++        if (CVarGetInteger("gSohIos.VrStash.Active", 0) == 0) {
++            return; // nothing stashed (idempotent exit)
++        }
++        for (int sohI = 0; sohI < SOHIOS_VR_ENHANCEMENT_COUNT; sohI++) {
++            CVarSetInteger(kSohIosVrEnhancementCVars[sohI], CVarGetInteger(kSohIosVrStashCVars[sohI], 0));
++            CVarClear(kSohIosVrStashCVars[sohI]);
++            ShipInit::Init(kSohIosVrEnhancementCVars[sohI]);
++        }
++        CVarClear("gSohIos.VrStash.Active");
++        CVarSave();
++    }
++}
++#endif
++
+ bool OTRGlobals::HasOriginal() {
+     return hasOriginal;
+ }
+@@ -1590,6 +1718,11 @@
+     if (CVarGetInteger(CVAR_REMOTE_ANCHOR("Enabled"), 0)) {
+         Anchor::Instance->Enable();
+     }
++#ifdef __IOS__
++    // SOH_IOS (overlay 0040): put back anything a VR session that was
++    // SIGKILLed left overridden, BEFORE the enhancements register.
++    SohIos_VRRestoreStashedCVars();
++#endif
+     ShipInit::InitAll();
+     Rando::StaticData::InitHashMaps();
+     OTRGlobals::Instance->gRandoContext->AddExcludedOptions();

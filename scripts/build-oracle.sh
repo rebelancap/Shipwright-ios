@@ -8,7 +8,8 @@ BUILD="$ROOT/oracle/build-cmake"
 [[ -d "$VENDOR/.git" ]] || { echo "FATAL: vendor/Shipwright missing — run scripts/bootstrap.sh" >&2; exit 1; }
 [[ "${1:-}" == "--clean" ]] && rm -rf "$BUILD"
 
-cmake -S "$VENDOR" -B "$BUILD" -GNinja -DCMAKE_BUILD_TYPE:STRING=Release
+cmake -S "$VENDOR" -B "$BUILD" -GNinja -DCMAKE_BUILD_TYPE:STRING=Release \
+      -DCMAKE_IGNORE_PREFIX_PATH="${SOH_IGNORE_PREFIX_PATH:-$HOME/Miniforge3}"
 cmake --build "$BUILD" --target GenerateSohOtr
 cmake --build "$BUILD"
 

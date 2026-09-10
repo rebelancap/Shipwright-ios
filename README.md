@@ -4,7 +4,21 @@ Play **The Legend of Zelda: Ocarina of Time** on your iPhone and Apple Vision Pr
 the full quest with saves, the Ship of Harkinian enhancements menu, HD/4K texture
 packs, game controllers and a tunable touch layout, and on Vision Pro a stereoscopic
 **3D mode** that puts the game on a world-locked panel floating in your room with
-real depth.
+real depth — plus a full **immersive VR mode** where you stand in Hyrule and swing
+the sword with your own hand.
+
+**On Apple Vision Pro there are three ways to play**, and you switch between them
+any time from the ornament under the game window:
+
+| Button | Mode |
+| --- | --- |
+| *(none — the default)* | **Window** — a free-resizing 2D window rendering at true 4K, with the touch layout |
+| **3D** | **Stereoscopic 3D** — the same game on a world-locked panel floating in your room, with real depth |
+| **VR** | **Immersive VR** *(new in 1.1.0)* — you stand inside Hyrule in first person, with PSVR2 Sense controllers as your hands: motion combat with the sword, aim down your own hand, a 3D item wheel on the grip |
+
+Tap **3D** or **VR** to enter, **Exit** to come back to the window; the game keeps
+running across the switch. The gear button beside them opens the live settings for
+whichever mode you are in.
 
 Built on [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) (Harbour
 Masters' native Ocarina of Time port) and
@@ -14,7 +28,7 @@ to detail.
 
 ![The Legend of Zelda: Ocarina of Time on Apple Vision Pro](docs/screenshots/visionos-window.jpg)
 
-*Ocarina of Time on Apple Vision Pro — a resizable window floating in your room, with the on-screen touch layout. The same build also runs in stereoscopic 3D.*
+*Ocarina of Time on Apple Vision Pro — a resizable window floating in your room, with the on-screen touch layout. The same build also runs in stereoscopic 3D and in fully immersive VR.*
 
 ---
 
@@ -93,7 +107,35 @@ vanilla textures, that's the switch. Turn it off to compare against vanilla.
   **stereoscopic 3D mode** — the game on a world-locked panel floating in your room,
   with foveated rendering for full-resolution clarity where you're looking, spatial audio
   anchored to the screen, and live-tunable stereo depth, focus, screen size/distance/height,
-  surroundings dimming, and a recenter button
+  surroundings dimming, and a recenter button — **plus a fully immersive VR mode**,
+  which gets its own section just below
+- Switch **Window / 3D / VR** any time from the ornament under the game window
+
+### Apple Vision Pro — immersive VR mode (new in 1.1.0)
+
+Stand in Hyrule. The third mode drops the panel entirely and puts you inside the
+game in first person, with the world at Link's scale around you.
+
+- **First-person immersion** — Link's body is hidden and the camera is your head;
+  the world turns with you, with **smooth turn** (default) or snap turn
+- **Motion hands** — your Sense controllers are your hands. The sword, shield, bow,
+  hookshot and the rest are held in them and follow your pose
+- **Motion combat** — a real swing swings the blade: slashes, stabs and combos come
+  out of how you actually move, with the swing's arc driving Link's attack
+- **Aim with your hand** — bow, slingshot, hookshot and boomerang aim down the
+  controller's own aim ray, with a crosshair you can always see
+- **The item wheel** — hold the right grip and the game's own 3D item models fan out
+  around your hand; look at one and let go to equip it
+- **The Megaton hammer** chops with a wrist flex, pivoting at your hand
+- **The Lens of Truth** renders as a single fused circle in the world, not a flat
+  overlay
+- **Shield crouch**, Z-targeting on the left trigger, ladders, and the HUD floating
+  where you can read it
+- **Hand calibration and an in-game VR settings sheet** — mode-gated sections with a
+  per-section Reset, so a bad tweak costs one tap
+- Crash and log capture written into the app's Files folder, for reporting bugs
+
+*Immersive VR is a Vision Pro mode; iPhone is unchanged by it.*
 
 ## Requirements
 

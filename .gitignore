@@ -37,3 +37,6 @@ xcuserdata/
 
 # OTA hosting dir (IPAs; rebuildable)
 /ota/
+
+# Release build output (IPAs, export plists) — staged via OTA tooling, never committed
+/release/

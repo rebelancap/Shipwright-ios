@@ -15,11 +15,25 @@ Fix, three parts:
 2. Metal: DeleteTexture actually releases the texture + exact byte
    ledger (created in 0019 rev2's UploadTexture accounting).
 3. interpreter.cpp ImportTexture tail (__IOS__): after each upload,
-   evict LRU entries until resident bytes <= gSohIos.TexCacheBudgetMB
-   (default 1536 MB), keeping >=128 entries. Draws are flushed before
-   imports and command buffers retain in-flight textures, so releasing
-   at evict time is GPU-safe — same invariants the count eviction
-   already relies on. Rate-limited eviction log for remote logtail.
+   evict LRU entries until resident bytes <= gSohIos.TexCacheBudgetMB,
+   keeping >=128 entries. Draws are flushed before imports and command
+   buffers retain in-flight textures, so releasing at evict time is
+   GPU-safe — same invariants the count eviction already relies on.
+   Rate-limited eviction log for remote logtail.
+rev3 (VR R8 part C, the jetsam round): two changes, both because the
+Vision Pro's budget is not the iPhone's.
+a. THE DEFAULT IS VR-AWARE — 512 MB in VR, 1536 MB everywhere else.
+   1536 was tuned on the flat iPhone path, where VR's ~800 MB of eye,
+   HUD and compositor surfaces did not exist; on the headset that
+   ceiling plus the VR tax plus an unbounded resource cache is the
+   4.9 GB jetsam of 2026-09-05. An explicit CVar still wins, which is
+   what keeps `cvar gSohIos.TexCacheBudgetMB N` an honest A/B.
+b. THE COUNT EVICTION NOW DELETES THE TEXTURE. TextureCacheLookup's
+   1024-entry cap parked the evicted id on the free list and left the
+   MTLTexture resident until that id was reused with different
+   dimensions — so the count cap, the one eviction upstream actually
+   has, freed nothing. It calls DeleteTexture now, exactly as the byte
+   budget below already does, and the ledger stays truthful.
 
 --- a/libultraship/include/fast/backends/gfx_rendering_api.h
 +++ b/libultraship/include/fast/backends/gfx_rendering_api.h
@@ -60,7 +74,7 @@ Fix, three parts:
      CoordUniforms mCoordUniforms;
 --- a/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -353,8 +353,34 @@
+@@ -345,8 +345,34 @@
  }
  
  void GfxRenderingAPIMetal::DeleteTexture(uint32_t texID) {
@@ -97,7 +111,38 @@ Fix, three parts:
      mCurrentTextureIds[tile] = texture_id;
 --- a/libultraship/src/fast/interpreter.cpp
 +++ b/libultraship/src/fast/interpreter.cpp
-@@ -1300,6 +1300,43 @@
+@@ -473,6 +473,15 @@
+     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
+         // Remove the texture that was least recently used
+         it = mTextureCache.lru.front().it;
++#ifdef __IOS__
++        // SOH_IOS (overlay 0020 rev3): actually release it. Without this the
++        // count cap frees no memory at all -- the id parks on the free list and
++        // the MTLTexture stays resident until the id is reused with different
++        // dimensions. Same GPU-safety invariants as the byte-budget eviction
++        // below: draws are flushed before imports and in-flight command buffers
++        // retain what they reference.
++        mRapi->DeleteTexture(it->second.texture_id);
++#endif
+         mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+         for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+             if (mRenderingState.mTextures[j] == &*it)
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -1158,6 +1158,10 @@
+     uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+     mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
+ }
++
++// SOH_IOS (overlay 0020 rev3): the VR mode flag, for the budget default below.
++// Defined in SohIosShell.m (also linked on iPhone, where it never leaves 0).
++extern "C" volatile int gSohVRMode;
+ 
+ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+     uint8_t fmt = mRdp->texture_tile[tile].fmt;
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -1300,6 +1300,49 @@
              SPDLOG_ERROR("Invalid texture format. Fmt = {}", fmt);
              break;
      }
@@ -110,8 +155,14 @@ Fix, three parts:
 +    // back), and pending draws are flushed before imports, so the front is
 +    // never referenced by unencoded work.
 +    {
++        // rev3 (VR R8 part C): THE DEFAULT IS VR-AWARE. 1536 MB was tuned on the
++        // flat iPhone path, where VR's ~800 MB of eye, HUD and compositor
++        // surfaces did not exist -- on the Vision Pro that ceiling plus the VR
++        // tax plus the resource cache is the 4.9 GB jetsam. In VR the ceiling
++        // is 512 MB; everywhere else it is unchanged. An explicit CVar still
++        // wins, which is what makes `cvar gSohIos.TexCacheBudgetMB N` an A/B.
 +        size_t sohIosBudget = (size_t)Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-+                                  "gSohIos.TexCacheBudgetMB", 1536) *
++                                  "gSohIos.TexCacheBudgetMB", gSohVRMode != 0 ? 512 : 1536) *
 +                              1024 * 1024;
 +        bool sohIosEvicted = false;
 +        while (mRapi->GetTextureBytes() > sohIosBudget && mTextureCache.map.size() > 128) {

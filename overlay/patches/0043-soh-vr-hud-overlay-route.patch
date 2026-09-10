@@ -1,0 +1,71 @@
+Overlay patch 0043: route OoT's OVERLAY display list away from the world
+list in VR gameplay, so the HUD can be rendered once into its own framebuffer
+and composited as a flat plane in front of the player (VR-spec D7,
+VR-DONOR-MAP 2 "why it's really an overlay routing switch" + 6).
+
+THE BUG THIS FIXES, stated precisely. OoT's HUD, the scene title card
+("Kokiri Forest"), dialogue boxes and the title/intro overlay are TEXRECT
+draws: GfxDpTextureRectangle builds screen-space vertices directly and never
+touches MP_matrix, so overlay 0031's projection injector cannot reach them and
+0031's ortho gate deliberately leaves them on the game's own matrix. Both eyes
+therefore receive the SAME PIXEL POSITIONS. On a headset with strongly
+asymmetric per-eye frusta -- the device measures
+eye0_tan = -1.7321,1.0000 and eye1_tan = -1.0000,1.7320 -- identical pixel
+positions are NOT the same direction, so the HUD lands at two different world
+directions and never fuses. It is also pushed toward the top and bottom edges,
+which is why the user could "barely see" it (2026-09-03, build 1.0.1.2).
+
+Vanilla chains the overlay onto the tail of the world list:
+
+    gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);
+
+The donor's fix is not a new renderer feature, it is a ROUTING switch
+(graph.c:307-347): in gameplay, terminate POLY_XLU properly and hand the
+overlay buffer to the HUD pass instead; in a flat-screen context, keep the
+vanilla chain, because there the overlay carries the ENTIRE interface -- the
+kaleido inventory pages AND the pause background-capture command -- which must
+land in the panel image as one picture. Routing that to the HUD plane would
+put the inventory on a floating quad while the panel stayed black.
+
+We reproduce the switch exactly, gated on the SAME latch overlay 0039 uses, so
+the routing decision and the flat/panel decision can never disagree about a
+frame. gSohVRHudPlane is the shell's A/B: 0 puts the HUD back on the world list
+(1.0.1.2's behaviour, doubled) in one console command, which is how the fix
+gets a red control in the headset.
+
+The consumer is overlay 0031 rev15's third interpreter walk. __IOS__-only; the
+oracle and every iPhone build emit the vanilla branch.
+
+--- a/soh/src/code/graph.c
++++ b/soh/src/code/graph.c
+@@ -310,7 +310,30 @@
+ 
+     gSPBranchList(WORK_DISP++, gfxCtx->polyOpaBuffer);
+     gSPBranchList(POLY_OPA_DISP++, gfxCtx->polyXluBuffer);
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0043, VR-spec D7 / VR-DONOR-MAP 2+6): in VR gameplay
++     * the overlay buffer leaves the world list and becomes its own render
++     * pass, composited as a flat plane with real per-eye disparity. In a
++     * flat-screen context it stays chained -- there the overlay IS the whole
++     * interface and belongs in the panel image. See the patch header. */
++    {
++        extern volatile int gSohVRMode;
++        extern volatile int gSohVRFlatLatch;
++        extern volatile int gSohVRHudPlane;
++        extern void* volatile gSohVROverlayDL;
++        if ((gSohVRMode != 0) && (gSohVRFlatLatch == 0) && (gSohVRHudPlane != 0)) {
++            gDPPipeSync(POLY_XLU_DISP++);
++            gDPFullSync(POLY_XLU_DISP++);
++            gSPEndDisplayList(POLY_XLU_DISP++);
++            gSohVROverlayDL = (void*)gfxCtx->overlayBuffer;
++        } else {
++            gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);
++            gSohVROverlayDL = NULL;
++        }
++    }
++#else
+     gSPBranchList(POLY_XLU_DISP++, gfxCtx->overlayBuffer);
++#endif
+     gDPPipeSync(OVERLAY_DISP++);
+     gDPFullSync(OVERLAY_DISP++);
+     gSPEndDisplayList(OVERLAY_DISP++);

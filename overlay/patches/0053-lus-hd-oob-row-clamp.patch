@@ -1,0 +1,163 @@
+Overlay patch 0053: THE HD PACK'S ONE-ROW IMAGES (VR R16 part C item 2).
+`vendor/Shipwright/libultraship/src/fast/interpreter.cpp`, LUS at its own pin.
+
+THE SYMPTOM. With `OoT_Reloaded_v11.0.0_4K.o2r` in `Documents/mods`, the
+"C-button to Equip" prompt at the bottom of the kaleido item subscreen draws
+NOTHING -- in 2D and in VR alike. the user has run that pack since the port
+booted; the macOS build has no mods, which is why the oracle never showed it.
+
+THE MEASUREMENT, which is what identified it. `artifacts/vr-r2/device-1.0.1.1.log`
+carries overlay 0019's clamp warning 138 times, in exactly two sizes:
+
+    20x   "clamping oversized texture 188416x1"
+    118x  "clamping oversized texture 65536x1"
+
+188416 * 4 = 753,664 bytes. The prompt is `gCBtnSymbolsTex`
+(`textures/icon_item_static/gCBtnSymbolsTex`, 48x16 IA8, 848 bytes in
+`oracle/shiphome/oot.o2r`), loaded at `z_kaleido_scope_PAL.c:2343` by
+`gDPLoadTextureBlock(..., icon_w = 46, icon_h = 16, ...)` -- three times per
+frame, once per C button, which is where a multiple of 20 per second comes
+from. 46 * 16 = 736 bytes requested; a 4K pack replacement of a 48x16 source is
+768x256 RGBA, so h_byte_scale = 768*4/48 = 64 and v_pixel_scale = 256/16 = 16,
+and 736 * 64 * 16 = 753,664 EXACTLY. That is the arithmetic identification, and
+it is the only one that closes: the alternative reading (a 736-wide export
+tripping the OOB guard) requires h_byte_scale to be 64 and the image to be 736
+wide at the same time, which cannot both be true.
+
+THE MECHANISM IS NOT THE OOB GUARD. `numLoadedBytes` (753,664) is LESS than
+`resourceImageSizeBytes` (768*256*4 = 786,432), so the guard at
+ImportTextureRaw's "restrict the bytes to a safe amount" never fires here. What
+flattens the image is the LOAD BLOCK's stride bookkeeping:
+`GfxDpLoadBlock` sets `line_size_bytes = full_image_line_size_bytes =
+actual_line_bytes`, and both of its stride refinements require
+`texture_to_load.width > 1` -- which the `gDPLoadTextureBlock` macro never
+gives (it sets the SetTextureImage width to 1 by construction). So for EVERY
+load-block texture the recorded "line" is the WHOLE LOAD, the copy loop runs
+once, and the buffer is described as `safeLineSizeBytes/4 x 1`: a
+188,416 x 1 strip, which 0019 then clamps to 16384x1 to stop Metal aborting.
+A one-row image is a blank icon.
+
+Load-block HD textures normally escape that path through the early return
+("Can use the texture directly since it has the correct dimensions"). This one
+misses it by ONE TEST, and by a rounding:
+
+    resultOrigLineSize = texture_tile.line_size_bytes = ((46*1)+7)>>3 <<3 = 48
+    resultOrigHeight   = 736 / 48 = 15        <-- 15.33 truncated
+    resultNewLineSize  = 48 * 64 = 3072 == 4 * 768   OK
+    resultNewHeight    = 15 * 16 = 240 != 256        FAILS
+
+The tile stride is 48 bytes and the DMA fetched 736 -- fifteen whole rows and
+two thirds of a sixteenth. Vanilla's tile still DESCRIBES sixteen rows (the
+rectangle draws all 16), and the pack's replacement has all 256 HD rows. The
+row count the comparison wants is the CEILING, not the floor.
+
+THE FIX, two parts, both `__IOS__`-only so the macOS build keeps upstream's
+behaviour byte for byte (upstream has this bug too; the oracle runs no pack, so
+fixing it there would only remove a comparison point):
+
+  (a) THE EARLY RETURN ALSO ACCEPTS THE CEILING, in a SECOND test placed
+      immediately ahead of upstream's rather than by editing it -- so the patch
+      removes no upstream line and every case that returned early before still
+      does, with the same arguments. For `gCBtnSymbolsTex` it uploads the
+      pack's own 768x256 image directly from `addr`, at the stride the tile
+      already agrees with (3072 == 4*768). Nothing is copied, nothing is
+      clamped, and the icon is the pack author's.
+
+  (b) A BUFFER IS NEVER DESCRIBED AS ONE ROW WHEN ITS STRIDE IS KNOWN. In the
+      fallback, when the packed result would be a single row AND the copy was
+      contiguous (`safeLineSizeBytes == safeFullImageLineSizeBytes`, the load
+      block's signature) AND the resource's own row stride `width*4` divides
+      the packed bytes, the upload is redescribed as `width x
+      (safeLoadedBytes / (width*4))`. The BYTES ARE NOT TOUCHED -- only their
+      shape -- and because the divisibility test proves `width*4` IS the
+      stride of the contiguous run, the rows land where they belong (no shear).
+      Worst case the image is short a few bottom rows, which is a picture
+      instead of a strip. This is what should catch the 118 `65536x1` uploads
+      (262,144 bytes each) that this round cannot identify by name.
+
+WHY NOT THE ROW-CLAMP THE BRIEF PROPOSED. Clamping ROWS out of
+`resourceImageSizeBytes / safeFullImageLineSizeBytes` while keeping
+`safeFullImageLineSizeBytes` as the SOURCE stride is right only when the source
+stride and the destination stride differ. Here they are equal and both are the
+whole image, so that formula yields rows = 1 and changes nothing; and if it
+were fed the pre-guard `fullImageLineSizeBytes` instead, the source rows would
+be read at the wrong pitch and the image would shear progressively down the
+page. (b) is the same idea done from the side that knows the true stride: the
+resource's own width.
+
+WHAT KEEPS US HONEST. 0019's `clamping oversized texture WxH` warning is
+DELIBERATELY LEFT ALONE and is the regression detector: a device log that still
+carries `x1` clamps is a texture family neither (a) nor (b) reached. This patch
+is not folded into 0019 for the same reason -- 0019 is the last line of defence
+in the Metal backend, this is the description bug one layer up.
+
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -1127,6 +1127,27 @@
+     uint32_t resultNewLineSize = resultOrigLineSize * metadata->h_byte_scale;
+     uint32_t resultNewHeight = resultOrigHeight * metadata->v_pixel_scale;
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0053): A LOAD BLOCK THAT ENDS MID-ROW STILL DESCRIBES
++    // THAT ROW. gDPLoadTextureBlock(gCBtnSymbolsTex, IA8, 46, 16) fetches
++    // 46*16 = 736 bytes against a tile stride of 48, so resultOrigHeight
++    // truncates 15.33 to 15 and upstream's test below misses by one row --
++    // sending a perfectly good 768x256 HD replacement into the fallback, which
++    // (because a load block records the whole load as a single "line")
++    // describes it as 188416x1 and draws nothing. Accept the CEILING too, in
++    // an ADDED test ahead of upstream's: every case upstream returns early on
++    // still reaches it unchanged, and an exact division makes the two
++    // identical.
++    {
++        uint32_t sohIosRowsCeil =
++            resultOrigLineSize > 0 ? ((numOriginallyLoadedBytes + resultOrigLineSize - 1) / resultOrigLineSize) : 0;
++        uint32_t sohIosNewHeightCeil = (uint32_t)(sohIosRowsCeil * metadata->v_pixel_scale);
++        if (resultNewLineSize == 4 * width && sohIosNewHeightCeil == height) {
++            mRapi->UploadTexture(addr, width, height);
++            return;
++        }
++    }
++#endif
+     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
+         // Can use the texture directly since it has the correct dimensions
+         mRapi->UploadTexture(addr, width, height);
+@@ -1162,6 +1183,39 @@
+         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0053): NEVER HAND THE BACKEND A ONE-ROW IMAGE WHEN THE
++    // ROW STRIDE IS KNOWN. A load block records line == full_image_line == the
++    // entire load (GfxDpLoadBlock's two stride refinements both require a
++    // SetTextureImage width > 1, which the gDPLoadTextureBlock macro never
++    // gives), so this fallback always packs "one line" and every HD
++    // replacement that misses the early return above arrives as a 65536x1 or
++    // 188416x1 strip -- which overlay 0019 then clamps to 16384x1 to keep
++    // Metal from aborting. Blank, either way.
++    //
++    // The copy above was CONTIGUOUS whenever the two strides are equal, so the
++    // buffer is a prefix of the replacement image laid out at its own pitch.
++    // If the resource's row stride (width*4) divides the packed bytes, that IS
++    // the pitch: upload the SAME BYTES described as width x rows. No shear is
++    // possible -- the divisibility is what proves the pitch -- and at worst the
++    // image is short its last rows, which is a picture rather than a strip.
++    //
++    // Placed ABOVE the description below, not folded into it, so that overlay
++    // 0020's hunk on those three lines keeps its context intact.
++    {
++        uint32_t sohIosPackedRows = safeLineSizeBytes > 0 ? (safeLoadedBytes / safeLineSizeBytes) : 0;
++        if (sohIosPackedRows <= 1 && width > 0 && safeLineSizeBytes == safeFullImageLineSizeBytes) {
++            uint32_t sohIosStride = (uint32_t)width * 4u;
++            if (safeLineSizeBytes > sohIosStride && (safeLoadedBytes % sohIosStride) == 0) {
++                uint32_t sohIosImageRows = safeLoadedBytes / sohIosStride;
++                if (sohIosImageRows > 1) {
++                    mRapi->UploadTexture(mTexUploadBuffer, (uint32_t)width, sohIosImageRows);
++                    return;
++                }
++            }
++        }
++    }
++#endif
+     // Describe the buffer by what was actually packed (the loaded HD stride)
+     uint32_t uploadWidth = safeLineSizeBytes / 4;
+     uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;

@@ -1,0 +1,125 @@
+Overlay patch 0054 (VR R17 part B): THE ALT-ASSETS SWITCH SAYS SO.
+
+WHAT HAPPENED. the user reported the 4K texture pack "not loading" on 1.0.1.21.
+It loads: the pack (21.77 GB) mounts on every boot, HD textures were live for the
+first five minutes of the session, and they stopped mid-session at ~13:10:28. The
+headset's Documents/shipofharkinian.json then read
+
+    "gSettings.AltAssets": 0
+
+which is SoH's own "Enable Mods" switch, off. Nothing in this port's VR layer can
+write it: the only two writers in the whole tree are the ImGui checkbox
+(soh/soh/Enhancements/mod_menu.cpp, RegisterModMenuWidgets) and the Tab hotkey
+(OTRGlobals.cpp's LUS_KB_TAB case), and no VR control synthesises a Tab. Overlay
+0053 is proven innocent by the logs themselves: ZERO "clamping oversized texture"
+lines across every 1.0.1.21 log, against 138 in 1.0.1.20.
+
+the user re-enables the switch himself. This patch is about the NEXT time, and it
+does exactly two things.
+
+(a) THE STATE CHANGE IS LOUD. OTRGlobals.cpp's per-frame CVar sync is the one
+    place in the program that observes the switch actually moving --
+
+        bool curAltAssets = CVarGetInteger(CVAR_SETTING("AltAssets"), 1);
+        if (prevAltAssets != curAltAssets) { ... SetAltAssetsEnabled(cur) ... }
+
+    -- and it said nothing at all, which is why "the pack stopped loading" and
+    "somebody turned mods off" were indistinguishable for a day. It now writes
+    one line into Documents/vr-mem.log through the shell's SohIos_VrNote, beside
+    the heartbeat and the audio notes, so a later pull carries the MOMENT the
+    switch moved in the same timestamp order as everything else. spdlog gets the
+    line too, at error level, because that file is what a desktop user would
+    send.
+
+(b) THE TAB HOTKEY DEFAULTS OFF ON iOS. `Mods.AlternateAssetsHotkey` defaults to
+    TRUE upstream, which is right on a desktop with a real keyboard and wrong on
+    a platform where the only Tab that can arrive is a forged one. This port has
+    already shipped one bug of exactly that shape: iPadOS forges a keyboard
+    Escape from a controller's B button (SohIosShell.m's input-trace note), and
+    SDL's UIKit backend delivered it as SDL_SCANCODE_ESCAPE with no controller
+    binding anywhere in the path to stop it. A forged Tab would toggle a 21.77 GB
+    asset pack with no UI feedback whatsoever. Both the READER's default and the
+    checkbox's DefaultValue move together, because a widget that shows "on" while
+    the reader defaults to off is a worse state than either.
+
+    This does NOT disable the switch, the pack, or the menu checkbox. the user can
+    still turn the hotkey on in the Mod Menu, and turning mods on and off from
+    the checkbox is untouched.
+
+Both edits are __IOS__-only: the macOS build and every desktop build compile
+byte-for-byte vanilla.
+
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -155,6 +155,13 @@
+ 
+ bool prevAltAssets = false;
+ 
++#ifdef __IOS__
++// R17 part B item 3: one line into Documents/vr-mem.log when the alt-assets
++// ("Enable Mods") switch moves. Defined in app/ios/SohIosShell.m, which no
++// desktop build links -- hence the guard.
++extern "C" void SohIos_VrNote(const char* what, const char* detail);
++#endif
++
+ // Same as NaviColor type from OoT src (z_actor.c), but modified to be sans alpha channel for Controller LED.
+ typedef struct {
+     Color_RGB8 inner;
+@@ -1755,7 +1762,17 @@
+         }
+ #endif
+         case KbScancode::LUS_KB_TAB: {
++#ifdef __IOS__
++            // R17 part B item 3(b): DEFAULT OFF on iOS. The only Tab that can
++            // reach here is a forged one -- iPadOS already forges a keyboard
++            // Escape out of a controller's B button on this platform, with no
++            // controller binding anywhere in the path to stop it -- and a
++            // forged Tab silently toggles a 21.77 GB asset pack. the user can
++            // still switch the hotkey on in the Mod Menu.
++            if (CVarGetInteger(CVAR_SETTING("Mods.AlternateAssetsHotkey"), 0)) {
++#else
+             if (CVarGetInteger(CVAR_SETTING("Mods.AlternateAssetsHotkey"), 1)) {
++#endif
+                 CVarSetInteger(CVAR_SETTING("AltAssets"), !CVarGetInteger(CVAR_SETTING("AltAssets"), 1));
+             }
+             break;
+@@ -1844,6 +1861,15 @@
+     bool curAltAssets = CVarGetInteger(CVAR_SETTING("AltAssets"), 1);
+     if (prevAltAssets != curAltAssets) {
+         prevAltAssets = curAltAssets;
++#ifdef __IOS__
++        // R17 part B item 3(a): THE ONLY PLACE THE SWITCH IS SEEN TO MOVE.
++        // It said nothing, so "the 4K pack stopped loading" and "mods got
++        // turned off" were indistinguishable for a day. One line, in the
++        // same file and the same timestamp order as the heartbeat.
++        SPDLOG_ERROR("SOH_IOS: alternate assets (Enable Mods) -> {}", curAltAssets ? "ON" : "OFF");
++        SohIos_VrNote("alt assets", curAltAssets ? "ENABLED (mods and texture packs live)"
++                                                : "DISABLED (vanilla assets) -- gSettings.AltAssets is 0");
++#endif
+         Ship::Context::GetRawInstance()->GetResourceManager()->SetAltAssetsEnabled(curAltAssets);
+         gfx_texture_cache_clear();
+         SOH::SkeletonPatcher::UpdateSkeletons();
+--- a/soh/soh/Enhancements/mod_menu.cpp
++++ b/soh/soh/Enhancements/mod_menu.cpp
+@@ -537,10 +537,21 @@
+     tabHotkeyWidget = { .name = "Mods Tab Hotkey", .type = WidgetType::WIDGET_CVAR_CHECKBOX };
+     tabHotkeyWidget.CVar(CVAR_SETTING("Mods.AlternateAssetsHotkey"))
+         .RaceDisable(false)
++#ifdef __IOS__
++        // R17 part B item 3(b): the checkbox and the reader in OTRGlobals.cpp
++        // must default the same way, or the menu shows "on" for a hotkey that
++        // is off. There is no Tab key on this platform to press deliberately.
+         .Options(UIWidgets::CheckboxOptions()
+                      .Color(THEME_COLOR)
++                     .Tooltip("Allows pressing the Tab key to toggle mods (off by default on iOS: "
++                              "the only Tab that can arrive here is a forged one)")
++                     .DefaultValue(false));
++#else
++        .Options(UIWidgets::CheckboxOptions()
++                     .Color(THEME_COLOR)
+                      .Tooltip("Allows pressing the Tab key to toggle mods")
+                      .DefaultValue(true));
++#endif
+     SohGui::mSohMenu->AddSearchWidget(
+         { tabHotkeyWidget, "Settings", "Mod Menu", "Top", "alternate assets tab hotkey" });
+ }

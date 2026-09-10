@@ -12,10 +12,17 @@ TEAM="${SOH_IOS_TEAM:?set your Apple Developer team id (see README)}"
 [[ -f "$PREFIX/lib/libopusfile.a" ]] || SOH_IOS_SDK=visionos "$ROOT/scripts/build-audio-deps-ios.sh"
 [[ -f "$SOH_O2R" ]] || "$ROOT/scripts/build-oracle.sh"
 
-SOH_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+SOH_VERSION="${SOH_OTA_VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION")}"
 SOH_BUILD="$(date -u +%Y%m%d%H%M)"
 CONSOLE="${SOH_REMOTE_CONSOLE:-ON}"
 echo "=== soh visionOS $SOH_VERSION (build $SOH_BUILD), remote console: $CONSOLE ==="
+
+for _stale in "$BUILD"/soh/Release-*/soh.app "$BUILD"/soh/Release-*/libsohvisionswift.a; do
+    if [[ -L "$_stale" && ! -e "$_stale" ]]; then
+        echo "build: removing dangling symlink $_stale"
+        rm -f "$_stale"
+    fi
+done
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Shipwright" -B "$BUILD" -GXcode \
     "-DSOH_IOS_VERSION=$SOH_VERSION" "-DSOH_IOS_BUILD=$SOH_BUILD" \

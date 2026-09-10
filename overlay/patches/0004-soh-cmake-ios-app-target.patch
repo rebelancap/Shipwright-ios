@@ -35,11 +35,10 @@ omitted on iOS.
  if (NOT ESPEAK)
      list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/ESpeak")
  endif()
-@@ -230,6 +232,76 @@
- # Target
+@@ -231,6 +233,82 @@
  ################################################################################
  add_executable(${PROJECT_NAME} ${ALL_FILES})
-+
+ 
 +if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    # LUS defines __IOS__ only PRIVATE to itself; soh TUs (and LUS headers
 +    # they include) need it too.
@@ -89,7 +88,13 @@ omitted on iOS.
 +            XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER "${SOH_IOS_SHELL_DIR}/SohVision-Bridging-Header.h")
 +        target_sources(${PROJECT_NAME} PRIVATE
 +            "${SOH_IOS_SHELL_DIR}/SohHostViewController.m"
-+            "${SOH_IOS_SHELL_DIR}/SohImmersive.m")
++            "${SOH_IOS_SHELL_DIR}/SohImmersive.m"
++            # VR R4 (DONOR-MAP 8): the Sense hand source and the reduced
++            # layer-0 physics. SohVrPhys.c is deliberately dependency-free C so
++            # scripts/vrphys-suite.sh can build it for the HOST and assert the
++            # swing thresholds with no headset and no simulator.
++            "${SOH_IOS_SHELL_DIR}/SohSense.m"
++            "${SOH_IOS_SHELL_DIR}/SohVrPhys.c")
 +        # -all_load on the archive: main lives there and nothing else
 +        # references the Swift objects. SDK swift dir: the app target has no
 +        # Swift sources, so Xcode won't add runtime search paths itself.
@@ -109,14 +114,14 @@ omitted on iOS.
 +    set_source_files_properties("${SOH_O2R_PATH}" "${CMAKE_BINARY_DIR}/gamecontrollerdb.txt"
 +        PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 +endif()
- 
++
  if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
  use_props(${PROJECT_NAME} "${CMAKE_CONFIGURATION_TYPES}" "${DEFAULT_CXX_PROPS}")
-@@ -254,6 +326,47 @@
-     set_target_properties(${PROJECT_NAME} PROPERTIES
+ endif()
+@@ -255,6 +333,68 @@
          XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
          OUTPUT_NAME "soh-macos"
-+    )
+     )
 +elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    set(SOH_IOS_BUNDLE_IDENTIFIER "com.harbourmasters.soh" CACHE STRING "iOS bundle identifier")
 +    set(SOH_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
@@ -124,12 +129,33 @@ omitted on iOS.
 +    # scenes; visionOS-only (the key changes UIKit scene behavior on iPhone).
 +    set(SOH_PLIST_EXTRA "")
 +    if(SOH_VISIONOS)
++        # VR R4: the two keys the PSVR2 Sense path cannot work without.
++        #
++        # GCSupportedGameControllers with ProfileName SpatialGamepad -- in the
++        # DICT form, not an array of strings. Without it the OS hands the app a
++        # COMPATIBILITY presentation in which the pair arrives as ONE aggregated
++        # MFi gamepad; an aggregate virtual gamepad is not a trackable
++        # accessory, so ar_accessory_load_from_device fails with error 1200,
++        # which reads exactly like "this hardware cannot be tracked" and is not.
++        # A sibling port lost two device rounds to that reading.
++        #
++        # NSAccessoryTrackingUsageDescription -- without it the authorization
++        # request cannot even prompt, so the answer is always DENIED.
 +        set(SOH_PLIST_EXTRA "
 +	<key>UIApplicationSceneManifest</key>
 +	<dict>
 +		<key>UIApplicationSupportsMultipleScenes</key>
 +		<true/>
-+	</dict>")
++	</dict>
++	<key>GCSupportedGameControllers</key>
++	<array>
++		<dict>
++			<key>ProfileName</key>
++			<string>SpatialGamepad</string>
++		</dict>
++	</array>
++	<key>NSAccessoryTrackingUsageDescription</key>
++	<string>Ship of Harkinian uses your PSVR2 Sense controllers as Link's hands, so you can swing your sword and raise your shield by moving your arms.</string>")
 +    endif()
 +    # PORT versioning (D-039) — deliberately NOT upstream's CMAKE_PROJECT_VERSION.
 +    # SOH_IOS_VERSION (CFBundleShortVersionString) is the PUBLIC version and the
@@ -157,10 +183,11 @@ omitted on iOS.
 +        # generic one) from a CMake-generated project.
 +        XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"
 +        XCODE_ATTRIBUTE_SKIP_INSTALL "NO"
-     )
++    )
  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
      set_target_properties(${PROJECT_NAME} PROPERTIES
-@@ -483,18 +596,21 @@
+     OUTPUT_NAME "soh.elf"
+@@ -483,18 +623,21 @@
  endif()
  
  if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -193,7 +220,7 @@ omitted on iOS.
              $<$<COMPILE_LANGUAGE:C>:
                  -Werror-implicit-function-declaration
                  -Wno-incompatible-pointer-types
-@@ -505,7 +621,6 @@
+@@ -505,7 +648,6 @@
                  -Wno-c++11-narrowing
                  -Wno-deprecated-enum-enum-conversion
              >
@@ -201,7 +228,7 @@ omitted on iOS.
          )
  
          target_link_options(${PROJECT_NAME} PRIVATE
-@@ -692,6 +807,67 @@
+@@ -692,6 +834,67 @@
      target_include_directories(${PROJECT_NAME} PRIVATE
          ${DEVKITPRO}/portlibs/wiiu/include/
      )

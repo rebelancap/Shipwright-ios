@@ -1,0 +1,187 @@
+Overlay patch 0046: the physical shield's FACING VETO (VR-DONOR-MAP 8, donor
+`soh/soh/Enhancements/vr-combat/VrShield.cpp:152` VrCombat_ShieldFacingVeto,
+hooked at the donor's z_collision_check.c:1732). The donor map calls this the
+sharpest hook in the mod, and the reason is structural rather than clever.
+
+Physical shield blocking sets NO stance flag at all -- there is nothing for the
+damage handler to consult. Blocking is purely GEOMETRIC: the shield quad rides
+the tracked hand, and whether an attack is blocked is decided by where that quad
+is pointing when the attack touches it.
+
+WHERE the decision is made is the load-bearing part. It sits at the VERY TOP of
+CollisionCheck_SetATvsAC, BEFORE the AC_HARD -> CollisionCheck_SetBounce call,
+and returns 0 for the whole hit: no bounce, no enemy recoil, no AT/AC flags, no
+hitmark. The attack keeps flying as if the shield were not there and may still
+go on to hit Link's body. The donor records why it is not judged later, in the
+player's damage handler: the AC_HARD bounce raised HERE is what actually cancels
+an enemy's attack, from ANY angle -- so by the time the damage handler runs, a
+back-facing shield has already eaten the attack. Too late.
+
+The test, in donor order, and its cost. The first thing it does is a POINTER
+COMPARE against `&player->shieldQuad.base`, so every other collision in the game
+-- sword vs enemy, enemy vs enemy, every projectile -- pays exactly one compare
+and leaves. Then:
+
+  1. the shield must be PHYSICALLY HELD. The donor's VrCombat_ShieldHeld is, for
+     us, the published shell state: VR first person live, motion hands on, and
+     the SHIELD hand tracked. Vanilla stance blocking (R-button, no tracked
+     hands) is never judged -- it keeps its vanilla behaviour byte for byte.
+  2. the cone half-angle gSohVRShieldFacingDeg, default 65 (donor CVar
+     gVrPhysShieldFacingDeg, same default); >= 179 disables the feature.
+  3. quad centre = mean of the 4 quad vertices; normal from (q1-q0) x (q2-q0),
+     normalized, then SIGN-FLIPPED AWAY FROM THE CHEST (world.pos + 40 on y), so
+     "front" is the outward face regardless of the quad's winding or the hand's
+     pose -- a mirrored hand or a reversed vertex order cannot invert the test.
+  4. toAtk = attacker->focus.pos - centre. focus.pos is the right target: it is
+     the chest/head for tall enemies and the projectile itself for rocks and
+     arrows.
+  5. veto iff dot(n, toAtk)/|toAtk| < cosf(maxDeg * pi/180).
+
+Degenerate inputs (no player, no attacker actor, zero-length normal, attacker
+standing exactly on the quad centre) all fall through to VANILLA, never to a
+veto -- the failure mode of a bad frame must be "the shield works as it always
+did", not "attacks pass through Link".
+
+The shield hand is the opposite of the sword hand: sword = gSohVRLeftHanded ?
+LEFT : RIGHT, shield = sword ^ 1. Symbols are declared locally with `extern
+volatile`, the style overlay 0039 uses; no header is added to vendor.
+
+__IOS__-only, and a strict no-op whenever gSohVRFpActive == 0. The macOS build
+compiles none of it. Outside VR, CollisionCheck_SetATvsAC behaves exactly as it
+does today.
+
+--- a/soh/src/code/z_collision_check.c
++++ b/soh/src/code/z_collision_check.c
+@@ -1718,11 +1718,132 @@
+     ac->acFlags |= AC_BOUNCED;
+ }
+ 
++#ifdef __IOS__
+ /**
++ * SOH_IOS (overlay 0046, VR-DONOR-MAP 8, donor VrShield.cpp
++ * VrCombat_ShieldFacingVeto): is this confirmed hit landing on the PHYSICAL
++ * shield quad from OUTSIDE its facing cone? Physical blocking sets no stance
++ * flag -- it is purely geometric -- so this is the only place the question can
++ * be asked. Returns 1 to veto the entire hit.
++ *
++ * The first test is a pointer compare, so every collision in the game that is
++ * not the player's shield quad costs one comparison and returns.
++ */
++static s32 sohVrShieldFacingVeto(PlayState* play, Collider* at, Collider* ac) {
++    extern volatile int gSohVRFpActive;
++    extern volatile int gSohVRMotionHands;
++    extern volatile int gSohVRHandValid[2];
++    extern volatile int gSohVRLeftHanded;
++    extern volatile float gSohVRShieldFacingDeg;
++    extern volatile int gSohVRShieldVetoes;
++    Player* sohPlayer;
++    Actor* sohAttacker;
++    Vec3f* sohQuad;
++    Vec3f sohCenter;
++    Vec3f sohE1;
++    Vec3f sohE2;
++    Vec3f sohN;
++    Vec3f sohChest;
++    Vec3f sohOut;
++    Vec3f sohToAtk;
++    f32 sohNLen;
++    f32 sohDLen;
++    f32 sohMaxDeg;
++    s32 sohShieldHand;
++
++    if (play == NULL) {
++        return 0;
++    }
++    sohPlayer = GET_PLAYER(play);
++    if (sohPlayer == NULL || (void*)ac != (void*)&sohPlayer->shieldQuad.base) {
++        return 0;
++    }
++    /* The shield must be PHYSICALLY held: vanilla stance blocking is never
++     * judged, so it keeps its vanilla behaviour exactly. The shield hand is the
++     * opposite of the sword hand (0 = LEFT, 1 = RIGHT). */
++    sohShieldHand = (gSohVRLeftHanded ? 0 : 1) ^ 1;
++    if (!gSohVRFpActive || !gSohVRMotionHands || !gSohVRHandValid[sohShieldHand]) {
++        return 0;
++    }
++    /* The generosity cone; >= 179 disables the gate (donor gVrPhysShieldFacingDeg). */
++    sohMaxDeg = gSohVRShieldFacingDeg;
++    if (sohMaxDeg >= 179.0f) {
++        return 0;
++    }
++    sohAttacker = at->actor;
++    if (sohAttacker == NULL) {
++        return 0;
++    }
++    sohQuad = sohPlayer->shieldQuad.dim.quad;
++    sohCenter.x = (sohQuad[0].x + sohQuad[1].x + sohQuad[2].x + sohQuad[3].x) * 0.25f;
++    sohCenter.y = (sohQuad[0].y + sohQuad[1].y + sohQuad[2].y + sohQuad[3].y) * 0.25f;
++    sohCenter.z = (sohQuad[0].z + sohQuad[1].z + sohQuad[2].z + sohQuad[3].z) * 0.25f;
++    sohE1.x = sohQuad[1].x - sohQuad[0].x;
++    sohE1.y = sohQuad[1].y - sohQuad[0].y;
++    sohE1.z = sohQuad[1].z - sohQuad[0].z;
++    sohE2.x = sohQuad[2].x - sohQuad[0].x;
++    sohE2.y = sohQuad[2].y - sohQuad[0].y;
++    sohE2.z = sohQuad[2].z - sohQuad[0].z;
++    sohN.x = sohE1.y * sohE2.z - sohE1.z * sohE2.y;
++    sohN.y = sohE1.z * sohE2.x - sohE1.x * sohE2.z;
++    sohN.z = sohE1.x * sohE2.y - sohE1.y * sohE2.x;
++    sohNLen = sqrtf(sohN.x * sohN.x + sohN.y * sohN.y + sohN.z * sohN.z);
++    if (sohNLen < 1e-3f) {
++        return 0;
++    }
++    sohN.x /= sohNLen;
++    sohN.y /= sohNLen;
++    sohN.z /= sohNLen;
++    /* Orient the normal AWAY from the chest, so "front" is the outward face
++     * whatever the quad's winding or the hand's mirroring does. */
++    sohChest.x = sohPlayer->actor.world.pos.x;
++    sohChest.y = sohPlayer->actor.world.pos.y + 40.0f;
++    sohChest.z = sohPlayer->actor.world.pos.z;
++    sohOut.x = sohCenter.x - sohChest.x;
++    sohOut.y = sohCenter.y - sohChest.y;
++    sohOut.z = sohCenter.z - sohChest.z;
++    if (sohN.x * sohOut.x + sohN.y * sohOut.y + sohN.z * sohOut.z < 0.0f) {
++        sohN.x = -sohN.x;
++        sohN.y = -sohN.y;
++        sohN.z = -sohN.z;
++    }
++    /* focus.pos is the chest/head for tall enemies and the projectile itself
++     * for rocks and arrows -- the direction the attack is actually coming from. */
++    sohToAtk.x = sohAttacker->focus.pos.x - sohCenter.x;
++    sohToAtk.y = sohAttacker->focus.pos.y - sohCenter.y;
++    sohToAtk.z = sohAttacker->focus.pos.z - sohCenter.z;
++    sohDLen = sqrtf(sohToAtk.x * sohToAtk.x + sohToAtk.y * sohToAtk.y + sohToAtk.z * sohToAtk.z);
++    if (sohDLen < 1e-3f) {
++        return 0;
++    }
++    if (((sohN.x * sohToAtk.x + sohN.y * sohToAtk.y + sohN.z * sohToAtk.z) / sohDLen) <
++        cosf(sohMaxDeg * (f32)(M_PI / 180.0))) {
++        /* rev2 (VR R5): count it. A veto and a plain miss are indistinguishable
++         * from a headset -- both are "I held my shield up and still got hit" --
++         * and this is the one number that tells them apart. */
++        gSohVRShieldVetoes = gSohVRShieldVetoes + 1;
++        return 1;
++    }
++    return 0;
++}
++#endif
++
++/**
+  * Performs the AC collision between the AT element and AC element that collided.
+  */
+ s32 CollisionCheck_SetATvsAC(PlayState* play, Collider* at, ColliderInfo* atInfo, Vec3f* atPos, Collider* ac,
+                              ColliderInfo* acInfo, Vec3f* acPos, Vec3f* hitPos) {
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0046): an attack touching the physical shield quad from
++     * outside its facing cone is ignored ENTIRELY, here at the source -- no
++     * bounce, no enemy recoil, no flags -- and keeps flying, so it may still hit
++     * the body. This must precede the AC_HARD bounce below: that bounce is what
++     * cancels an enemy's attack from any angle, so judging in the player's
++     * damage handler instead would already be too late. */
++    if (sohVrShieldFacingVeto(play, at, ac)) {
++        return 0;
++    }
++#endif
+     if (ac->acFlags & AC_HARD && at->actor != NULL && ac->actor != NULL) {
+         CollisionCheck_SetBounce(at, ac);
+     }
