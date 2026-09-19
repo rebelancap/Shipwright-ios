@@ -10,6 +10,7 @@
 // captures the true landscape framebuffer and is the verification source.
 #import <GameController/GameController.h>
 #include <dlfcn.h> // R17 part B: dladdr, to name a terminating C++ exception
+#include <objc/runtime.h> // iOS 27 scene-config hook grafted onto SDL's app delegate
 #import <AVFAudio/AVFAudio.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
@@ -3304,15 +3305,96 @@ static int SohIos_EventFilter(void* userdata, SDL_Event* event) {
     return 1;
 }
 
-// Runtime-installed scene delegate: SDL2 predates scenes, so UIKit creates
-// the scene with delegate=nil and scene-routed events (URL opens) vanish.
-// Installing a delegate post-launch is surgical: URL contexts start
-// arriving here, and the lifecycle methods forward to SDL's app delegate
-// (the predecessor's visionOS fwd: pattern) in case delegate presence
-// reroutes them away from the legacy callbacks SDL depends on.
+// The app's scene delegate. As of the iOS 27 SDK this is NAMED IN THE
+// Info.plist scene manifest and instantiated by UIKit itself (+load below
+// grafts the matching configuration hook onto SDL's app delegate, which is
+// the other half the runtime insists on). It also still works the old way:
+// SohIos_InstallSceneDelegate() attaches this object to any scene that
+// somehow arrived with delegate == nil, so a build against an older SDK
+// behaves exactly as before.
+//
+// Lifecycle: the scene callbacks forward to SDL's app delegate (the
+// predecessor's visionOS fwd: pattern). SDL itself listens on
+// NSNotificationCenter (SDL_uikitevents.m), and those notifications still
+// post under a scene life cycle, so nothing SDL needs is lost and the fwd:
+// calls are no-ops on SDLUIKitDelegate (it implements none of them) --
+// nothing fires twice.
 @interface SohIosSceneDelegate : NSObject <UIWindowSceneDelegate>
 @end
+
+// The scene UIKit connected us to, remembered the moment it arrives. Under the
+// real scene life cycle this is live BEFORE SDL_main has created any window,
+// so the landscape/graft path no longer has to poll for it.
+static UIWindowScene* gSohConnectedScene = nil;
+
 @implementation SohIosSceneDelegate
+#if !TARGET_OS_VISION
+// iOS 27 SDK gate (see soh/ios/Info.plist.in, overlay 0004). UIKit refuses to
+// launch a UIKit app built against this SDK unless the app ADOPTS scenes, and
+// it checks the app delegate for the scene-configuration hook -- the manifest
+// alone is not enough. Our app delegate is SDL2's SDLUIKitDelegate, which
+// predates scenes entirely and which we do not want to fork (SDL arrives via
+// libultraship's FetchContent, not the overlay). So graft the one method onto
+// it at +load, which runs at image load, long before UIApplicationMain.
+// class_addMethod (not a category) keeps this free of any link dependency on
+// SDL's class -- on visionOS that class is not even the app delegate.
+static UISceneConfiguration* SohIos_SceneConfigForSession(id self, SEL _cmd, UIApplication* application,
+                                                          UISceneSession* connectingSceneSession,
+                                                          UISceneConnectionOptions* options) {
+    UISceneConfiguration* cfg = [UISceneConfiguration configurationWithName:@"Default"
+                                                               sessionRole:connectingSceneSession.role];
+    cfg.delegateClass = SohIosSceneDelegate.class;
+    cfg.sceneClass = UIWindowScene.class;
+    return cfg;
+}
+
++ (void)load {
+    Class sdlDelegate = NSClassFromString(@"SDLUIKitDelegate");
+    if (sdlDelegate == Nil) {
+        NSLog(@"[SohIosShell] SDLUIKitDelegate not found; scene-config hook NOT installed");
+        return;
+    }
+    SEL sel = @selector(application:configurationForConnectingSceneSession:options:);
+    if ([sdlDelegate instancesRespondToSelector:sel]) {
+        return; // SDL grew one; leave it alone
+    }
+    BOOL ok = class_addMethod(sdlDelegate, sel, (IMP)SohIos_SceneConfigForSession, "@@:@@@");
+    NSLog(@"[SohIosShell] scene-config hook on SDLUIKitDelegate: %@", ok ? @"installed" : @"FAILED");
+}
+#endif
+
+// UIKit now instantiates this class itself (Info.plist UISceneConfigurations),
+// so this is the first shell code that runs with a live scene. SDL's window
+// does not exist yet -- SDL_main runs on a later run-loop turn -- so all we can
+// do here is remember the scene, adopt whatever windows already exist (SDL's
+// launch screen window), and drain any launch-time soh:// URL.
+- (void)scene:(UIScene*)scene willConnectToSession:(UISceneSession*)session
+      options:(UISceneConnectionOptions*)connectionOptions {
+    if ([scene isKindOfClass:UIWindowScene.class]) {
+        UIWindowScene* ws = (UIWindowScene*)scene;
+        gSohConnectedScene = ws;
+        for (UIWindow* w in UIApplication.sharedApplication.windows) {
+            if (w.windowScene == nil) {
+                w.windowScene = ws;
+            }
+            if (w.windowScene == ws) {
+                SohIos_GlueWindowToScene(w, ws);
+            }
+        }
+        NSLog(@"[SohIosShell] scene connected (%@ windows adopted)", @(UIApplication.sharedApplication.windows.count));
+    }
+    for (UIOpenURLContext* ctx in connectionOptions.URLContexts) {
+        NSString* u = ctx.URL.absoluteString;
+        // The engine is not up yet; hand it over once SDL_main has run.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(),
+                       ^{ SohIos_HandleDeepLink(u); });
+    }
+}
+- (void)sceneDidDisconnect:(UIScene*)scene {
+    if ((UIScene*)gSohConnectedScene == scene) {
+        gSohConnectedScene = nil;
+    }
+}
 - (void)scene:(UIScene*)scene openURLContexts:(NSSet<UIOpenURLContext*>*)URLContexts {
     for (UIOpenURLContext* ctx in URLContexts) {
         SohIos_HandleDeepLink(ctx.URL.absoluteString);
@@ -5134,7 +5216,7 @@ static UIWindow* SohIos_GetSDLWindow(struct SDL_Window* sdlWindow) {
 }
 
 static UIWindowScene* SohIos_ActiveScene(void) {
-    UIWindowScene* fallback = nil;
+    UIWindowScene* fallback = gSohConnectedScene;
     for (UIScene* s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:UIWindowScene.class]) {
             continue;

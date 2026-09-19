@@ -1,0 +1,366 @@
+Overlay patch 0058: FOLD IN UPSTREAM SOH `G_SETTILESIZE_LERP` (the game half).
+Upstream commit `c4e92a70f` on HarbourMasters/Shipwright `develop` ("Constant-size
+texture scroll display lists via G_SETTILESIZE_LERP", #6902). Pairs with overlay
+0057, the LUS half.
+Upstream code, no `__IOS__` gating; the macOS build builds and runs it too.
+
+Upstream's `libultraship` submodule pointer bump is EXCLUDED — our LUS is our own
+pin plus this overlay, and 0057 is how it gets the new opcode.
+
+WHY (the same bug as 0056). `G_SETTILESIZE_INTERP` bakes ONE tile-size command
+per interpolated frame into the display list, each carrying a pre-stepped
+FRACTIONAL tile coordinate (`xStep / interpFrames` accumulated in a float). Those
+are exactly the coordinates that land on 31.9999 and make HD replacement textures
+rescale by 32/31 (see 0056's header). It also makes display list memory scale
+with the interpolation frame count — a 120 Hz iPhone allocates 6x what a 20 Hz
+run does for every scrolling surface. `G_SETTILESIZE_LERP` sends the two exact
+ENDPOINTS once and lerps at draw time instead.
+
+WHAT UPSTREAM CHANGES, taken as-is:
+
+  * `soh/include/functions.h`, `soh/soh/GbiWrap.cpp` — `gDPSetTileSizeLerp`, the
+    C entry point wrapping LUS's `__gDPSetTileSizeLerp` macro.
+  * `soh/src/code/z_rcp.c` — `Gfx_TexScrollEx`, `Gfx_TwoTexScrollEx` and
+    `Gfx_TwoTexScrollEnvColorEx` rewritten to emit ONE lerp command per tile
+    (endpoints = the tile rectangle now, and the same rectangle advanced by one
+    game tick's scroll step) instead of a `gDPSetInterpolation` +
+    `gDPSetTileSizeInterp` pair per interpolated frame. Allocation becomes a
+    constant 7 / 12 / 13 Gfx instead of `2 + 4n` / `5 + 7n` / `6 + 7n`.
+    `Gfx_TwoTexScrollEnvColorEx` is the Death Mountain Crater lava and Water
+    Temple water path this whole round is about.
+  * `soh/soh/OTRGlobals.h` + `.cpp` — upstream DELETES
+    `Ship_GetInterpolationFrameCount` here (z_rcp.c was its only caller, verified
+    by grep across `vendor/Shipwright/soh` and `app/`, and nothing needs the frame
+    count once display lists stop scaling with it). WE KEEP IT. Overlay 0013
+    anchors its own additions on that function's body as patch context, so
+    deleting it makes 0013 undetectable on a second `apply-overlay.sh` run and
+    hard-fails the build — the same trap as `RunCommands` below. It is now an
+    unreferenced `extern "C"` helper: a few dead instructions, zero risk, and
+    removable in a later round that also regenerates 0013.
+  * `ovl_Boss_Tw`, `ovl_En_Fz`, `ovl_Effect_Ss_En_Ice` — three call sites moved
+    from `Gfx_TwoTexScroll` to `Gfx_TwoTexScrollEx` with their real per-tick
+    scroll steps, so those effects interpolate instead of stepping at 20 Hz.
+
+THE ONE PLACE WE DIVERGE, AND WHY.
+
+Upstream's `RunCommands(Gfx*, int time, int step, int denom, int count)` runs the
+interpolation loop itself, so its fix is a one-liner inside that loop:
+`intp->mInterpolationT = (float)time / denom;`. OUR `RunCommands` has a different
+shape — it takes a PRE-BUILT `std::vector<std::unordered_map<Mtx*, MtxF>>` that
+`Graph_ProcessGfxCommands` fills in a separate loop — and, more to the point,
+overlay 0008's perf probe owns EVERY line of its body and its signature as patch
+context (`void RunCommands(...)`, `for (const auto& m : mtx_replacements) {`,
+`wnd->DrawAndRunGraphicsCommands(Commands, m);`, `intp->mInterpolationIndex++;`,
+and the call site `RunCommands(commands, mtx_replacements);`). Editing any of
+them makes 0008 undetectable on a second `apply-overlay.sh` run — which is not a
+style objection, it is a hard build failure: the script's reverse-apply probe
+fails and reports "0008 neither applied nor appliable". (Observed, not theorised;
+this patch was written the other way first.)
+
+So `RunCommands` is not touched at all. Instead `Graph_ProcessGfxCommands`:
+
+  * builds a parallel `std::vector<float> interp_ts`, pushing
+    `(float)time / next_original_frame` next to each matrix replacement — the
+    SAME expression it already passes to `FrameInterpolation_Interpolate`, so
+    matrices and tile sizes are interpolated to the identical instant, and the
+    last frame of a tick is exactly 1.0f (upstream's `time == denom` case);
+  * hands the whole list to the interpreter once per tick, next to the existing
+    `wnd->SetTargetFps(fps)`;
+  * does the same in the gfx-debugger branch, which collapses the frame list to a
+    single entry, with a single 1.0f.
+
+Overlay 0057's last two hunks are the LUS side of that: `mInterpolationTs`, indexed by the
+`mInterpolationIndex` the loop already advances per rendered frame, with
+`mInterpolationT` kept as the fallback. Net effect is identical to upstream's
+one-liner; the difference is only WHERE the factor is handed over.
+
+WHY THAT COVERS BOTH PLATFORMS. `Graph_ProcessGfxCommands` -> `RunCommands` is
+the ONLY path that runs graphics commands in this port (grep for `RunCommands`
+across `vendor/Shipwright/soh` and `app/` finds exactly one definition and one
+call). Flat iOS drives it from the display link; the visionOS immersive path
+drives the same game loop — `app/ios/SohImmersive.m` changes what
+`GetInterpolationFPS()` REPORTS (overlay 0015), which feeds `target_fps` in this
+very function and therefore the length of both vectors. So the LERP factor
+advances once per rendered frame on iPhone and in the headset alike, and the
+scroll cannot freeze on either.
+
+--- a/soh/include/functions.h
++++ b/soh/include/functions.h
+@@ -23,6 +23,8 @@
+ void gSPSegmentLoadRes(void* value, int segNum, uintptr_t target);
+ void gSPDisplayList(Gfx* pkt, Gfx* dl);
+ void gDPSetTileSizeInterp(Gfx* pkt, int t, float uls, float ult, float lrs, float lrt);
++void gDPSetTileSizeLerp(Gfx* pkt, int t, float uls0, float ult0, float lrs0, float lrt0, float uls1, float ult1,
++                        float lrs1, float lrt1);
+ void gSPDisplayListOffset(Gfx* pkt, Gfx* dl, int offset);
+ void gSPVertex(Gfx* pkt, uintptr_t v, int n, int v0);
+ void gSPInvalidateTexCache(Gfx* pkt, uintptr_t texAddr);
+--- a/soh/soh/GbiWrap.cpp
++++ b/soh/soh/GbiWrap.cpp
+@@ -91,6 +91,11 @@
+     pkt++;
+ }
+ 
++extern "C" void gDPSetTileSizeLerp(Gfx* pkt, int t, float uls0, float ult0, float lrs0, float lrt0, float uls1,
++                                   float ult1, float lrs1, float lrt1) {
++    __gDPSetTileSizeLerp(pkt, t, uls0, ult0, lrs0, lrt0, uls1, ult1, lrs1, lrt1);
++}
++
+ extern "C" void gSPDisplayListOffset(Gfx* pkt, Gfx* dl, int offset) {
+     char* imgData = (char*)dl;
+ 
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -2185,6 +2185,8 @@
+ 
+     audio.cv_to_thread.notify_one();
+     std::vector<std::unordered_map<Mtx*, MtxF>> mtx_replacements;
++    // Overlay 0058: the G_SETTILESIZE_LERP factor for each of those frames.
++    std::vector<float> interp_ts;
+     int target_fps = OTRGlobals::Instance->GetInterpolationFPS();
+     static int last_fps;
+     static int last_update_rate;
+@@ -2211,18 +2213,28 @@
+         } else {
+             mtx_replacements.emplace_back();
+         }
++        interp_ts.push_back((float)time / next_original_frame);
+     }
+ 
+     time -= fps;
+ 
+     if (wnd != nullptr) {
+         wnd->SetTargetFps(fps);
++        if (auto intp = wnd->GetInterpreterWeak().lock()) {
++            intp->mInterpolationTs = interp_ts;
++        }
+     }
+ 
+     // When the gfx debugger is active, only run with the final mtx
+     if (GfxDebuggerIsDebugging()) {
+         mtx_replacements.clear();
+         mtx_replacements.emplace_back();
++        interp_ts.assign(1, 1.0f);
++        if (wnd != nullptr) {
++            if (auto intp = wnd->GetInterpreterWeak().lock()) {
++                intp->mInterpolationTs = interp_ts;
++            }
++        }
+     }
+ 
+     RunCommands(commands, mtx_replacements);
+--- a/soh/src/code/z_rcp.c
++++ b/soh/src/code/z_rcp.c
+@@ -1395,34 +1395,19 @@
+ }
+ 
+ Gfx* Gfx_TexScrollEx(GraphicsContext* gfxCtx, u32 x, u32 y, s32 width, s32 height, s32 xStep, s32 yStep) {
+-    int interpFrames = Ship_GetInterpolationFrameCount();
+-
+-    Gfx* gfx = Graph_Alloc(gfxCtx, (2 + (interpFrames * 4)) * sizeof(Gfx));
++    Gfx* gfx = Graph_Alloc(gfxCtx, 7 * sizeof(Gfx));
+ 
+     x %= 2048;
+     y %= 2048;
+ 
+-    float xFlt = (float)x;
+-    float yFlt = (float)y;
+-
+-    float xInc = (float)xStep / (float)interpFrames;
+-    float yInc = (float)yStep / (float)interpFrames;
+-
+-    int idx = 0;
+-
+-    gDPTileSync(&gfx[idx++]);
++    s32 xEnd = (s32)x + xStep;
++    s32 yEnd = (s32)y + yStep;
+ 
+-    for (int i = 0; i < interpFrames; i++) {
+-        gDPSetInterpolation(&gfx[idx++], i);
+-        gDPSetTileSizeInterp(&gfx[idx], 0, xFlt, yFlt, (xFlt + ((width - 1) << 2)), (yFlt + ((height - 1) << 2)));
+-        idx += 3;
++    gDPTileSync(&gfx[0]);
++    gDPSetTileSizeLerp(&gfx[1], 0, x, y, x + ((width - 1) << 2), y + ((height - 1) << 2), xEnd, yEnd,
++                       xEnd + ((width - 1) << 2), yEnd + ((height - 1) << 2));
++    gSPEndDisplayList(&gfx[6]);
+ 
+-        xFlt += xInc;
+-        yFlt += yInc;
+-    }
+-
+-    gSPEndDisplayList(&gfx[idx++]);
+-
+     return gfx;
+ }
+ 
+@@ -1446,46 +1431,24 @@
+ 
+ Gfx* Gfx_TwoTexScrollEx(GraphicsContext* gfxCtx, s32 tile1, u32 x1, u32 y1, s32 width1, s32 height1, s32 tile2, u32 x2,
+                         u32 y2, s32 width2, s32 height2, s32 xStep1, s32 yStep1, s32 xStep2, s32 yStep2) {
+-    int interpFrames = Ship_GetInterpolationFrameCount();
++    Gfx* gfx = Graph_Alloc(gfxCtx, 12 * sizeof(Gfx));
+ 
+-    Gfx* gfx = Graph_Alloc(gfxCtx, (5 + (interpFrames * 7)) * sizeof(Gfx));
+-
+     x1 %= 2048;
+     y1 %= 2048;
+     x2 %= 2048;
+     y2 %= 2048;
+ 
+-    float x1Flt = (float)x1;
+-    float y1Flt = (float)y1;
+-    float x2Flt = (float)x2;
+-    float y2Flt = (float)y2;
++    s32 x1End = (s32)x1 + xStep1;
++    s32 y1End = (s32)y1 + yStep1;
++    s32 x2End = (s32)x2 + xStep2;
++    s32 y2End = (s32)y2 + yStep2;
+ 
+-    int index = 0;
+-
+-    gDPTileSync(&gfx[index++]);
+-
+-    float xInc1 = (float)xStep1 / (float)interpFrames;
+-    float yInc1 = (float)yStep1 / (float)interpFrames;
+-
+-    float xInc2 = (float)xStep2 / (float)interpFrames;
+-    float yInc2 = (float)yStep2 / (float)interpFrames;
+-
+-    for (int i = 0; i < interpFrames; i++) {
+-        gDPSetInterpolation(&gfx[index++], i);
+-
+-        gDPSetTileSizeInterp(&gfx[index], tile1, x1Flt, y1Flt, (x1Flt + ((width1 - 1) << 2)),
+-                             (y1Flt + ((height1 - 1) << 2)));
+-        index += 3;
+-        gDPSetTileSizeInterp(&gfx[index], tile2, x2Flt, y2Flt, (x2Flt + ((width2 - 1) << 2)),
+-                             (y2Flt + ((height2 - 1) << 2)));
+-        index += 3;
+-
+-        x1Flt += xInc1;
+-        x2Flt += xInc2;
+-        y1Flt += yInc1;
+-        y2Flt += yInc2;
+-    }
+-    gSPEndDisplayList(&gfx[index]);
++    gDPTileSync(&gfx[0]);
++    gDPSetTileSizeLerp(&gfx[1], tile1, x1, y1, x1 + ((width1 - 1) << 2), y1 + ((height1 - 1) << 2), x1End, y1End,
++                       x1End + ((width1 - 1) << 2), y1End + ((height1 - 1) << 2));
++    gDPSetTileSizeLerp(&gfx[6], tile2, x2, y2, x2 + ((width2 - 1) << 2), y2 + ((height2 - 1) << 2), x2End, y2End,
++                       x2End + ((width2 - 1) << 2), y2End + ((height2 - 1) << 2));
++    gSPEndDisplayList(&gfx[11]);
+ 
+     return gfx;
+ }
+@@ -1512,48 +1475,26 @@
+ Gfx* Gfx_TwoTexScrollEnvColorEx(GraphicsContext* gfxCtx, s32 tile1, u32 x1, u32 y1, s32 width1, s32 height1, s32 tile2,
+                                 u32 x2, u32 y2, s32 width2, s32 height2, s32 r, s32 g, s32 b, s32 a, s32 xStep1,
+                                 s32 yStep1, s32 xStep2, s32 yStep2) {
+-    int interpFrames = Ship_GetInterpolationFrameCount();
++    Gfx* gfx = Graph_Alloc(gfxCtx, 13 * sizeof(Gfx));
+ 
+-    Gfx* gfx = Graph_Alloc(gfxCtx, (6 + (interpFrames * 7)) * sizeof(Gfx));
+-
+     x1 %= 2048;
+     y1 %= 2048;
+     x2 %= 2048;
+     y2 %= 2048;
+ 
+-    float x1Flt = (float)x1;
+-    float y1Flt = (float)y1;
+-    float x2Flt = (float)x2;
+-    float y2Flt = (float)y2;
++    s32 x1End = (s32)x1 + xStep1;
++    s32 y1End = (s32)y1 + yStep1;
++    s32 x2End = (s32)x2 + xStep2;
++    s32 y2End = (s32)y2 + yStep2;
+ 
+-    int index = 0;
++    gDPTileSync(&gfx[0]);
++    gDPSetTileSizeLerp(&gfx[1], tile1, x1, y1, x1 + ((width1 - 1) << 2), y1 + ((height1 - 1) << 2), x1End, y1End,
++                       x1End + ((width1 - 1) << 2), y1End + ((height1 - 1) << 2));
++    gDPSetTileSizeLerp(&gfx[6], tile2, x2, y2, x2 + ((width2 - 1) << 2), y2 + ((height2 - 1) << 2), x2End, y2End,
++                       x2End + ((width2 - 1) << 2), y2End + ((height2 - 1) << 2));
++    gDPSetEnvColor(&gfx[11], r, g, b, a);
++    gSPEndDisplayList(&gfx[12]);
+ 
+-    gDPTileSync(&gfx[index++]);
+-
+-    float xInc1 = (float)xStep1 / (float)interpFrames;
+-    float yInc1 = (float)yStep1 / (float)interpFrames;
+-
+-    float xInc2 = (float)xStep2 / (float)interpFrames;
+-    float yInc2 = (float)yStep2 / (float)interpFrames;
+-
+-    for (int i = 0; i < interpFrames; i++) {
+-        gDPSetInterpolation(&gfx[index++], i);
+-
+-        gDPSetTileSizeInterp(&gfx[index], tile1, x1Flt, y1Flt, (x1Flt + ((width1 - 1) << 2)),
+-                             (y1Flt + ((height1 - 1) << 2)));
+-        index += 3;
+-        gDPSetTileSizeInterp(&gfx[index], tile2, x2Flt, y2Flt, (x2Flt + ((width2 - 1) << 2)),
+-                             (y2Flt + ((height2 - 1) << 2)));
+-        index += 3;
+-
+-        x1Flt += xInc1;
+-        x2Flt += xInc2;
+-        y1Flt += yInc1;
+-        y2Flt += yInc2;
+-    }
+-    gDPSetEnvColor(&gfx[index++], r, g, b, a);
+-    gSPEndDisplayList(&gfx[index]);
+-
+     return gfx;
+ }
+ 
+--- a/soh/src/overlays/actors/ovl_Boss_Tw/z_boss_tw.c
++++ b/soh/src/overlays/actors/ovl_Boss_Tw/z_boss_tw.c
+@@ -5037,8 +5037,9 @@
+             if (sp18F == 0) {
+                 gSPDisplayList(POLY_XLU_DISP++, SEGMENTED_TO_VIRTUAL(gTwinrovaIceSurroundingPlayerMaterialDL));
+                 gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, 195, 225, 235, 255);
+-                gSPSegment(POLY_XLU_DISP++, 8,
+-                           Gfx_TwoTexScroll(play->state.gfxCtx, 0, 0, 0, 0x20, 0x40, 1, 0, 0, 0x20, 0x20));
++                gSPSegment(
++                    POLY_XLU_DISP++, 8,
++                    Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, 0, 0, 0x20, 0x40, 1, 0, 0, 0x20, 0x20, 0, 0, 0, 0));
+                 sp18F++;
+                 BossTw_InitRand(1, 0x71AC, 0x263A);
+             }
+@@ -5090,8 +5091,9 @@
+             }
+ 
+             gSPSegment(POLY_XLU_DISP++, 8,
+-                       Gfx_TwoTexScroll(play->state.gfxCtx, 0, (currentEffect->frame * 3) & 0x7F,
+-                                        (-currentEffect->frame * 15) & 0xFF, 0x20, 0x40, 1, 0, 0, 0x20, 0x20));
++                       Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, (currentEffect->frame * 3) & 0x7F,
++                                          (-currentEffect->frame * 15) & 0xFF, 0x20, 0x40, 1, 0, 0, 0x20, 0x20, 3, -15,
++                                          0, 0));
+             Matrix_Translate(currentEffect->pos.x, currentEffect->pos.y, currentEffect->pos.z, MTXMODE_NEW);
+             Matrix_ReplaceRotation(&play->billboardMtxF);
+             Matrix_Scale(currentEffect->workf[EFF_SCALE], currentEffect->workf[EFF_SCALE], 1.0f, MTXMODE_APPLY);
+--- a/soh/src/overlays/actors/ovl_En_Fz/z_en_fz.c
++++ b/soh/src/overlays/actors/ovl_En_Fz/z_en_fz.c
+@@ -886,8 +886,8 @@
+ 
+             gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, 195, 225, 235, iceSmoke->primAlpha);
+             gSPSegment(POLY_XLU_DISP++, 0x08,
+-                       Gfx_TwoTexScroll(play->state.gfxCtx, 0, 3 * (iceSmoke->timer + (3 * i)),
+-                                        15 * (iceSmoke->timer + (3 * i)), 32, 64, 1, 0, 0, 32, 32));
++                       Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, 3 * (iceSmoke->timer + (3 * i)),
++                                          15 * (iceSmoke->timer + (3 * i)), 32, 64, 1, 0, 0, 32, 32, 3, 15, 0, 0));
+             Matrix_Translate(iceSmoke->pos.x, iceSmoke->pos.y, iceSmoke->pos.z, MTXMODE_NEW);
+             Matrix_ReplaceRotation(&play->billboardMtxF);
+             Matrix_Scale(iceSmoke->xyScale, iceSmoke->xyScale, 1.0f, MTXMODE_APPLY);
+--- a/soh/src/overlays/effects/ovl_Effect_Ss_En_Ice/z_eff_ss_en_ice.c
++++ b/soh/src/overlays/effects/ovl_Effect_Ss_En_Ice/z_eff_ss_en_ice.c
+@@ -122,8 +122,8 @@
+     Gfx_SetupDL_25Xlu(play->state.gfxCtx);
+     func_8002EB44(&this->pos, &play->view.eye, &hiliteLightDir, play->state.gfxCtx);
+     gSPSegment(POLY_XLU_DISP++, 0x08,
+-               Gfx_TwoTexScroll(play->state.gfxCtx, 0, 0, gameplayFrames & 0xFF, 0x20, 0x10, 1, 0,
+-                                (gameplayFrames * 2) & 0xFF, 0x40, 0x20));
++               Gfx_TwoTexScrollEx(play->state.gfxCtx, 0, 0, gameplayFrames & 0xFF, 0x20, 0x10, 1, 0,
++                                  (gameplayFrames * 2) & 0xFF, 0x40, 0x20, 0, 1, 0, 2));
+     gDPSetPrimColor(POLY_XLU_DISP++, 0, 0x80, this->rPrimColorR, this->rPrimColorG, this->rPrimColorB,
+                     this->rPrimColorA);
+     gDPSetEnvColor(POLY_XLU_DISP++, this->rEnvColorR, this->rEnvColorG, this->rEnvColorB, (u32)alpha);

@@ -1,0 +1,283 @@
+Overlay patch 0057: FOLD IN UPSTREAM LUS `G_SETTILESIZE_LERP` (the LUS half).
+Upstream commit `c57da1b4` on Kenix3/libultraship ("Add G_SETTILESIZE_LERP for
+constant-size texture scroll interpolation", #1141; cherry-picked to their main
+as `eee464e0`). Taken verbatim onto our pin — this is upstream code, not an iOS
+behaviour change, so there is no `__IOS__` gating and the macOS build takes it
+too.
+
+WHY WE WANT IT (same bug as 0056). The old scheme, `G_SETTILESIZE_INTERP`, bakes
+ONE tile-size command per interpolated frame into the display list, each carrying
+a pre-stepped fractional tile coordinate, and the interpreter picks the one whose
+index matches `mInterpolationIndex`. Two consequences we care about:
+
+  * Every one of those baked coordinates is a float that has already accumulated
+    `xStep / interpFrames` additions, so the derived tile width lands on 31.9999
+    instead of 32 and HD replacement textures rescale by 32/31 — the jitter 0056
+    describes.
+  * Display list memory scales with the interpolation frame count. A 120 Hz
+    iPhone runs 6 interpolated frames per 20 Hz game tick, so every scrolling
+    surface allocates 6x the Gfx words a 20 Hz run would.
+
+`G_SETTILESIZE_LERP` replaces the whole scheme with ONE command (opcode 0x4a,
+5 Gfx) carrying the two ENDPOINTS as floats — the tile rectangle at the previous
+game tick and at the current one — and the interpreter lerps between them at DRAW
+time against a new `Interpreter::mInterpolationT` (0 = previous tick, 1 = current
+tick), which the port sets before each rendered frame. Display list size is now
+constant, and the endpoints are exact integers-as-floats rather than an
+accumulated running sum.
+
+WHAT IS IN HERE (all five files upstream touches):
+
+  * `include/fast/interpreter.h` — `float mInterpolationT = 1.0f;`. The default
+    of 1.0 matters: any draw that happens before the port sets it (or in a
+    non-interpolating path) uses the current tick's endpoint, i.e. exactly what
+    a non-interpolated frame should show.
+  * `include/fast/lus_gbi.h` — `RDP_G_SETTILESIZE_LERP = OPCODE(0x4a)`.
+  * `include/libultraship/libultra/gbi.h` — `G_SETTILESIZE_LERP 0x4a` and the
+    `__gDPSetTileSizeLerp` packing macro (8 floats across 4 following Gfx).
+  * `src/fast/interpreter.cpp` — `gfx_set_tile_size_lerp_handler_rdp`, which
+    reads the 8 floats, lerps each of uls/ult/lrs/lrt by `mInterpolationT`, and
+    marks both texture slots changed; plus the handler-table row. (The bulk of
+    that file's diff is upstream's clang-format realignment of the table's
+    trailing comments, not logic.)
+  * `src/libultraship/window/gui/GfxDebuggerWindow.cpp` — the disassembler now
+    steps over both `G_SETTILESIZE_INTERP` (3 Gfx) and `G_SETTILESIZE_LERP`
+    (5 Gfx) instead of walking into their float payloads as if they were
+    commands.
+
+`G_SETTILESIZE_INTERP` is NOT removed; it keeps working for any producer that
+still emits it. Patch 0058 is the SoH half: it emits the new command and supplies
+the interpolation factors.
+
+THE ONE ADAPTATION ON TOP OF UPSTREAM (two extra hunks, marked `SOH_IOS`).
+
+Upstream expects the port to set `mInterpolationT` immediately before each
+`DrawAndRunGraphicsCommands` call. In this port that loop is `RunCommands` in
+`OTRGlobals.cpp`, and overlay 0008's perf probe owns EVERY line of its body and
+its signature as patch context — adding a line there makes 0008 undetectable on a
+second `apply-overlay.sh` run and hard-fails the build. (Observed, not theorised.)
+So the port hands over the whole tick's factors once, from
+`Graph_ProcessGfxCommands` where they are computed anyway, and the interpreter
+picks the right one:
+
+  * `include/fast/interpreter.h` — `std::vector<float> mInterpolationTs;` beside
+    upstream's `mInterpolationT`. (`<vector>` is already included.)
+  * `src/fast/interpreter.cpp`, `gfx_set_tile_size_lerp_handler_rdp` — `t` comes
+    from `mInterpolationTs[mInterpolationIndex]` when that index is in range,
+    otherwise from `mInterpolationT` (default 1.0f). `mInterpolationIndex` is the
+    counter `RunCommands` already advances once per RENDERED frame, so entry i
+    belongs to frame i by construction.
+
+The fallback is what makes it safe: any draw outside an interpolated tick — a port
+that never fills the vector, a frame before the first tick, the gfx debugger —
+behaves exactly as upstream's unmodified code, taking the current-tick endpoint.
+Net effect is identical to upstream's one-liner; only the handover point differs.
+These two hunks are NOT `__IOS__`-gated: the macOS build runs the same
+`Graph_ProcessGfxCommands` and must take the same path, or it stops being a valid
+comparison for scrolling textures.
+
+Ordering note: this patch must come AFTER 0056, which edits the tile_w/tile_h
+sites in the same file. 0056's hunks are far from these (line ~580 vs ~4790), but
+the series order is what the context lines were generated against.
+
+--- a/libultraship/include/fast/interpreter.h
++++ b/libultraship/include/fast/interpreter.h
+@@ -565,6 +565,16 @@
+     size_t mShadersIndex;
+     int mInterpolationIndex;
+     int mInterpolationIndexTarget;
++    // Interpolation factor for the current rendered frame within a game tick:
++    // 0 = previous tick, 1 = current tick. Set by the port before each
++    // DrawAndRunGraphicsCommands call, like mInterpolationIndex.
++    float mInterpolationT = 1.0f;
++    // SOH_IOS (overlay 0059): the same factor, one entry per rendered frame of
++    // the current game tick, indexed by mInterpolationIndex. Upstream sets
++    // mInterpolationT inside its own render loop; ours is owned line-for-line by
++    // overlay 0008's perf probe, so the port hands the whole tick's factors over
++    // once instead. Empty => fall back to mInterpolationT.
++    std::vector<float> mInterpolationTs;
+ };
+ 
+ void gfx_set_target_ucode(UcodeHandlers ucode);
+--- a/libultraship/include/fast/lus_gbi.h
++++ b/libultraship/include/fast/lus_gbi.h
+@@ -74,6 +74,7 @@
+ constexpr int8_t RDP_G_LOADBLOCK_WIDE = OPCODE(0x47);
+ constexpr int8_t RDP_G_VTX_WIDE = OPCODE(0x48);
+ constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
++constexpr int8_t RDP_G_SETTILESIZE_LERP = OPCODE(0x4a);
+ 
+ /*
+  * The following commands are the "generated" RDP commands; the user
+--- a/libultraship/include/libultraship/libultra/gbi.h
++++ b/libultraship/include/libultraship/libultra/gbi.h
+@@ -196,6 +196,7 @@
+ #define G_POP_SHADER 0x44
+ #define G_SETTILESIZE_INTERP 0x45
+ #define G_SETTARGETINTERPINDEX 0x46
++#define G_SETTILESIZE_LERP 0x4a
+ 
+ /*
+  * The following commands are the "generated" RDP commands; the user
+@@ -3277,6 +3278,32 @@
+ 
+ #define __gDPSetTileSizeInterp(pkt, t, uls, ult, lrs, lrt) \
+     gDPLoadTileGeneric(pkt, G_SETTILESIZE_INTERP, t, uls, ult, lrs, lrt)
++
++/*
++ * Tile size interpolated at draw time between two endpoints using the
++ * interpreter's mInterpolationT (0 = previous game tick, 1 = current tick).
++ */
++#define __gDPSetTileSizeLerpCoord(g, w, coord) \
++    _DW({                                      \
++        float _f = (coord);                    \
++        (g).words.w = *(uint32_t*)&_f;         \
++    })
++
++#define __gDPSetTileSizeLerp(pkt, t, uls0, ult0, lrs0, lrt0, uls1, ult1, lrs1, lrt1) \
++    _DW({                                                                            \
++        Gfx* _g = (Gfx*)(pkt);                                                       \
++                                                                                     \
++        _g[0].words.w0 = _SHIFTL(G_SETTILESIZE_LERP, 24, 8);                         \
++        _g[0].words.w1 = _SHIFTL(t, 24, 3);                                          \
++        __gDPSetTileSizeLerpCoord(_g[1], w0, uls0);                                  \
++        __gDPSetTileSizeLerpCoord(_g[1], w1, ult0);                                  \
++        __gDPSetTileSizeLerpCoord(_g[2], w0, lrs0);                                  \
++        __gDPSetTileSizeLerpCoord(_g[2], w1, lrt0);                                  \
++        __gDPSetTileSizeLerpCoord(_g[3], w0, uls1);                                  \
++        __gDPSetTileSizeLerpCoord(_g[3], w1, ult1);                                  \
++        __gDPSetTileSizeLerpCoord(_g[4], w0, lrs1);                                  \
++        __gDPSetTileSizeLerpCoord(_g[4], w1, lrt1);                                  \
++    })
+ #define gDPSetTileSize(pkt, t, uls, ult, lrs, lrt) gDPLoadTileGeneric(pkt, G_SETTILESIZE, t, uls, ult, lrs, lrt)
+ #define gsDPSetTileSize(t, uls, ult, lrs, lrt) gsDPLoadTileGeneric(G_SETTILESIZE, t, uls, ult, lrs, lrt)
+ #define gDPLoadTile(pkt, t, uls, ult, lrs, lrt) gDPLoadTileGeneric(pkt, G_LOADTILE, t, uls, ult, lrs, lrt)
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -4787,6 +4787,34 @@
+         ++(*cmd0);
+         ++(*cmd0);
+     }
++
++    return false;
++}
++
++bool gfx_set_tile_size_lerp_handler_rdp(F3DGfx** cmd0) {
++    F3DGfx* cmd = *cmd0;
++    Interpreter* gfx = mInstance.lock().get();
++
++    int tile = C1(24, 3);
++    float coords[8];
++    for (int i = 0; i < 8; i += 2) {
++        ++(*cmd0);
++        memcpy(&coords[i], &(*cmd0)->words.w0, sizeof(float));
++        memcpy(&coords[i + 1], &(*cmd0)->words.w1, sizeof(float));
++    }
++
++    // SOH_IOS (overlay 0059): prefer the per-rendered-frame table the port filled
++    // for this tick; mInterpolationT remains the fallback and the default (1.0f =
++    // current tick), so a draw outside an interpolated tick is unchanged.
++    float t = gfx->mInterpolationIndex >= 0 && (size_t)gfx->mInterpolationIndex < gfx->mInterpolationTs.size()
++                  ? gfx->mInterpolationTs[gfx->mInterpolationIndex]
++                  : gfx->mInterpolationT;
++    gfx->mRdp->texture_tile[tile].uls = coords[0] + t * (coords[4] - coords[0]);
++    gfx->mRdp->texture_tile[tile].ult = coords[1] + t * (coords[5] - coords[1]);
++    gfx->mRdp->texture_tile[tile].lrs = coords[2] + t * (coords[6] - coords[2]);
++    gfx->mRdp->texture_tile[tile].lrt = coords[3] + t * (coords[7] - coords[3]);
++    gfx->mRdp->textures_changed[0] = true;
++    gfx->mRdp->textures_changed[1] = true;
+ 
+     return false;
+ }
+@@ -5108,34 +5136,35 @@
+     { RDP_G_SETTARGETINTERPINDEX,
+       { "G_SETTARGETINTERPINDEX", gfx_set_interpolation_index_target } }, // G_SETTARGETINTERPINDEX
+     { RDP_G_SETTILESIZE_INTERP,
+-      { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },            // G_SETTILESIZE_INTERP
+-    { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },           // G_TEXRECT (-28)
+-    { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },   // G_TEXRECTFLIP (-27)
+-    { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },          // mRdpLOADSYNC (-26)
+-    { RDP_G_RDPPIPESYNC, { "mRdpPIPESYNC", gfx_stubbed_command_handler } },          // mRdpPIPESYNC (-25)
+-    { RDP_G_RDPTILESYNC, { "mRdpTILESYNC", gfx_stubbed_command_handler } },          // mRdpPIPESYNC (-24)
+-    { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },          // mRdpFULLSYNC (-23)
+-    { RDP_G_SETKEYGB, { "G_SETKEYGB", gfx_set_key_gb_handler_rdp } },                // G_SETKEYGB (-22)
+-    { RDP_G_SETKEYR, { "G_SETKEYR", gfx_set_key_r_handler_rdp } },                   // G_SETKEYR (-21)
+-    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_set_convert_handler_rdp } },           // G_SETCONVERT (-20)
+-    { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },            // G_SETSCISSOR (-19)
+-    { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },    // G_SETPRIMDEPTH (-18)
+-    { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },   // mRdpSETOTHERMODE (-17)
+-    { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                 // G_LOADTLUT (-16)
+-    { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },       // G_SETTILESIZE (-14)
+-    { RDP_G_LOADBLOCK, { "G_LOADBLOCK", gfx_load_block_handler_rdp } },              // G_LOADBLOCK (-13)
+-    { RDP_G_LOADTILE, { "G_LOADTILE", gfx_load_tile_handler_rdp } },                 // G_LOADTILE (-12)
+-    { RDP_G_SETTILE, { "G_SETTILE", gfx_set_tile_handler_rdp } },                    // G_SETTILE (-11)
+-    { RDP_G_FILLRECT, { "G_FILLRECT", gfx_fill_rect_handler_rdp } },                 // G_FILLRECT (-10)
+-    { RDP_G_SETFILLCOLOR, { "G_SETFILLCOLOR", gfx_set_fill_color_handler_rdp } },    // G_SETFILLCOLOR (-9)
+-    { RDP_G_SETFOGCOLOR, { "G_SETFOGCOLOR", gfx_set_fog_color_handler_rdp } },       // G_SETFOGCOLOR (-8)
+-    { RDP_G_SETBLENDCOLOR, { "G_SETBLENDCOLOR", gfx_set_blend_color_handler_rdp } }, // G_SETBLENDCOLOR (-7)
+-    { RDP_G_SETPRIMCOLOR, { "G_SETPRIMCOLOR", gfx_set_prim_color_handler_rdp } },    // G_SETPRIMCOLOR (-6)
+-    { RDP_G_SETENVCOLOR, { "G_SETENVCOLOR", gfx_set_env_color_handler_rdp } },       // G_SETENVCOLOR (-5)
+-    { RDP_G_SETCOMBINE, { "G_SETCOMBINE", gfx_set_combine_handler_rdp } },           // G_SETCOMBINE (-4)
+-    { RDP_G_SETTIMG, { "G_SETTIMG", gfx_set_timg_handler_rdp } },                    // G_SETTIMG (-3)
+-    { RDP_G_SETZIMG, { "G_SETZIMG", gfx_set_z_img_handler_rdp } },                   // G_SETZIMG (-2)
+-    { RDP_G_SETCIMG, { "G_SETCIMG", gfx_set_c_img_handler_rdp } },                   // G_SETCIMG (-1)
++      { "G_SETTILESIZE_INTERP", gfx_set_tile_size_interp_handler_rdp } },                     // G_SETTILESIZE_INTERP
++    { RDP_G_SETTILESIZE_LERP, { "G_SETTILESIZE_LERP", gfx_set_tile_size_lerp_handler_rdp } }, // G_SETTILESIZE_LERP
++    { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },                    // G_TEXRECT (-28)
++    { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },            // G_TEXRECTFLIP (-27)
++    { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },                   // mRdpLOADSYNC (-26)
++    { RDP_G_RDPPIPESYNC, { "mRdpPIPESYNC", gfx_stubbed_command_handler } },                   // mRdpPIPESYNC (-25)
++    { RDP_G_RDPTILESYNC, { "mRdpTILESYNC", gfx_stubbed_command_handler } },                   // mRdpPIPESYNC (-24)
++    { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },                   // mRdpFULLSYNC (-23)
++    { RDP_G_SETKEYGB, { "G_SETKEYGB", gfx_set_key_gb_handler_rdp } },                         // G_SETKEYGB (-22)
++    { RDP_G_SETKEYR, { "G_SETKEYR", gfx_set_key_r_handler_rdp } },                            // G_SETKEYR (-21)
++    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_set_convert_handler_rdp } },                    // G_SETCONVERT (-20)
++    { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },                     // G_SETSCISSOR (-19)
++    { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },             // G_SETPRIMDEPTH (-18)
++    { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },            // mRdpSETOTHERMODE (-17)
++    { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                          // G_LOADTLUT (-16)
++    { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },                // G_SETTILESIZE (-14)
++    { RDP_G_LOADBLOCK, { "G_LOADBLOCK", gfx_load_block_handler_rdp } },                       // G_LOADBLOCK (-13)
++    { RDP_G_LOADTILE, { "G_LOADTILE", gfx_load_tile_handler_rdp } },                          // G_LOADTILE (-12)
++    { RDP_G_SETTILE, { "G_SETTILE", gfx_set_tile_handler_rdp } },                             // G_SETTILE (-11)
++    { RDP_G_FILLRECT, { "G_FILLRECT", gfx_fill_rect_handler_rdp } },                          // G_FILLRECT (-10)
++    { RDP_G_SETFILLCOLOR, { "G_SETFILLCOLOR", gfx_set_fill_color_handler_rdp } },             // G_SETFILLCOLOR (-9)
++    { RDP_G_SETFOGCOLOR, { "G_SETFOGCOLOR", gfx_set_fog_color_handler_rdp } },                // G_SETFOGCOLOR (-8)
++    { RDP_G_SETBLENDCOLOR, { "G_SETBLENDCOLOR", gfx_set_blend_color_handler_rdp } },          // G_SETBLENDCOLOR (-7)
++    { RDP_G_SETPRIMCOLOR, { "G_SETPRIMCOLOR", gfx_set_prim_color_handler_rdp } },             // G_SETPRIMCOLOR (-6)
++    { RDP_G_SETENVCOLOR, { "G_SETENVCOLOR", gfx_set_env_color_handler_rdp } },                // G_SETENVCOLOR (-5)
++    { RDP_G_SETCOMBINE, { "G_SETCOMBINE", gfx_set_combine_handler_rdp } },                    // G_SETCOMBINE (-4)
++    { RDP_G_SETTIMG, { "G_SETTIMG", gfx_set_timg_handler_rdp } },                             // G_SETTIMG (-3)
++    { RDP_G_SETZIMG, { "G_SETZIMG", gfx_set_z_img_handler_rdp } },                            // G_SETZIMG (-2)
++    { RDP_G_SETCIMG, { "G_SETCIMG", gfx_set_c_img_handler_rdp } },                            // G_SETCIMG (-1)
+ };
+ 
+ static constexpr UcodeHandler otrHandlers = {
+--- a/libultraship/src/libultraship/window/gui/GfxDebuggerWindow.cpp
++++ b/libultraship/src/libultraship/window/gui/GfxDebuggerWindow.cpp
+@@ -194,11 +194,25 @@
+             // Increment 3 times because texture rectangle uses RDPHALF
+             case RDP_G_TEXRECTFLIP:
+             case RDP_G_TEXRECT: {
++                simpleNode(cmd, opcode);
++                cmd += 3;
++                break;
++            }
++
++            // Header word plus 2 float tile coordinates
++            case RDP_G_SETTILESIZE_INTERP: {
+                 simpleNode(cmd, opcode);
+                 cmd += 3;
+                 break;
+             }
+ 
++            // Header word plus 4 float tile coordinate endpoints
++            case RDP_G_SETTILESIZE_LERP: {
++                simpleNode(cmd, opcode);
++                cmd += 5;
++                break;
++            }
++
+             case OTR_G_MARKER: {
+                 cmd++;
+                 uint64_t hash = ((uint64_t)cmd->words.w0 << 32) + cmd->words.w1;

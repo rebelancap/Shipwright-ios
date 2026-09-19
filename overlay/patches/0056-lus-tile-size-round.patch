@@ -1,0 +1,143 @@
+Overlay patch 0056: ROUND THE TILE SIZE, DON'T TRUNCATE IT.
+`vendor/Shipwright/libultraship/src/fast/interpreter.cpp`, LUS at our own pin.
+
+THE SYMPTOM (external report, iPhone 15, 60 Hz, `OoT_Reloaded` HD pack). The
+Death Mountain Crater lava and the Water Temple water "jiggle violently" —
+the whole texture plane snaps to a slightly larger scale and back, many times
+a second. Non-HD (vanilla) textures on the same surfaces are steady.
+
+THE MECHANISM. SoH's frame interpolation emits fractional tile coordinates for
+scrolling textures on every RENDERED frame: `Gfx_TwoTexScrollEx` /
+`Gfx_TwoTexScrollEnvColorEx` in `soh/src/code/z_rcp.c` bake one
+`gDPSetTileSizeInterp` per interpolated frame, and the interpreter stores those
+endpoints into `mRdp->texture_tile[].uls/ult/lrs/lrt`, which are FLOATS (see
+the `G_SETTILESIZE_INTERP` handler, which memcpy's float words straight into
+them). Every place that needs the tile's pixel dimensions then does
+
+    uint32_t tile_w = (uint32_t)((lrs - uls + 4) / 4);
+
+— a C cast, i.e. TRUNCATION. At 60 Hz the port runs 3 interpolated frames per
+game frame, so the step is 1/3 of a texel and the float arithmetic lands on
+values like 127.9999 / 4 → 31.9999. Truncated that is 31, not 32, on roughly
+12% of frames.
+
+WHY ONLY HD PACKS JIGGLE. Upstream LUS `ec194d6b` (#1118, inside our pin) made
+HD replacement textures normalize their texcoords against that computed tile
+width/height — the `isHd ||` term in the clamp conditions. Vanilla textures
+skip the clamp entirely and never see the number. So on the ~12% of frames
+where the tile reads 31 instead of 32, an HD texture is scaled by 32/31 in both
+axes, and that error is MULTIPLIED by the repeat count across a big lava or
+water plane. Hence "violent" on exactly the large scrolling surfaces, and
+invisible on small ones.
+
+Upstream tracks this as https://github.com/Kenix3/libultraship/issues/1119 and
+the proposed fix there is the same one: round instead of truncate.
+
+THE FIX. `lroundf` of the same float expression at every site that derives tile
+dimensions from the float tile fields — five places, found by grepping
+`lrs - mRdp->texture_tile[tile].uls + 4`:
+
+  * `ImportTextureRgba16`, `ImportTextureRgba32`, `ImportTextureCI4`,
+    `ImportTextureCI8` — the `tile_w`/`tile_h` pyramid/HD clamp gate.
+  * the tri/vertex path's `tex_width2[i]` / `tex_height2[i]`, which is what
+    actually feeds the HD texcoord normalization per draw.
+
+(The other `lrs`/`lrt` readers — `GfxDpLoadBlock`, `GfxDpLoadTile`, the texrect
+and background paths — take integer arguments straight off the display list and
+never see a fractional value, so they are untouched.)
+
+Everything is `#ifdef __IOS__` with upstream's exact line kept in the `#else`,
+so the macOS build (`scripts/build-oracle.sh`) keeps upstream behaviour byte
+for byte and stays a valid comparison point. `math.h` is already included at the
+top of the file; no new include is needed.
+
+Patch 0057/0058 fold in upstream's structural fix (`G_SETTILESIZE_LERP`), which
+removes most of the fractional traffic at the source. This patch stays anyway:
+it is cheap, it is correct on its own, and any other producer of fractional tile
+sizes (mods, future interp paths) gets the same protection.
+
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -579,8 +579,16 @@
+     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
+     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
+     // skip both. CLAMP wrap mode always opts in.
++#ifdef __IOS__
++    // SOH_IOS (overlay 0056): round to nearest instead of truncating. The tile fields are
++    // floats and frame interpolation feeds them fractional steps, so 31.999 truncated to 31
++    // rescales HD replacement textures by 32/31 on ~12% of frames (LUS issue #1119).
++    uint32_t tile_w = (uint32_t)lroundf((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
++    uint32_t tile_h = (uint32_t)lroundf((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#else
+     uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+     uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#endif
+     uint32_t loadedPixels = width * height;
+     uint32_t renderedPixels = tile_w * tile_h;
+     bool pyramidLike =
+@@ -649,8 +657,16 @@
+     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
+     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
+     // skip both. CLAMP wrap mode always opts in.
++#ifdef __IOS__
++    // SOH_IOS (overlay 0056): round to nearest instead of truncating. The tile fields are
++    // floats and frame interpolation feeds them fractional steps, so 31.999 truncated to 31
++    // rescales HD replacement textures by 32/31 on ~12% of frames (LUS issue #1119).
++    uint32_t tile_w = (uint32_t)lroundf((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
++    uint32_t tile_h = (uint32_t)lroundf((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#else
+     uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+     uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#endif
+     uint32_t loadedPixels = width * height;
+     uint32_t renderedPixels = tile_w * tile_h;
+     bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+@@ -955,8 +971,16 @@
+     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
+     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
+     // skip both. CLAMP wrap mode always opts in.
++#ifdef __IOS__
++    // SOH_IOS (overlay 0056): round to nearest instead of truncating. The tile fields are
++    // floats and frame interpolation feeds them fractional steps, so 31.999 truncated to 31
++    // rescales HD replacement textures by 32/31 on ~12% of frames (LUS issue #1119).
++    uint32_t tile_w = (uint32_t)lroundf((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
++    uint32_t tile_h = (uint32_t)lroundf((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#else
+     uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+     uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#endif
+     uint32_t loadedPixels = width * height;
+     uint32_t renderedPixels = tile_w * tile_h;
+     bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+@@ -1049,8 +1073,16 @@
+     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
+     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
+     // skip both. CLAMP wrap mode always opts in.
++#ifdef __IOS__
++    // SOH_IOS (overlay 0056): round to nearest instead of truncating. The tile fields are
++    // floats and frame interpolation feeds them fractional steps, so 31.999 truncated to 31
++    // rescales HD replacement textures by 32/31 on ~12% of frames (LUS issue #1119).
++    uint32_t tile_w = (uint32_t)lroundf((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
++    uint32_t tile_h = (uint32_t)lroundf((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#else
+     uint32_t tile_w = (uint32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+     uint32_t tile_h = (uint32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#endif
+     uint32_t loadedPixels = width * height;
+     uint32_t renderedPixels = tile_w * tile_h;
+     bool pyramidLike = renderedPixels > 0 && loadedPixels > renderedPixels && loadedPixels * 8 < renderedPixels * 13;
+@@ -2457,8 +2489,14 @@
+             }
+             tex_width[i] = line_size;
+ 
++#ifdef __IOS__
++            // SOH_IOS (overlay 0056): round to nearest — see the tile_w/tile_h note above.
++            tex_width2[i] = (uint32_t)lroundf((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
++            tex_height2[i] = (uint32_t)lroundf((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#else
+             tex_width2[i] = (uint32_t)(int32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+             tex_height2[i] = (uint32_t)(int32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
++#endif
+ 
+             // Same pyramid-like ratio gate as ImportTexture: only clamp when loaded pixels
+             // are close to rendered pixels (mipmap), not when much bigger (window scroll).
