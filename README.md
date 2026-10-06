@@ -20,7 +20,7 @@ Tap **3D** or **VR** to enter, **Exit** to come back to the window; the game kee
 running across the switch. The gear button beside them opens the live settings for
 whichever mode you are in.
 
-Built on [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) (Harbour
+Built on [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) **9.3.0** (Harbour
 Masters' native Ocarina of Time port) and
 [libultraship](https://github.com/HarbourMasters/libultraship), rendering natively on
 **Metal** — no translation layer. 100% vibe coded with lots of passion and attention
@@ -95,6 +95,10 @@ vanilla textures, that's the switch. Turn it off to compare against vanilla.
 - The **Ship of Harkinian enhancements menu** — the reason these ports exist: higher
   frame rates, widescreen, and the whole quality-of-life catalogue
 - **In-app ROM extraction** — no PC tools, no companion app
+- Everything new in Ship of Harkinian 9.3.0: **speedrun mode** (Speedrun and Speedrun MQ
+  presets, with a quest select screen when you start a file), **new randomizer shuffles**
+  (signs, butterflies, rocks, silver rupees, masks and more) and redesigned win conditions,
+  **boss death skips** for every boss, expanded cutscene skips, and **instant text**
 - **Game controllers** (Backbone, DualSense, Xbox…) with menu-aware navigation
 - **Touch controls** built for the game: floating analog stick, N64 button cluster with
   C-buttons, Z as momentary-or-double-tap-lock, and a **layout customizer** — drag any
@@ -204,14 +208,13 @@ a reviewable patch in `overlay/patches/`, applied by `scripts/apply-overlay.sh` 
 
 - [Ship of Harkinian / Shipwright](https://github.com/HarbourMasters/Shipwright) by
   **Harbour Masters** and contributors — the port this is built on
-- [libultraship](https://github.com/HarbourMasters/libultraship) (MIT),
-  [ZAPDTR](https://github.com/HarbourMasters/ZAPDTR) (MIT), and OTRExporter
-  (© 2022 Harbour Masters) — the platform layer and asset pipeline
+- [libultraship](https://github.com/HarbourMasters/libultraship) (MIT) and
+  [Torch](https://github.com/HarbourMasters/Torch) — the platform layer and the
+  asset pipeline that extracts your ROM
 - [OoT Reloaded](https://github.com/GhostlyDark/OoT-Reloaded-SoH) texture pack by
   **GhostlyDark**
 - THE LEGEND OF ZELDA: OCARINA OF TIME © **Nintendo**. This project is not affiliated
   with or endorsed by Nintendo, and ships no Nintendo content.
 
 <!-- TODO: pick a license for this repo's own code (the app shell + overlay patches).
-     Upstream Shipwright has no root LICENSE file; its components are MIT (libultraship,
-     ZAPDTR) and a Harbour Masters copyright (OTRExporter). -->
+     Upstream Shipwright has no root LICENSE file; libultraship is MIT. -->

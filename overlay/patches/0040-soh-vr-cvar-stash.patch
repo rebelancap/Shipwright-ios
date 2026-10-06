@@ -46,7 +46,7 @@ of 0015's hunks. __IOS__-only.
 
 --- a/soh/soh/OTRGlobals.cpp
 +++ b/soh/soh/OTRGlobals.cpp
-@@ -995,7 +995,135 @@
+@@ -1032,7 +1032,135 @@
  bool OTRGlobals::HasMasterQuest() {
      return hasMasterQuest;
  }
@@ -182,10 +182,10 @@ of 0015's hunks. __IOS__-only.
  bool OTRGlobals::HasOriginal() {
      return hasOriginal;
  }
-@@ -1590,6 +1718,11 @@
-     if (CVarGetInteger(CVAR_REMOTE_ANCHOR("Enabled"), 0)) {
-         Anchor::Instance->Enable();
+@@ -1639,6 +1767,11 @@
      }
+     // Restores settings left over from a run that never exited cleanly, so it must come after other setup.
+     Speedrun_Register();
 +#ifdef __IOS__
 +    // SOH_IOS (overlay 0040): put back anything a VR session that was
 +    // SIGKILLed left overridden, BEFORE the enhancements register.

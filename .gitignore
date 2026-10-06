@@ -40,3 +40,7 @@ xcuserdata/
 
 # Release build output (IPAs, export plists) — staged via OTA tooling, never committed
 /release/
+
+# Oracle runtime outputs (run-oracle.sh log; 9.3.0 time-split tracker)
+/oracle/shiphome/soh-run.log
+/oracle/shiphome/SoHTimeSplitData.json

@@ -4,34 +4,29 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROM="${1:-$ROOT/work/gamedata/oot-usa.z64}"
 OUTDIR="${2:-$ROOT/oracle/shiphome}"
-ZAPD="$ROOT/oracle/build-cmake/ZAPD/ZAPD.out"
+TORCH="$ROOT/oracle/build-cmake/soh-torch"
 ASSETS="$ROOT/oracle/build-cmake/soh/assets"
-VERSION="GC_NMQ_D"
-PORTVER="9.2.3"
+PORTVER="$(sed -n 's/^project(Ship VERSION \([0-9.]*\) .*/\1/p' "$ROOT/vendor/Shipwright/CMakeLists.txt")"
 
-[[ -x "$ZAPD" ]] || { echo "FATAL: ZAPD not built at $ZAPD" >&2; exit 1; }
+[[ -x "$TORCH" ]] || { echo "FATAL: soh-torch not built at $TORCH (scripts/build-oracle.sh builds it)" >&2; exit 1; }
 [[ -f "$ROM" ]] || { echo "FATAL: ROM not found at $ROM" >&2; exit 1; }
-[[ -d "$ASSETS/xml/$VERSION" && -f "$ASSETS/Config_$VERSION.xml" ]] || { echo "FATAL: extractor assets missing $ASSETS/xml/$VERSION" >&2; exit 1; }
+[[ -f "$ASSETS/config.yml" && -d "$ASSETS/pal_gc_dbg" ]] || { echo "FATAL: extractor yml tree missing at $ASSETS" >&2; exit 1; }
+[[ -n "$PORTVER" ]] || { echo "FATAL: could not read the port version from the root CMakeLists.txt" >&2; exit 1; }
 
-ROM="$(cd "$(dirname "$ROM")" && pwd)/$(basename "$ROM")"
 mkdir -p "$OUTDIR"
-
 TMP="$(mktemp -d /tmp/soh-extract.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
-ln -s "$ASSETS" "$TMP/assets"
 
-(cd "$TMP" && "$ZAPD" ed \
-    -i "assets/xml/$VERSION" \
-    -b "$ROM" \
-    -fl assets/filelists \
-    -gsf 0 \
-    -rconf "assets/Config_$VERSION.xml" \
-    -se OTR \
-    --otrfile oot.o2r \
-    --portVer "$PORTVER" \
-    -o placeholder -osf placeholder)
+T0=$(date +%s)
+if ! /usr/bin/time -l "$TORCH" --src "$ASSETS" --dest "$TMP" --version "$PORTVER" "$ROM" 2> "$TMP/time.txt"; then
+    cat "$TMP/time.txt" >&2
+    echo "FATAL: soh-torch failed" >&2
+    exit 1
+fi
+T1=$(date +%s)
+grep -E "maximum resident set size| real " "$TMP/time.txt" || echo "(no /usr/bin/time stats)"
 
-[[ -s "$TMP/oot.o2r" ]] || { echo "FATAL: extraction produced no oot.o2r" >&2; exit 1; }
+[[ -s "$TMP/oot.o2r" ]] || { echo "FATAL: extraction produced no oot.o2r" >&2; ls -la "$TMP" >&2; exit 1; }
 cp "$TMP/oot.o2r" "$OUTDIR/oot.o2r"
 ls -la "$OUTDIR/oot.o2r"
-echo "extracted OK: $OUTDIR/oot.o2r"
+echo "extracted OK in $((T1 - T0)) s (port version $PORTVER): $OUTDIR/oot.o2r"

@@ -16,7 +16,7 @@ loop and joined there.
 
 --- a/soh/soh/OTRGlobals.cpp
 +++ b/soh/soh/OTRGlobals.cpp
-@@ -1792,6 +1792,117 @@
+@@ -1761,6 +1761,117 @@
  #endif
  }
  
@@ -131,17 +131,17 @@ loop and joined there.
 +}
 +#endif
 +
- void RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
+ // Interpolated frames of a tick are evenly spaced numerators time+step, time+2*step, ... over denom.
+ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
      auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(OTRGlobals::Instance->context->GetWindow());
- 
-@@ -1809,7 +1920,14 @@
-         static_cast<UIWidgets::Colors>(CVarGetInteger(CVAR_SETTING("Menu.Theme"), UIWidgets::Colors::LightBlue));
-     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, UIWidgets::ColorValues.at(themeColor));
-     for (const auto& m : mtx_replacements) {
+@@ -1783,7 +1894,14 @@
+         std::unordered_map<Mtx*, MtxF> mtx_replacements =
+             (time == denom) ? std::unordered_map<Mtx*, MtxF>() : FrameInterpolation_Interpolate((float)time / denom);
+         intp->mInterpolationT = (float)time / denom;
 +#ifdef __IOS__
 +        auto sohIosEngT0 = std::chrono::steady_clock::now();
 +#endif
-         wnd->DrawAndRunGraphicsCommands(Commands, m);
+         wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements);
 +#ifdef __IOS__
 +        SohIosPerf::gPerfProbe.OnFrame(
 +            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sohIosEngT0).count());
@@ -149,10 +149,10 @@ loop and joined there.
          intp->mInterpolationIndex++;
      }
      ImGui::PopStyleColor();
-@@ -1865,6 +1983,9 @@
+@@ -1838,6 +1956,9 @@
      }
  
-     RunCommands(commands, mtx_replacements);
+     RunCommands(commands, start_time, step, next_original_frame, count);
 +#ifdef __IOS__
 +    SohIosPerf::gPerfProbe.OnTick();
 +#endif

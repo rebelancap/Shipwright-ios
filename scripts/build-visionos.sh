@@ -39,13 +39,12 @@ cmake --no-warn-unused-cli -S "$ROOT/vendor/Shipwright" -B "$BUILD" -GXcode \
     "-DSOH_O2R_PATH=$SOH_O2R" \
     "-DSOH_IOS_SHELL_DIR=$ROOT/app/ios" \
     -DSOH_IOS_BUNDLE_IDENTIFIER=com.rebelancap.soh \
-    "-DSOH_IOS_DEVELOPMENT_TEAM=$TEAM" \
-    "-DPNG_LIBRARY=$PREFIX/lib/libpng16.a" \
-    "-DPNG_PNG_INCLUDE_DIR=$PREFIX/include"
+    "-DSOH_IOS_DEVELOPMENT_TEAM=$TEAM"
 
 cmake --build "$BUILD" --config Release --target soh --parallel 12 -- -allowProvisioningUpdates
 
 APP="$BUILD/soh/Release-xros/soh.app"
 [[ -d "$APP" ]] || { echo "FATAL: expected app at $APP" >&2; exit 1; }
 codesign -dv "$APP" 2>&1 | sed -n '1,3p'
+"$ROOT/scripts/assert-app-assets.sh" "$APP"
 echo "built (visionOS device): $APP"

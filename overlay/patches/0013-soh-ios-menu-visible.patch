@@ -7,10 +7,10 @@ menubar. Appended at EOF of OTRGlobals.cpp so it shares no hunks with
 
 --- a/soh/soh/OTRGlobals.cpp
 +++ b/soh/soh/OTRGlobals.cpp
-@@ -2594,4 +2594,74 @@
- // Number of interpolated frames
- extern "C" uint32_t Ship_GetInterpolationFrameCount() {
-     return static_cast<uint32_t>(ceil((float)OTRGlobals::Instance->GetInterpolationFPS() / 20.0f));
+@@ -2657,4 +2657,74 @@
+         return false;
+     }
+     return false;
 +}
 +
 +#ifdef __IOS__

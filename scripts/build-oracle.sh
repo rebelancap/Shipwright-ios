@@ -12,6 +12,7 @@ cmake -S "$VENDOR" -B "$BUILD" -GNinja -DCMAKE_BUILD_TYPE:STRING=Release \
       -DCMAKE_IGNORE_PREFIX_PATH="${SOH_IGNORE_PREFIX_PATH:-$HOME/Miniforge3}"
 cmake --build "$BUILD" --target GenerateSohOtr
 cmake --build "$BUILD"
+cmake --build "$BUILD" --target soh-torch
 
 BIN="$BUILD/soh/soh-macos"
 [[ -x "$BIN" ]] || { echo "FATAL: expected oracle binary at $BIN" >&2; exit 1; }

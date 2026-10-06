@@ -31,13 +31,12 @@ cmake --no-warn-unused-cli -S "$ROOT/vendor/Shipwright" -B "$BUILD" -GXcode \
     -DSDL_OPENGLES=OFF -DSDL_OPENGL=OFF \
     "-DSOH_IOS_DEPS_PREFIX=$PREFIX" \
     "-DSOH_O2R_PATH=$SOH_O2R" \
-    "-DSOH_IOS_SHELL_DIR=$ROOT/app/ios" \
-    "-DPNG_LIBRARY=$PREFIX/lib/libpng16.a" \
-    "-DPNG_PNG_INCLUDE_DIR=$PREFIX/include"
+    "-DSOH_IOS_SHELL_DIR=$ROOT/app/ios"
 
 cmake --build "$BUILD" --config Release --target soh --parallel 12
 
 APP="$BUILD/soh/Release-xrsimulator/soh.app"
 [[ -d "$APP" ]] || { echo "FATAL: expected app at $APP" >&2; exit 1; }
 lipo -info "$APP/soh"
+"$ROOT/scripts/assert-app-assets.sh" "$APP"
 echo "built (visionOS simulator): $APP"

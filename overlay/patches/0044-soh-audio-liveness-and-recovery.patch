@@ -118,6 +118,19 @@ rule (which reads it as proof the audio thread is alive) see every one of them -
 only the log line is thinned, and it is thinned on the counter rather than on a
 clock so the thinning is deterministic and testable on the host.
 
+--- rev4 (9.3.0 fold-in, D-079): LOCK-STEP AGAIN ----------------------------
+
+Upstream 9.3.0 reverted the self-pumping audio thread (#7284): OTRAudio_Thread
+wakes once per game tick and the game thread waits for it; the producer guard
+is gone. The OTRGlobals half of this patch is rewritten for that shape: the
+stall window is wall time (1 s) instead of 200 x 5 ms ticks, the stall test is
+"more than one full HIGH update above desired" (a healthy lock-step queue rides
+around desired, so the old test would fire constantly), gSohAudioSkipped is no
+longer incremented (there is no skip path), and the try/catch closes before the
+processing/notify handshake. NOTE for the shell's launch watchdog: beats are now
+game ticks, so "no beats for two windows" also means "the game thread did not
+tick for 6 s".
+
 --- a/libultraship/src/ship/audio/SDLAudioPlayer.cpp
 +++ b/libultraship/src/ship/audio/SDLAudioPlayer.cpp
 @@ -1,6 +1,37 @@
@@ -278,10 +291,11 @@ clock so the thinning is deterministic and testable on the host.
      /**
 --- a/soh/soh/OTRGlobals.cpp
 +++ b/soh/soh/OTRGlobals.cpp
-@@ -1018,6 +1018,25 @@
+@@ -1212,6 +1212,25 @@
+ int AudioPlayer_Buffered(void);
  extern "C" int AudioPlayer_GetDesiredBuffered(void);
  std::unordered_map<std::string, ExtensionEntry> ExtensionCache;
- 
++
 +#ifdef __IOS__
 +// SOH_IOS (overlay 0044, VR R3): the audio-liveness counters `vr audio`
 +// reads, and the stall watchdog. See the patch header.
@@ -300,84 +314,67 @@ clock so the thinning is deterministic and testable on the host.
 +void SohIos_AudioNote(const char* what);
 +}
 +#endif
-+
+ 
  void OTRAudio_Thread() {
- #define SAMPLES_HIGH 560
- #define SAMPLES_LOW 528
-@@ -1079,6 +1098,38 @@
-             std::unique_lock<std::mutex> Lock(audio.mutex);
-             int samples_left = AudioPlayer_Buffered();
-             u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+     while (audio.running) {
+@@ -1237,9 +1256,51 @@
+ 
+         int samples_left = AudioPlayer_Buffered();
+         u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
 +#ifdef __IOS__
-+            /* SOH_IOS (overlay 0044): liveness + the stall watchdog. The
-+             * guard below is correct, but it is also the exact shape of a
-+             * PERMANENT silence: if the backend stops DRAINING, buffered
-+             * never falls, the guard skips forever, and nothing anywhere
-+             * says so. With a healthy device at 32 kHz the queue cannot
-+             * stay at capacity for a whole second, so that is the test. */
-+            gSohAudioBeats = gSohAudioBeats + 1ull;
-+            gSohAudioBuffered = samples_left;
-+            gSohAudioDesired = AudioPlayer_GetDesiredBuffered();
-+            /* rev2 (VR R14): the launch watchdog asks; THIS thread does
-+             * it. Closing the device underneath a live SDL_QueueAudio is
-+             * a race, and this loop is the only writer. */
-+            if (gSohAudioReopenReq != 0) {
-+                gSohAudioReopenReq = 0;
-+                SohIos_AudioReopenDevice();
-+            }
-+            {
-+                static int sSohStallTicks = 0;
-+                if (samples_left + (int)(SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE) >
-+                    AudioPlayer_GetDesiredBuffered()) {
-+                    sSohStallTicks++;
-+                    /* the loop self-pumps every 5 ms; 200 ticks is ~1 s */
-+                    if (sSohStallTicks >= 200) {
-+                        sSohStallTicks = 0;
-+                        SohIos_AudioRecoverDevice();
-+                    }
-+                } else {
-+                    sSohStallTicks = 0;
++        /* SOH_IOS (overlay 0044 rev4): liveness + the stall watchdog. If the
++         * backend stops DRAINING, the queue climbs to SDLAudioPlayer's cap
++         * and stays there, and nothing anywhere says so. In lock-step a
++         * healthy device keeps buffered within one update of desired, so a
++         * full second more than a HIGH update above it is the test. */
++        gSohAudioBeats = gSohAudioBeats + 1ull;
++        gSohAudioBuffered = samples_left;
++        gSohAudioDesired = AudioPlayer_GetDesiredBuffered();
++        /* rev2 (VR R14): the launch watchdog asks; THIS thread does
++         * it. Closing the device underneath a live SDL_QueueAudio is
++         * a race, and this loop is the only writer. */
++        if (gSohAudioReopenReq != 0) {
++            gSohAudioReopenReq = 0;
++            SohIos_AudioReopenDevice();
++        }
++        {
++            static bool sSohStalled = false;
++            static std::chrono::steady_clock::time_point sSohStallSince;
++            if (samples_left > AudioPlayer_GetDesiredBuffered() + (int)(SAMPLES_HIGH * AUDIO_FRAMES_PER_UPDATE)) {
++                auto sohNow = std::chrono::steady_clock::now();
++                if (!sSohStalled) {
++                    sSohStalled = true;
++                    sSohStallSince = sohNow;
++                } else if (sohNow - sSohStallSince >= std::chrono::seconds(1)) {
++                    sSohStalled = false;
++                    SohIos_AudioRecoverDevice();
 +                }
++            } else {
++                sSohStalled = false;
 +            }
++        }
 +#endif
  
-             // Producer guard (banteg/Shipwright#6594): skip advancing the audio
-             // engine if the backend ring cannot accept the smallest next burst.
-@@ -1086,9 +1137,15 @@
-             // audible as a click. The pre-buffer loop below will catch up once
-             // the backend drains enough.
-             if (AudioPlayer_Buffered() + SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE > AudioPlayer_GetDesiredBuffered()) {
-+#ifdef __IOS__
-+                gSohAudioSkipped = gSohAudioSkipped + 1ull;
-+#endif
-                 audio.processing = false;
-             } else {
-                 produce_and_play(num_audio_samples);
-+#ifdef __IOS__
-+                gSohAudioProduced = gSohAudioProduced + 1ull;
-+#endif
-                 audio.processing = false;
-             }
-         }
-@@ -1098,6 +1155,13 @@
-         // Safe for BGM — the N64 sequencer advances independently of gameplay.
-         // The producer guard (same as above) prevents advancing the audio engine
-         // when the backend ring is already at capacity.
+         // 3 is the maximum authentic frame divisor.
+         s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS * 3];
 +#ifdef __IOS__
 +        /* rev2 (VR R14): an uncaught throw anywhere under this loop
 +         * reaches std::terminate and aborts the PROCESS -- the
 +         * `OTRAudio_Thread` cxx-terminate this project has carried as an
-+         * open item since R10. Counted and survived instead. */
++         * open item since R10. Counted and survived instead. rev4: the
++         * handshake below stays OUTSIDE the try, or the waiting game
++         * thread would hang on a caught fault. */
 +        try {
 +#endif
-         while (audio.running && AudioPlayer_Buffered() < AudioPlayer_GetDesiredBuffered()) {
-             if (AudioPlayer_Buffered() + SAMPLES_LOW * AUDIO_FRAMES_PER_UPDATE > AudioPlayer_GetDesiredBuffered()) {
-                 break;
-@@ -1106,6 +1170,16 @@
-             u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
-             produce_and_play(num_audio_samples);
-         }
+         for (int i = 0; i < AUDIO_FRAMES_PER_UPDATE; i++) {
+             AudioMgr_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * NUM_AUDIO_CHANNELS),
+                                            num_audio_samples);
+@@ -1247,6 +1308,17 @@
+ 
+         AudioPlayer_Play((u8*)audio_buffer,
+                          num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS * AUDIO_FRAMES_PER_UPDATE));
 +#ifdef __IOS__
++        gSohAudioProduced = gSohAudioProduced + 1ull;
 +        } catch (const std::exception& sohEx) {
 +            gSohAudioThreadFaults = gSohAudioThreadFaults + 1ull;
 +            SohIos_AudioNote("audio thread caught an exception -- kept running");
@@ -387,9 +384,9 @@ clock so the thinning is deterministic and testable on the host.
 +            SohIos_AudioNote("audio thread caught an unknown exception -- kept running");
 +        }
 +#endif
-     }
- }
  
+         audio.processing = false;
+         audio.cv_from_thread.notify_one();
 --- a/libultraship/src/ship/audio/Audio.cpp
 +++ b/libultraship/src/ship/audio/Audio.cpp
 @@ -8,6 +8,12 @@

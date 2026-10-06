@@ -22,7 +22,7 @@ C driver flags.
 @@ -7,6 +7,17 @@
  set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum OS X deployment version")
  
- project(Ship VERSION 9.2.3 LANGUAGES C CXX)
+ project(Ship VERSION 9.3.0 LANGUAGES C CXX)
 +
 +# SOH_IOS (overlay 0022): visionOS builds (PLATFORM=SIMULATOR_VISIONOS /
 +# VISIONOS) dispatch as iOS throughout the tree. Compilers and SDK are
@@ -37,7 +37,7 @@ C driver flags.
  include(CMake/soh-cvars.cmake)
  include(CMake/lus-cvars.cmake)
  set(SPDLOG_LEVEL_TRACE 0)
-@@ -140,8 +151,11 @@
+@@ -142,8 +153,11 @@
  # Enforce strict, deterministic IEEE-754 floating-point to match N64 (MIPS) semantics.
  # Never enable fast-math, and disable FMA contraction: the R4300 CPU and RSP have no
  # fused multiply-add, so contracting mul+add into an FMA produces extra precision.

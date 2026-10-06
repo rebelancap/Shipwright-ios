@@ -33,7 +33,7 @@ never leaves 0 there, and the macOS build compiles none of it.
  s32 sShrinkWindowVal = 0;
  s32 sShrinkWindowCurrentVal = 0;
  
- void ShrinkWindow_SetVal(s32 value) {
+ void Letterbox_SetSizeTarget(s32 value) {
 +#ifdef __IOS__
 +    if (SohIos_LetterboxVrSuppressed()) {
 +        sShrinkWindowVal = 0;

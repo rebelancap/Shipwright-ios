@@ -11,7 +11,7 @@ finish method closes the ImGui frame.
 
 --- a/libultraship/include/ship/window/gui/Gui.h
 +++ b/libultraship/include/ship/window/gui/Gui.h
-@@ -137,6 +137,12 @@
+@@ -138,6 +138,12 @@
       * @brief Returns true if the menu bar or the full-screen menu window is currently visible.
       */
      bool GetMenuOrMenubarVisible();
@@ -26,9 +26,9 @@ finish method closes the ImGui frame.
      bool IsMouseOverAnyGuiItem();
 --- a/libultraship/src/ship/window/gui/Gui.cpp
 +++ b/libultraship/src/ship/window/gui/Gui.cpp
-@@ -160,6 +160,18 @@
- 
- void Gui::ImGuiWMNewFrame() {
+@@ -183,6 +183,18 @@
+         mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+     }
  }
 +
 +// SOH_IOS (overlay 0034): 3D mode flag (shell) — gates the Main Game
@@ -44,8 +44,8 @@ finish method closes the ImGui frame.
 +#endif
  
  void Gui::DrawMenu() {
-     const std::shared_ptr<Window> wnd = Context::GetRawInstance()->GetWindow();
-@@ -199,6 +211,17 @@
+     // Per frame: popups (boot prompts, the file browser) have no open/close event to hook.
+@@ -225,6 +237,17 @@
      }
  
      ImGui::DockSpace(dockId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None | ImGuiDockNodeFlags_NoDockingInCentralNode);
@@ -63,7 +63,7 @@ finish method closes the ImGui frame.
  
      if (ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
          (ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false) &&
-@@ -258,6 +281,82 @@
+@@ -284,6 +307,82 @@
      }
  }
  

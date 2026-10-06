@@ -1,0 +1,69 @@
+Overlay patch 0061: soh-torch CLI builds again (host tool only, NOT __IOS__).
+Upstream 9.3.0 broke its own build-time extractor: #7301 ("Extractor: pass
+Torch ROMs as big endian") changed SohTorch::Extract to take the ROM BYTES
+(std::vector<uint8_t>, already big-endian) instead of a path, but
+soh/assets/tools/torch-cli/main.cpp still passes the path string. soh-torch is
+EXCLUDE_FROM_ALL, so upstream's default build never notices; ExtractAssets and
+our scripts/extract-oot-o2r.sh both need it. Fix: read the file and normalize
+.v64 (16-bit swapped) / .n64 (32-bit little-endian) dumps to .z64 order by the
+first word, exactly what the game's Extractor does with
+BitConverter::RomToBigEndian before calling Extract. The game itself does not
+compile this file; the oracle and the iOS app are unaffected. Upstreamable as-is.
+(D-079)
+
+--- a/soh/assets/tools/torch-cli/main.cpp
++++ b/soh/assets/tools/torch-cli/main.cpp
+@@ -8,6 +8,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <filesystem>
++#include <fstream>
++#include <iterator>
+ #include <string>
+ #include <vector>
+ 
+@@ -52,6 +54,30 @@
+     return roms;
+ }
+ 
++// SohTorch::Extract takes the ROM bytes in big-endian (.z64) order (#7301); the
++// game normalizes with BitConverter::RomToBigEndian, this tool by the first word.
++static bool ReadRomBigEndian(const std::string& path, std::vector<uint8_t>& out) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        return false;
++    }
++    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++    if (out.size() < 4 || (out.size() % 4) != 0) {
++        return false;
++    }
++    if (out[0] == 0x37 && out[1] == 0x80) { // .v64: 16-bit byteswapped
++        for (size_t i = 0; i < out.size(); i += 2) {
++            std::swap(out[i], out[i + 1]);
++        }
++    } else if (out[0] == 0x40 && out[1] == 0x12) { // .n64: 32-bit little-endian
++        for (size_t i = 0; i < out.size(); i += 4) {
++            std::swap(out[i], out[i + 3]);
++            std::swap(out[i + 1], out[i + 2]);
++        }
++    }
++    return out[0] == 0x80 && out[1] == 0x37;
++}
++
+ int main(int argc, char** argv) {
+     std::string src, dest, version;
+     std::vector<std::string> romArgs;
+@@ -98,7 +124,12 @@
+ 
+     for (const auto& rom : roms) {
+         // A fresh extraction per ROM; torch names the archive from config.yml.
+-        const std::string archive = SohTorch::Extract(rom, src, dest, version, nullptr);
++        std::vector<uint8_t> romData;
++        if (!ReadRomBigEndian(rom, romData)) {
++            fprintf(stderr, "not a readable N64 rom: %s\n", rom.c_str());
++            return 1;
++        }
++        const std::string archive = SohTorch::Extract(std::move(romData), src, dest, version, nullptr);
+         if (archive.empty()) {
+             fprintf(stderr, "failed to extract %s\n", rom.c_str());
+             return 1;

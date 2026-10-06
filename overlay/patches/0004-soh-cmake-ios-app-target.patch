@@ -4,12 +4,15 @@ src/code/main.c (SDL2main UIKit shim owns the real main), OBJCXX/ARC and
 Darwin warning flags extended to iOS, espeak skipped, deps: SDL2-static
 from LUS FetchContent + prebuilt static ogg/vorbis/opus/opusfile via
 -DSOH_IOS_DEPS_PREFIX, soh.o2r bundled via -DSOH_O2R_PATH, SDL2_net
-omitted on iOS.
+omitted on iOS. 9.3.0 (D-079): links torch (in-process Torch ROM
+extraction) where it linked ZAPDLib; upstream's POST_BUILD copy of
+soh/assets/yml into $<TARGET_FILE_DIR:soh>/assets lands in the flat iOS
+.app, where GetAppBundlePath (0005) finds it.
 
 --- a/soh/CMakeLists.txt
 +++ b/soh/CMakeLists.txt
-@@ -6,7 +6,7 @@
- set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard to use")
+@@ -7,7 +7,7 @@
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
  set(CMAKE_C_STANDARD 23 CACHE STRING "The C standard to use")
  
 -if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -17,7 +20,7 @@ omitted on iOS.
      enable_language(OBJCXX)
      set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
      set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc")
-@@ -156,13 +156,15 @@
+@@ -153,13 +153,15 @@
  # handle speechsynthesizer removals
  if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
      list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/Darwin")
@@ -35,7 +38,7 @@ omitted on iOS.
  if (NOT ESPEAK)
      list(FILTER soh__ EXCLUDE REGEX "soh/Enhancements/speechsynthesizer/ESpeak")
  endif()
-@@ -230,6 +232,82 @@
+@@ -227,6 +229,82 @@
  # Target
  ################################################################################
  add_executable(${PROJECT_NAME} ${ALL_FILES})
@@ -118,10 +121,11 @@ omitted on iOS.
  
  if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
  use_props(${PROJECT_NAME} "${CMAKE_CONFIGURATION_TYPES}" "${DEFAULT_CXX_PROPS}")
-@@ -255,6 +333,98 @@
+@@ -251,6 +329,98 @@
+     set_target_properties(${PROJECT_NAME} PROPERTIES
          XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
          OUTPUT_NAME "soh-macos"
-     )
++    )
 +elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    set(SOH_IOS_BUNDLE_IDENTIFIER "com.harbourmasters.soh" CACHE STRING "iOS bundle identifier")
 +    set(SOH_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
@@ -213,11 +217,10 @@ omitted on iOS.
 +        # generic one) from a CMake-generated project.
 +        XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"
 +        XCODE_ATTRIBUTE_SKIP_INSTALL "NO"
-+    )
+     )
  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
      set_target_properties(${PROJECT_NAME} PROPERTIES
-     OUTPUT_NAME "soh.elf"
-@@ -483,18 +653,21 @@
+@@ -482,19 +652,22 @@
  endif()
  
  if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -234,6 +237,7 @@ omitted on iOS.
 -            -Wno-parentheses
 -            -Wno-narrowing
 -            -Wno-missing-braces
+-            -Wno-unknown-pragmas # #pragma region is an editor folding marker, GCC doesn't know it
 +            $<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:
 +                -Wall -Wextra -Wno-error
 +                -Wformat-security
@@ -245,6 +249,7 @@ omitted on iOS.
 +                -Wno-parentheses
 +                -Wno-narrowing
 +                -Wno-missing-braces
++                -Wno-unknown-pragmas # #pragma region is an editor folding marker, GCC doesn't know it
 +                -pthread
 +            >
              $<$<COMPILE_LANGUAGE:C>:
@@ -258,11 +263,10 @@ omitted on iOS.
          )
  
          target_link_options(${PROJECT_NAME} PRIVATE
-@@ -691,6 +863,67 @@
-     )
-     target_include_directories(${PROJECT_NAME} PRIVATE
+@@ -685,6 +857,68 @@
+     target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
          ${DEVKITPRO}/portlibs/wiiu/include/
-+    )
+     )
 +elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    # SDL2 comes statically from libultraship's FetchContent (OVERRIDE_FIND_PACKAGE).
 +    find_package(SDL2 REQUIRED)
@@ -311,7 +315,8 @@ omitted on iOS.
 +        INTERFACE_INCLUDE_DIRECTORIES "${SOH_IOS_DEPS_PREFIX}/include;${SOH_IOS_DEPS_PREFIX}/include/opus")
 +    set(ADDITIONAL_LIBRARY_DEPENDENCIES
 +        "libultraship;"
-+        "ZAPDLib;"
++        # 9.3.0 (D-079): in-process ROM extraction is Torch, not ZAPDLib.
++        "torch;"
 +        SDL2::SDL2-static
 +        "$<$<NOT:$<BOOL:${SOH_VISIONOS}>>:SDL2main>"
 +        "Ogg::ogg"
@@ -323,9 +328,10 @@ omitted on iOS.
 +        SDL2_net
 +        ${CMAKE_DL_LIBS}
 +        Threads::Threads
-     )
++    )
  else()
      find_package(SDL2)
+     set(THREADS_PREFER_PTHREAD_FLAG ON)
 --- a/soh/ios/Info.plist.in
 +++ b/soh/ios/Info.plist.in
 @@ -0,0 +1,64 @@

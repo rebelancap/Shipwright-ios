@@ -111,7 +111,7 @@ b. THE COUNT EVICTION NOW DELETES THE TEXTURE. TextureCacheLookup's
      mCurrentTextureIds[tile] = texture_id;
 --- a/libultraship/src/fast/interpreter.cpp
 +++ b/libultraship/src/fast/interpreter.cpp
-@@ -473,6 +473,15 @@
+@@ -507,6 +507,15 @@
      if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
          // Remove the texture that was least recently used
          it = mTextureCache.lru.front().it;
@@ -129,8 +129,8 @@ b. THE COUNT EVICTION NOW DELETES THE TEXTURE. TextureCacheLookup's
              if (mRenderingState.mTextures[j] == &*it)
 --- a/libultraship/src/fast/interpreter.cpp
 +++ b/libultraship/src/fast/interpreter.cpp
-@@ -1158,6 +1158,10 @@
-     uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+@@ -1246,6 +1246,10 @@
+     }
      mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
  }
 +
@@ -142,7 +142,7 @@ b. THE COUNT EVICTION NOW DELETES THE TEXTURE. TextureCacheLookup's
      uint8_t fmt = mRdp->texture_tile[tile].fmt;
 --- a/libultraship/src/fast/interpreter.cpp
 +++ b/libultraship/src/fast/interpreter.cpp
-@@ -1300,6 +1300,49 @@
+@@ -1388,6 +1388,49 @@
              SPDLOG_ERROR("Invalid texture format. Fmt = {}", fmt);
              break;
      }
