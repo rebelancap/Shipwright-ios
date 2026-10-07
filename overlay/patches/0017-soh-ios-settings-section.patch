@@ -7,7 +7,7 @@ the desktop build is unchanged.
 
 --- a/soh/soh/SohGui/SohMenuSettings.cpp
 +++ b/soh/soh/SohGui/SohMenuSettings.cpp
-@@ -446,6 +446,146 @@
+@@ -436,6 +436,162 @@
      path.sidebarName = "Controls";
      path.column = SECTION_COLUMN_1;
      AddSidebarEntry("Settings", "Controls", 2);
@@ -63,6 +63,22 @@ the desktop build is unchanged.
 +                     .ComboMap(sohIosCurveOptions)
 +                     .Tooltip("Linear: deflection maps 1:1. Precise: finer control near the center, same maximum.")
 +                     .DefaultIndex(0));
++#if !TARGET_OS_VISION
++    // D-081 (overlay 0062): touch drag-look for SoH's Free Look camera. The
++    // shell scales finger travel by this; 1.0 = one screen width -> 180 deg.
++    AddWidget(path, "Touch Camera Sensitivity", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.TouchLookSens")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions()
++                     .Tooltip("With Free Look on (Settings > Controls > Camera Controls), drag on empty screen "
++                              "space to turn the camera. 1.00 = one screen width turns the camera 180 degrees. "
++                              "Free Look's own sensitivity and invert options apply on top.")
++                     .ShowButtons(true)
++                     .Min(0.25f)
++                     .Max(3.0f)
++                     .Format("%.2f")
++                     .DefaultValue(1.0f));
++#endif
 +    AddWidget(path, "Customize Layout...", WIDGET_BUTTON)
 +        .RaceDisable(false)
 +        .Callback([](WidgetInfo& info) { CVarSetInteger("gSohIos.EditLayout", 1); })

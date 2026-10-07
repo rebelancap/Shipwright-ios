@@ -1,11 +1,4 @@
 #!/bin/bash
-# Post-build bundle check (Round 2 of the 9.3.0 fold-in, D-079).
-# Upstream 9.3.0 ships the Torch yml tree as <app>/assets/{config.yml,<ver>/...}.
-# Its POST_BUILD copy (copy_directory_if_different) never deletes, so an
-# incremental build dir from the ZAPD era keeps assets/xml, Config_*.xml,
-# filelists and TexturePool.xml in the .app — 54 MB of dead weight that would
-# ship. Fail loudly if the yml tree is missing or any ZAPD leftover is present.
-# Usage: assert-app-assets.sh <path/to/soh.app>
 set -euo pipefail
 APP="${1:?usage: assert-app-assets.sh <soh.app>}"
 [[ -d "$APP" ]] || { echo "FATAL: no app at $APP" >&2; exit 1; }

@@ -1,0 +1,148 @@
+Overlay patch 0062 (D-081): TOUCH DRAG-LOOK FOR FREE LOOK + TOUCH-C STICK MASK.
+
+A Discord user could not use SoH's Free Look camera (gSettings.FreeLook.Enabled)
+with touch controls: the touch overlay has no camera input. the user chose
+DRAG-LOOK: a touch that lands on empty overlay space turns the free camera by
+finger distance. The shell (app/ios/SohIosShell.m) owns the gesture; this patch
+is the game side, three small __IOS__-gated hunks (the desktop build is
+byte-for-byte unchanged):
+
+  1. Mouse.cpp -- THE INJECTION POINT. Free Look reads the N64 right stick as a
+     RATE (x10 per tick) and then calls Mouse_HandleThirdPerson, which adds the
+     mouse delta. Touch drag-look rides exactly that seam: Mouse_UpdatePosRel
+     (called once per pad tick from padmgr's Mouse_UpdateAll) drains the
+     shell's accumulated drag into a per-tick delta, and Mouse_HandleThirdPerson
+     subtracts it the way it subtracts `mouseCoordRel * 40` -- so a drag behaves
+     like a mouse move: same sign convention, then SoH's own
+     FreeLook.CameraSensitivity.X/Y, FreeLook.InvertXAxis/InvertYAxis and
+     MirroredWorld apply on top, unchanged, at every call site
+     (SetCameraManual's 15-unit engage threshold, Camera_Free, and the
+     door-peek release hook in FreeLook.cpp). NOT gated on EnableMouse: the
+     shell only accumulates while Free Look is on and gameplay is live.
+     Drained per TICK, not per call: SetCameraManual and Camera_Free both read
+     it in the same tick and must agree.
+
+     The trap this avoids: the SDL right-stick axes. LUS's default mapping
+     (ControllerDefaultMappings.cpp) binds SDL RIGHTX/RIGHTY to BOTH the
+     C-buttons and the N64 right stick, so driving drag-look through them would
+     fire C items.
+
+  2. padmgr.c -- THE SAME TRAP, ALREADY SPRUNG BY THE TOUCH C-BUTTONS. They
+     emit through SDL RIGHTX/RIGHTY (that is how they reach the C bits), so
+     with Free Look on every touch C press also deflected the N64 right stick
+     fully and swung the camera for as long as it was held (confirmed on the
+     sim, D-081). PadMgr_ProcessInputs now zeroes port 1's right stick while
+     SohIos_TouchCMaskActive() -- set by the shell while any touch C is held
+     and for 0.25 s after (the virtual axis' release lands on the next SDL
+     event pump). The C BITS are untouched, so items/ocarina still work.
+     Physical gamepads never raise the mask (the touch overlay is hidden in
+     controller mode), so a real right stick still drives Free Look.
+     `cvar gSohIos.TouchCMask 0` is the A/B switch.
+
+  3. z_camera.c (Camera_Free) -- INSTRUMENTATION ONLY: publish play->camX/camY
+     and a Camera_Free tick count for the console bridge's `look` command, and
+     when this tick's touch delta was actually applied (not while shielding,
+     same gate as the mouse), a rate-limited log line from the shell proving
+     the delta reached the camera.
+
+
+--- a/soh/soh/Enhancements/controls/Mouse.cpp
++++ b/soh/soh/Enhancements/controls/Mouse.cpp
+@@ -16,6 +16,15 @@
+ static Ship::Coords mouseCoord = {};
+ static Ship::Coords mouseCoordRel = {};
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0062, D-081): touch drag-look. The shell accumulates finger
++// travel (binary-angle units, mouse sign convention) on the main thread; it is
++// drained once per pad tick below and applied like a mouse delta.
++extern "C" void SohIos_TouchLookDrain(float* x, float* y);
++static f32 sSohIosTouchLookX = 0.0f;
++static f32 sSohIosTouchLookY = 0.0f;
++#endif
++
+ #define CVAR_ENABLE_MOUSE_NAME CVAR_SETTING("EnableMouse")
+ #define CVAR_ENABLE_MOUSE_DEFAULT 0
+ #define CVAR_ENABLE_MOUSE_VALUE CVarGetInteger(CVAR_ENABLE_MOUSE_NAME, CVAR_ENABLE_MOUSE_DEFAULT)
+@@ -32,8 +41,19 @@
+ 
+ void Mouse_UpdatePosRel() {
+     mouseCoordRel = GetWindow()->GetMouseDelta();
++#ifdef __IOS__
++    SohIos_TouchLookDrain(&sSohIosTouchLookX, &sSohIosTouchLookY);
++#endif
+ }
+ 
++#ifdef __IOS__
++// This tick's touch drag-look delta (overlay 0062): Camera_Free's log line.
++void Mouse_SohIosTouchLookTick(f32* x, f32* y) {
++    *x = sSohIosTouchLookX;
++    *y = sSohIosTouchLookY;
++}
++#endif
++
+ void Mouse_UpdateAll() {
+     Mouse_UpdatePos();
+     Mouse_UpdatePosRel();
+@@ -44,6 +64,10 @@
+         *newCamX -= mouseCoordRel.x * 40.0f;
+         *newCamY -= mouseCoordRel.y * 40.0f;
+     }
++#ifdef __IOS__
++    *newCamX -= sSohIosTouchLookX;
++    *newCamY -= sSohIosTouchLookY;
++#endif
+ }
+ 
+ void Mouse_HandleFirstPerson(Player* player) {
+--- a/soh/src/code/padmgr.c
++++ b/soh/src/code/padmgr.c
+@@ -227,6 +227,20 @@
+         switch (padnow1->err_no) {
+             case 0:
+                 input->cur = *padnow1;
++
++#ifdef __IOS__
++                /* SOH_IOS (overlay 0062, D-081): touch C-buttons reach the C bits
++                 * through SDL RIGHTX/RIGHTY, which LUS ALSO maps to the N64 right
++                 * stick -- Free Look's camera rate. While a touch C is down (and
++                 * 0.25 s after), port 1's right stick is not the player's. */
++                {
++                    extern int SohIos_TouchCMaskActive(void);
++                    if (i == 0 && SohIos_TouchCMaskActive()) {
++                        input->cur.right_stick_x = 0;
++                        input->cur.right_stick_y = 0;
++                    }
++                }
++#endif
+ 
+                 if (GameInteractor_DisableZTargetingActive()) {
+                     input->cur.button &= ~(BTN_Z);
+--- a/soh/src/code/z_camera.c
++++ b/soh/src/code/z_camera.c
+@@ -1530,6 +1530,25 @@
+         camera->play->camY = -0x228C;
+     }
+ 
++#ifdef __IOS__
++    /* SOH_IOS (overlay 0062, D-081): drag-look instruments (console `look`). */
++    {
++        extern volatile int gSohIosFreeCamX;
++        extern volatile int gSohIosFreeCamY;
++        extern volatile int gSohIosFreeCamTicks;
++        extern void Mouse_SohIosTouchLookTick(f32 * x, f32 * y);
++        extern void SohIos_TouchLookCameraLog(float dx, float dy, int camX, int camY);
++        f32 sohTlX, sohTlY;
++        gSohIosFreeCamX = camera->play->camX;
++        gSohIosFreeCamY = camera->play->camY;
++        gSohIosFreeCamTicks++;
++        Mouse_SohIosTouchLookTick(&sohTlX, &sohTlY);
++        if ((sohTlX != 0.0f || sohTlY != 0.0f) && !(camera->player->stateFlags1 & 0x400000)) {
++            SohIos_TouchLookCameraLog(sohTlX, sohTlY, camera->play->camX, camera->play->camY);
++        }
++    }
++#endif
++
+     // SOH [Enhancement] When set, use the game's per-mode default distance (para1->distTarget)
+     // instead of the fixed free-look distance.
+     f32 distTarget = CVarGetInteger(CVAR_SETTING("FreeLook.UseGameDistance"), 0)

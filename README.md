@@ -104,6 +104,8 @@ vanilla textures, that's the switch. Turn it off to compare against vanilla.
   C-buttons, Z as momentary-or-double-tap-lock, and a **layout customizer** — drag any
   button, scale 70–140%, left-handed mirror, opacity, haptics, and **per-button
   hide/show** so you can drop the buttons you never use
+- **Touch camera** (iPhone & iPad): with Free Look on, drag on empty screen space to turn
+  the camera, with its own sensitivity slider in the iOS settings
 - **60 / 120 Hz** (ProMotion) and a supersampling slider for extra sharpness
 - Texture packs and other `.o2r` mods via drag-and-drop in Files
 - On-screen fps + thermal readout for tuning
