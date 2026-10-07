@@ -2909,6 +2909,7 @@ void SohIos_SetAudioAnchorStatus(int s) {
 //   look                 drag-look state: camX/camY, counters, gate (D-081)
 //   drag X0 Y0 X1 Y1 [ms] [steps]  synthetic finger through the overlay's handlers
 //   tc L|R|U|D [ms]      press a touch C-button through the overlay's handlers
+//   tc RS|LS [ms]        press the touch R / L shoulder button the same way
 // D-081 bridge backends, defined after the touch overlay's @implementation.
 int SohIos_SynthTouch(int phase, uintptr_t tid, CGFloat x, CGFloat y);
 CGPoint SohIos_TouchButtonCenter(NSString* label, CGSize* outBounds, int* outLookEnabled);
@@ -3269,7 +3270,7 @@ static NSString* SohIos_HandleConsoleLine(NSString* line) {
     }
     if ([cmd isEqualToString:@"tc"] && tok.count >= 2) {
         NSDictionary<NSString*, NSString*>* lab =
-            @{ @"l" : @"C\u2190", @"r" : @"C\u2192", @"u" : @"C\u2191", @"d" : @"C\u2193" };
+            @{ @"l" : @"C\u2190", @"r" : @"C\u2192", @"u" : @"C\u2191", @"d" : @"C\u2193", @"rs" : @"R", @"ls" : @"L" };
         NSString* label = lab[tok[1].lowercaseString];
         if (label == nil) {
             return @"err tc L|R|U|D";
@@ -4377,6 +4378,12 @@ void SohIos_RestoreWindowTo(CGSize target) {
     } else if ([label isEqualToString:@"L"]) {
         SohIos_PadButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, down);
     } else if ([label isEqualToString:@"R"]) {
+        // SoH's default layout maps N64 R to the RIGHT TRIGGER (LUS
+        // ControllerDefaultMappings: BTN_R <- AXIS_TRIGGERRIGHT); RB is unbound.
+        // Touch R used to send RB only, so it was dead out of the box (user
+        // report 2026-10-07). Drive the trigger like touch Z drives LT, and
+        // keep RB for anyone who worked around it by binding RB to R.
+        SohIos_PadAxis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, down ? 32767 : 0);
         SohIos_PadButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, down);
     } else if ([label isEqualToString:@"Z"]) {
         // Touchscreen Z (device feedback 2026-07-12): MOMENTARY by default
