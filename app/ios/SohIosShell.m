@@ -1255,6 +1255,27 @@ int SohIos_ThermalState(void) {
     return (int)NSProcessInfo.processInfo.thermalState;
 }
 
+// D-084 (overlay 0065's SOH_PACE line): power state beside thermal, because
+// Low Power Mode caps the panel at 60 Hz and charging heats the phone before
+// thermalState moves. Bits: 1 = Low Power Mode, 2 = charging, 4 = full
+// (plugged in), 8 = battery state unknown. Called on the game (main) thread.
+int SohIos_PowerState(void) {
+    int bits = NSProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0;
+#if !TARGET_OS_VISION
+    UIDevice* dev = UIDevice.currentDevice;
+    if (!dev.batteryMonitoringEnabled) {
+        dev.batteryMonitoringEnabled = YES;
+    }
+    switch (dev.batteryState) {
+        case UIDeviceBatteryStateCharging: bits |= 2; break;
+        case UIDeviceBatteryStateFull: bits |= 4; break;
+        case UIDeviceBatteryStateUnknown: bits |= 8; break;
+        default: break;
+    }
+#endif
+    return bits;
+}
+
 // Menu visibility, exported by overlay 0013 (OTRGlobals.cpp) — drives the
 // touch overlay's auto-hide.
 extern int SohIos_IsMenuOpen(void);
@@ -1490,6 +1511,184 @@ int SohIos_TouchCMaskActive(void) {
         return 0; // A/B switch for the sim round (D-081); default ON
     }
     return sSohIosTouchCHeld || CACurrentMediaTime() < sSohIosTouchCUntil;
+}
+
+#pragma mark - Gyro aiming (overlay 0063, D-082)
+
+// "Gyro Aiming" (gSohIos.Gyro, 0017; off by default): tilting the phone aims
+// the bow/slingshot/hookshot and the first-person view. Upstream already reads
+// N64 pad gyro_x/gyro_y in exactly those places (z_player.c first-person
+// control, x750 binang per tick); LUS only fills them from an SDL gamepad
+// gyro mapping, which a phone does not have. So CoreMotion feeds them here,
+// and overlay 0063 copies SohIos_GyroSample into port 1's pad in
+// PadMgr_ProcessInputs -- ONLY while SohIos_GyroActive(), so with the setting
+// off a physical controller's own LUS gyro mapping is untouched.
+//
+// Units and signs match SDLGyroMapping (x = gyro[0] pitch rad/s * sens,
+// y = gyro[1] yaw rad/s * sens), SDL's controller frame being X right, Y up,
+// Z toward the player, right-handed. A landscape phone held up like a window
+// maps onto that frame as X = screen right, Y = screen up, Z = out of the
+// screen. Hence:
+//   gyro_x = rotation rate about SCREEN RIGHT. Positive = the top edge tips
+//            toward you (the back of the phone looks up) = aim UP: z_player
+//            adds -gyro_x*750 to focus.rot.x, and negative rot.x is up.
+//            Screen right in CoreMotion's portrait device frame is -Y when
+//            the interface is landscapeRight (top of the phone on the left)
+//            and +Y when landscapeLeft.
+//   gyro_y = rotation rate about WORLD UP (-gravity), not screen up, so a
+//            phone tilted back in the hands still turns 1:1 with the body
+//            ("player space"; local screen-up would lose cos(tilt) and leak
+//            roll). Positive = counter-clockwise seen from above = aim LEFT:
+//            z_player adds +gyro_y*750 to focus.rot.y, and +yaw is left.
+// rotationRate is CoreMotion's bias-corrected rate (not raw gyroData). The
+// samples arriving between two pad ticks are averaged, then a 0.02 rad/s
+// per-axis deadzone kills hand tremor, then gSohIos.GyroSens (0.25-4.0) scales.
+// visionOS: compiled out (the headset keeps its own head aim).
+static os_unfair_lock sSohIosGyroLock = OS_UNFAIR_LOCK_INIT;
+static double sSohIosGyroSumX, sSohIosGyroSumY;
+static int sSohIosGyroCount;
+static float sSohIosGyroHeldX, sSohIosGyroHeldY; // last average (no new sample: hold it)
+static volatile int sSohIosGyroRunning;           // CoreMotion delivering
+static volatile int sSohIosGyroSuspended;         // scene not active
+static volatile long sSohIosGyroOrient = UIInterfaceOrientationLandscapeRight;
+static volatile float sSohIosGyroSynthX, sSohIosGyroSynthY; // bridge `gyro X Y [s]`
+static volatile double sSohIosGyroSynthUntil;
+volatile float gSohIosGyroLastX, gSohIosGyroLastY; // last values handed to the pad
+volatile int gSohIosGyroReads;                     // pad ticks that took a sample
+volatile int gSohIosGyroMotionSamples;             // CoreMotion callbacks
+static const float kSohIosGyroDeadzone = 0.02f;    // rad/s
+
+int SohIos_GyroActive(void) {
+#if TARGET_OS_VISION
+    return 0;
+#else
+    if (!CVarGetInteger("gSohIos.Gyro", 0)) {
+        return 0;
+    }
+    return sSohIosGyroRunning || CACurrentMediaTime() < sSohIosGyroSynthUntil;
+#endif
+}
+
+// Game thread (overlay 0063, PadMgr_ProcessInputs, port 1, once per pad tick).
+void SohIos_GyroSample(float* x, float* y) {
+    float gx, gy;
+    if (CACurrentMediaTime() < sSohIosGyroSynthUntil) {
+        gx = sSohIosGyroSynthX;
+        gy = sSohIosGyroSynthY;
+    } else {
+        os_unfair_lock_lock(&sSohIosGyroLock);
+        if (sSohIosGyroCount > 0) {
+            sSohIosGyroHeldX = (float)(sSohIosGyroSumX / sSohIosGyroCount);
+            sSohIosGyroHeldY = (float)(sSohIosGyroSumY / sSohIosGyroCount);
+            sSohIosGyroSumX = sSohIosGyroSumY = 0;
+            sSohIosGyroCount = 0;
+        }
+        gx = sSohIosGyroHeldX;
+        gy = sSohIosGyroHeldY;
+        os_unfair_lock_unlock(&sSohIosGyroLock);
+    }
+    if (fabsf(gx) < kSohIosGyroDeadzone) {
+        gx = 0;
+    }
+    if (fabsf(gy) < kSohIosGyroDeadzone) {
+        gy = 0;
+    }
+    float sens = CVarGetFloat("gSohIos.GyroSens", 1.0f);
+    sens = MAX(0.25f, MIN(4.0f, sens));
+    *x = gx * sens;
+    *y = gy * sens;
+    gSohIosGyroLastX = *x;
+    gSohIosGyroLastY = *y;
+    gSohIosGyroReads++;
+}
+
+#if !TARGET_OS_VISION
+#import <CoreMotion/CoreMotion.h>
+static CMMotionManager* sSohIosMotion;
+static NSOperationQueue* sSohIosMotionQueue;
+
+static void SohIos_GyroStop(const char* why) {
+    if (!sSohIosGyroRunning) {
+        return;
+    }
+    [sSohIosMotion stopDeviceMotionUpdates];
+    sSohIosGyroRunning = 0;
+    os_unfair_lock_lock(&sSohIosGyroLock);
+    sSohIosGyroSumX = sSohIosGyroSumY = 0;
+    sSohIosGyroCount = 0;
+    sSohIosGyroHeldX = sSohIosGyroHeldY = 0;
+    os_unfair_lock_unlock(&sSohIosGyroLock);
+    NSLog(@"[SohIosShell] gyro: stopped (%s)", why);
+}
+
+static void SohIos_GyroStart(void) {
+    if (sSohIosGyroRunning) {
+        return;
+    }
+    if (sSohIosMotion == nil) {
+        sSohIosMotion = [[CMMotionManager alloc] init];
+        sSohIosMotionQueue = [[NSOperationQueue alloc] init];
+        sSohIosMotionQueue.maxConcurrentOperationCount = 1;
+        sSohIosMotionQueue.qualityOfService = NSQualityOfServiceUserInteractive;
+    }
+    if (!sSohIosMotion.deviceMotionAvailable) {
+        static BOOL logged = NO;
+        if (!logged) {
+            logged = YES;
+            NSLog(@"[SohIosShell] gyro: device motion unavailable (simulator?) -- only bridge `gyro` input applies");
+        }
+        return;
+    }
+    sSohIosMotion.deviceMotionUpdateInterval = 1.0 / 100.0;
+    [sSohIosMotion
+        startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXArbitraryZVertical
+                                            toQueue:sSohIosMotionQueue
+                                        withHandler:^(CMDeviceMotion* m, NSError* err) {
+                                            if (m == nil) {
+                                                return;
+                                            }
+                                            CMRotationRate r = m.rotationRate;
+                                            CMAcceleration g = m.gravity;
+                                            BOOL ll = sSohIosGyroOrient == UIInterfaceOrientationLandscapeLeft;
+                                            // Pitch: about screen right (-Y landscapeRight, +Y landscapeLeft).
+                                            double pitch = ll ? r.y : -r.y;
+                                            // Yaw: about world up = -gravity; screen up as a fallback.
+                                            double gl = sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+                                            double yaw = gl > 0.5 ? -(r.x * g.x + r.y * g.y + r.z * g.z) / gl
+                                                                  : (ll ? -r.x : r.x);
+                                            os_unfair_lock_lock(&sSohIosGyroLock);
+                                            sSohIosGyroSumX += pitch;
+                                            sSohIosGyroSumY += yaw;
+                                            sSohIosGyroCount++;
+                                            os_unfair_lock_unlock(&sSohIosGyroLock);
+                                            gSohIosGyroMotionSamples++;
+                                        }];
+    sSohIosGyroRunning = 1;
+    NSLog(@"[SohIosShell] gyro: started (100 Hz device motion, orient=%ld)", (long)sSohIosGyroOrient);
+}
+#endif
+
+// Main thread: syncWithMenuState's 0.25 s poll + the scene activation hooks.
+static void SohIos_GyroUpdate(UIWindowScene* scene) {
+#if !TARGET_OS_VISION
+    if (scene != nil) {
+        UIInterfaceOrientation o = scene.interfaceOrientation;
+        if (o == UIInterfaceOrientationLandscapeLeft || o == UIInterfaceOrientationLandscapeRight) {
+            sSohIosGyroOrient = o;
+        }
+    }
+    BOOL want = CVarGetInteger("gSohIos.Gyro", 0) && !sSohIosGyroSuspended;
+    if (want) {
+        SohIos_GyroStart();
+    } else {
+        SohIos_GyroStop(sSohIosGyroSuspended ? "inactive" : "setting off");
+    }
+#endif
+}
+
+static void SohIos_GyroSetSuspended(BOOL suspended, UIScene* scene) {
+    sSohIosGyroSuspended = suspended;
+    SohIos_GyroUpdate([scene isKindOfClass:UIWindowScene.class] ? (UIWindowScene*)scene : nil);
 }
 
 // Active BGM/fanfare sequence ids (overlay 0013) — wrong-music diagnostics.
@@ -3230,6 +3429,37 @@ static NSString* SohIos_HandleConsoleLine(NSString* line) {
     // finger through the overlay's REAL per-touch handlers (so a drag that
     // starts on a button presses it, one in the stick zone spawns the stick);
     // `tc L|R|U|D [ms]` presses a touch C-button the same way.
+    // D-082 gyro instruments. `gyro X Y [secs]` injects a synthetic rate
+    // sample (rad/s, before sensitivity/deadzone) for secs (default 3) --
+    // the simulator has no CoreMotion hardware; it applies only while
+    // gSohIos.Gyro is on, exactly like the real sensor. `gyro` alone prints
+    // the live state plus the player's focus.rot (aim) from overlay 0063.
+    // `mscroll X DY`: scroll the open SoH menu the way a finger drag does
+    // (the touch-router's scroll mode), for settings-page screenshots.
+    if ([cmd isEqualToString:@"mscroll"] && tok.count >= 3) {
+        SohIos_QueueMenuScroll(tok[1].floatValue, tok[2].floatValue);
+        return @"ok";
+    }
+    if ([cmd isEqualToString:@"gyro"]) {
+        if (tok.count >= 3) {
+            double secs = tok.count >= 4 ? tok[3].doubleValue : 3.0;
+            sSohIosGyroSynthX = tok[1].floatValue;
+            sSohIosGyroSynthY = tok[2].floatValue;
+            sSohIosGyroSynthUntil = CACurrentMediaTime() + secs;
+        }
+        extern int SohIos_PlayerFocusRot(int* x, int* y);
+        int fx = 0, fy = 0;
+        int have = SohIos_PlayerFocusRot(&fx, &fy);
+        return [NSString stringWithFormat:@"ok cvar=%d sens=%.2f active=%d running=%d synth=%.3f,%.3f(%.1fs) "
+                                          @"pad=%.3f,%.3f reads=%d motion=%d orient=%ld focus=%@",
+                                          CVarGetInteger("gSohIos.Gyro", 0), CVarGetFloat("gSohIos.GyroSens", 1.0f),
+                                          SohIos_GyroActive(), sSohIosGyroRunning, sSohIosGyroSynthX,
+                                          sSohIosGyroSynthY,
+                                          MAX(0.0, sSohIosGyroSynthUntil - CACurrentMediaTime()),
+                                          gSohIosGyroLastX, gSohIosGyroLastY, gSohIosGyroReads,
+                                          gSohIosGyroMotionSamples, (long)sSohIosGyroOrient,
+                                          have ? [NSString stringWithFormat:@"%d,%d", fx, fy] : @"none"];
+    }
     if ([cmd isEqualToString:@"look"]) {
         extern int SohIos_TouchCMaskActive(void);
         __block CGSize vb = CGSizeZero;
@@ -3268,12 +3498,74 @@ static NSString* SohIos_HandleConsoleLine(NSString* line) {
         static NSString* const names[] = { @"none", @"button", @"stick", @"look" };
         return [NSString stringWithFormat:@"ok began=%@", cls >= 0 && cls <= 3 ? names[cls] : @"no-overlay"];
     }
+    // Perf round 4 (D-088) instrument: `overlayshot NAME` renders ONLY the
+    // touch overlay (its view hierarchy, as displayed) into Documents/NAME.png
+    // with a transparent background, so overlay drawing can be compared
+    // pixel-for-pixel across builds with the game image changing underneath.
+    if ([cmd isEqualToString:@"overlayshot"] && tok.count >= 2) {
+        NSString* name = tok[1];
+        __block NSString* res = @"err no-overlay";
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            extern UIView* SohIos_TouchOverlayView(void);
+            UIView* o = SohIos_TouchOverlayView();
+            if (o == nil) {
+                return;
+            }
+            UIGraphicsImageRendererFormat* fmt = [UIGraphicsImageRendererFormat preferredFormat];
+            fmt.opaque = NO;
+            UIGraphicsImageRenderer* r = [[UIGraphicsImageRenderer alloc] initWithSize:o.bounds.size format:fmt];
+            NSData* png = [r PNGDataWithActions:^(UIGraphicsImageRendererContext* c) {
+                [o drawViewHierarchyInRect:o.bounds afterScreenUpdates:YES];
+            }];
+            NSString* docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString* path = [docs stringByAppendingPathComponent:[name stringByAppendingString:@".png"]];
+            res = [png writeToFile:path atomically:YES] ? [NSString stringWithFormat:@"ok %@ %.0fx%.0f@%.0f", path,
+                                                                                   o.bounds.size.width,
+                                                                                   o.bounds.size.height, fmt.scale]
+                                                         : @"err write";
+        });
+        return res;
+    }
+    // Perf round 4 (D-088) instrument: `stickspin CX CY R SECS [RPS]` lands a
+    // synthetic finger at (CX,CY) through the REAL per-touch handlers (so it
+    // spawns the floating stick there), then circles it at radius R points,
+    // RPS turns per second (default 1; 0 = hold deflected to the right),
+    // moved at 120 Hz like a ProMotion finger, and lifts it after SECS.
+    if ([cmd isEqualToString:@"stickspin"] && tok.count >= 5) {
+        CGFloat cx = tok[1].floatValue, cy = tok[2].floatValue, r = tok[3].floatValue;
+        double secs = tok[4].doubleValue;
+        double rps = tok.count >= 6 ? tok[5].doubleValue : 1.0;
+        static uintptr_t sSpinId = 0x7000;
+        uintptr_t tid = ++sSpinId;
+        __block int cls = -1;
+        dispatch_sync(dispatch_get_main_queue(), ^{ cls = SohIos_SynthTouch(0, tid, cx, cy); });
+        CFTimeInterval t0 = CACurrentMediaTime();
+        __block dispatch_source_t timer =
+            dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_t spin = timer;
+        dispatch_source_set_timer(spin, DISPATCH_TIME_NOW, NSEC_PER_SEC / 120, NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(spin, ^{
+            double el = CACurrentMediaTime() - t0;
+            if (el >= secs) {
+                SohIos_SynthTouch(2, tid, cx, cy);
+                dispatch_source_cancel(timer);
+                timer = nil; // breaks the block <-> source retain cycle
+                return;
+            }
+            double a = 2.0 * M_PI * rps * el;
+            SohIos_SynthTouch(1, tid, cx + r * cos(a), cy + r * sin(a));
+        });
+        dispatch_resume(spin);
+        static NSString* const names[] = { @"none", @"button", @"stick", @"look" };
+        return [NSString stringWithFormat:@"ok began=%@", cls >= 0 && cls <= 3 ? names[cls] : @"no-overlay"];
+    }
     if ([cmd isEqualToString:@"tc"] && tok.count >= 2) {
         NSDictionary<NSString*, NSString*>* lab =
-            @{ @"l" : @"C\u2190", @"r" : @"C\u2192", @"u" : @"C\u2191", @"d" : @"C\u2193", @"rs" : @"R", @"ls" : @"L" };
+            @{ @"l" : @"C\u2190", @"r" : @"C\u2192", @"u" : @"C\u2191", @"d" : @"C\u2193", @"rs" : @"R", @"ls" : @"L",
+               @"z" : @"Z" };
         NSString* label = lab[tok[1].lowercaseString];
         if (label == nil) {
-            return @"err tc L|R|U|D";
+            return @"err tc L|R|U|D|LS|RS|Z";
         }
         int ms = tok.count >= 3 ? tok[2].intValue : 200;
         __block CGPoint c = CGPointMake(-1, -1);
@@ -3571,6 +3863,7 @@ static UISceneConfiguration* SohIos_SceneConfigForSession(id self, SEL _cmd, UIA
 }
 - (void)sceneWillResignActive:(UIScene*)scene {
     SohIos_FlushConfig("sceneWillResignActive"); // swipe-kill safety
+    SohIos_GyroSetSuspended(YES, scene); // D-082: no CoreMotion while inactive
     // R8 review: the clean-exit marker was only on the UIApplication
     // notification path; this scene path is the one that actually fires on a
     // swipe-kill, so without it every backgrounded run read as a memory kill.
@@ -3592,6 +3885,7 @@ static UISceneConfiguration* SohIos_SceneConfigForSession(id self, SEL _cmd, UIA
 }
 - (void)sceneDidBecomeActive:(UIScene*)scene {
     SohIos_SetBackgrounded(0); // belt-and-braces on every activation path
+    SohIos_GyroSetSuspended(NO, scene); // D-082: restarts only if gSohIos.Gyro
     [self fwd:@selector(applicationDidBecomeActive:)];
 #if !TARGET_OS_VISION
     // iOS 27: every activation (Home-and-return, Notification/Control Center
@@ -3643,6 +3937,39 @@ static void SohIos_InstallSceneDelegate(void) {
 // (A, B, C-up/down/left/right, Z, R, Start). v1 renders the layout and logs
 // touches; input injection (SDL virtual controller) lands in the next revision.
 @interface SohIosTouchOverlay : UIView
+// D-088: drawing entry for the overlay's canvases (role 0: everything except
+// the stick and Z; role 1: the Z button only, in its own small view).
+- (void)sohDrawCanvasRole:(int)role inView:(UIView*)view;
+@end
+
+// D-088 (perf round 4): the overlay no longer draws itself. Its content is
+// split so that the frequent changes stop repainting a full-screen bitmap on
+// the CPU inside the game thread's SDL event pump:
+//   _stickView  the floating stick's ring + knob as two CAShapeLayers, moved
+//               by `position` (no redraw at all while the finger moves)
+//   _canvas     full-size, everything else (buttons, customizer, restore dot)
+//               -- redrawn only on layout / visibility / mode changes
+//   _zCanvas    just the Z button, so Z held/locked repaints a ~70 pt view
+// All three are non-interactive subviews; touches still hit the overlay.
+@interface SohIosOverlayCanvas : UIView
+@property(nonatomic, weak) SohIosTouchOverlay* owner;
+@property(nonatomic) int role;
+@end
+
+@implementation SohIosOverlayCanvas
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = UIColor.clearColor;
+        self.opaque = NO;
+        self.contentMode = UIViewContentModeRedraw;
+        self.userInteractionEnabled = NO;
+    }
+    return self;
+}
+- (void)drawRect:(CGRect)rect {
+    [self.owner sohDrawCanvasRole:self.role inView:self];
+}
 @end
 
 typedef struct {
@@ -3692,6 +4019,13 @@ static NSString* SohIos_LayoutKey(NSString* label);
     NSString* _editDrag;  // label being dragged, @"__stick", @"__slider", or nil
     NSString* _editSelected; // layout key of the last-touched button: the ONLY
                              // one showing an eye chip in the customizer (nil = none)
+    // D-088: layered drawing (see SohIosOverlayCanvas).
+    UIView* _stickView;
+    CAShapeLayer* _ringLayer;
+    CAShapeLayer* _knobLayer;
+    CGFloat _ringLayerR, _knobLayerR;
+    SohIosOverlayCanvas* _canvas;
+    SohIosOverlayCanvas* _zCanvas;
 }
 
 - (CGPoint)restoreDotCenter {
@@ -3701,8 +4035,15 @@ static NSString* SohIos_LayoutKey(NSString* label);
 
 // The ≡ menu button shows only where menu access makes sense: intro/title/
 // file-select (users tune settings at the start) and the game's pause menu.
-// Hidden during normal gameplay for BOTH touch and controller input.
+// Hidden during normal gameplay for BOTH touch and controller input -- unless
+// the user turned on "Always Show Menu Button" (gSohIos.MenuAlwaysVisible,
+// 0017; D-083). Every draw/hit-test path (touch + controller mode) goes
+// through here, and syncWithMenuState repaints on a change, so the toggle is
+// live with no other edit.
 - (BOOL)menuButtonVisible {
+    if (CVarGetInteger("gSohIos.MenuAlwaysVisible", 0)) {
+        return YES;
+    }
     return SohIos_IsGamePaused() || SohIos_IsTitleOrDemo();
 }
 
@@ -3765,6 +4106,33 @@ static NSString* SohIos_LayoutKey(NSString* label);
         _layoutHidden = [NSMutableSet set];
         _layoutScale = 1.0;
         _stickHome = CGPointZero; // zero = default position
+        // D-088: stick layers below the button canvas (buttons drew over the
+        // stick in the old single drawRect), Z canvas on top.
+        _stickView = [[UIView alloc] initWithFrame:self.bounds];
+        _stickView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _stickView.userInteractionEnabled = NO;
+        _stickView.backgroundColor = UIColor.clearColor;
+        _ringLayer = [CAShapeLayer layer];
+        _ringLayer.fillColor = nil;
+        _ringLayer.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+        _ringLayer.lineWidth = 4;
+        _ringLayer.hidden = YES;
+        _knobLayer = [CAShapeLayer layer];
+        _knobLayer.fillColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
+        _knobLayer.strokeColor = nil;
+        _knobLayer.hidden = YES;
+        [_stickView.layer addSublayer:_ringLayer];
+        [_stickView.layer addSublayer:_knobLayer];
+        [self addSubview:_stickView];
+        _canvas = [[SohIosOverlayCanvas alloc] initWithFrame:self.bounds];
+        _canvas.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _canvas.owner = self;
+        _canvas.role = 0;
+        [self addSubview:_canvas];
+        _zCanvas = [[SohIosOverlayCanvas alloc] initWithFrame:CGRectZero];
+        _zCanvas.owner = self;
+        _zCanvas.role = 1;
+        [self addSubview:_zCanvas];
         [self loadLayoutFromCVars];
         // EditLayout is a transient trigger, not a setting: a stale persisted
         // 1 (e.g. saved by a config flush mid-edit) must never relaunch the
@@ -4105,6 +4473,7 @@ void SohIos_RestoreWindowTo(CGSize target) {
 }
 
 - (void)syncWithMenuState {
+    SohIos_GyroUpdate(self.window.windowScene); // D-082: start/stop on gSohIos.Gyro
     {
         UIView* mv = SohIos_FindMetalView(self.window);
         if (mv != nil) {
@@ -4286,9 +4655,10 @@ void SohIos_RestoreWindowTo(CGSize target) {
         }
         changed = YES;
     }
-    if (changed || _controllerMode) {
-        // controllerMode redraws every tick cheaply so the ≡ button can track
-        // the game's pause state (visible only while paused).
+    if (changed) {
+        // D-088: controller mode used to repaint the full screen every tick so
+        // ≡ could follow pause; _lastMenuBtnVisible (above) now flags exactly
+        // that change, in both modes.
         [self setNeedsDisplay];
     }
     // Touch-control opacity (edit mode and open menu stay fully opaque).
@@ -4348,6 +4718,7 @@ void SohIos_RestoreWindowTo(CGSize target) {
     [self recomputeCAxes]; // dict now empty -> C axes recentre
     _stickActive = NO;
     _stickTouch = NULL;
+    [self syncStickLayers]; // D-088
     _lookTouch = NULL;
     SohIos_TouchLookClear();
     _zHeld = NO;
@@ -4406,7 +4777,7 @@ void SohIos_RestoreWindowTo(CGSize target) {
                 SohIos_PadAxis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, 0);
             }
         }
-        [self setNeedsDisplay];
+        [_zCanvas setNeedsDisplay]; // D-088: only the Z button repaints
     } else if ([label hasPrefix:@"C"]) {
         [self recomputeCAxes];
     }
@@ -5030,8 +5401,132 @@ static NSString* SohIos_LayoutKey(NSString* label) {
     [glyph drawAtPoint:CGPointMake(c.x - sz.width / 2, c.y - sz.height / 2) withAttributes:attrs];
 }
 
-- (void)drawRect:(CGRect)rect {
+// D-088: every repaint request reaches the canvases (the old full-view
+// redraw), and the stick layers follow the same state. Nothing else.
+- (void)setNeedsDisplay {
+    [_canvas setNeedsDisplay];
+    [self sohLayoutZCanvas];
+    [_zCanvas setNeedsDisplay];
+    [self syncStickLayers];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self sohLayoutZCanvas];
+    [self syncStickLayers];
+}
+
+// The Z canvas covers the Z button (+ stroke/AA margin) at an integral point
+// origin, so its pixels land exactly where the full canvas put them.
+- (void)sohLayoutZCanvas {
+    if (_zCanvas == nil) {
+        return;
+    }
+    CGRect f = CGRectZero;
+    SohButton btns[16];
+    int n = 0;
+    [self buttonRects:btns count:&n];
+    for (int i = 0; i < n; i++) {
+        if ([btns[i].label isEqualToString:@"Z"]) {
+            CGFloat r = btns[i].radius + 4;
+            f = CGRectIntegral(CGRectMake(btns[i].center.x - r, btns[i].center.y - r, r * 2, r * 2));
+            break;
+        }
+    }
+    if (!CGRectEqualToRect(f, _zCanvas.frame)) {
+        _zCanvas.frame = f;
+        [_zCanvas setNeedsDisplay];
+    }
+}
+
+// Floating stick: position-only updates, no implicit animation, no redraw.
+// Visible exactly when the old drawRect drew it.
+- (void)syncStickLayers {
+    if (_ringLayer == nil) {
+        return;
+    }
+    BOOL show = _stickActive && !_editMode && !_popupOpen && !_controlsHidden && !_controllerMode;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _ringLayer.hidden = !show;
+    _knobLayer.hidden = !show;
+    if (show) {
+        CGFloat scale = self.traitCollection.displayScale > 0 ? self.traitCollection.displayScale : 3.0;
+        if (_ringLayer.contentsScale != scale) {
+            _ringLayer.contentsScale = scale;
+            _knobLayer.contentsScale = scale;
+        }
+        CGFloat ringR = (_stickBaseR + 8) * _layoutScale;
+        if (ringR != _ringLayerR) {
+            _ringLayerR = ringR;
+            CGRect b = CGRectMake(0, 0, ringR * 2, ringR * 2);
+            _ringLayer.bounds = b;
+            CGPathRef path = CGPathCreateWithEllipseInRect(b, NULL);
+            _ringLayer.path = path;
+            CGPathRelease(path);
+        }
+        CGFloat knobR = _stickKnobR * _layoutScale;
+        if (knobR != _knobLayerR) {
+            _knobLayerR = knobR;
+            CGRect b = CGRectMake(0, 0, knobR * 2, knobR * 2);
+            _knobLayer.bounds = b;
+            CGPathRef path = CGPathCreateWithEllipseInRect(b, NULL);
+            _knobLayer.path = path;
+            CGPathRelease(path);
+        }
+        _ringLayer.position = _stickBase;
+        _knobLayer.position = _stickKnob;
+    }
+    [CATransaction commit];
+}
+
+// One gameplay-mode button, exactly as the single drawRect drew it.
+- (void)sohDrawButton:(SohButton)bt ctx:(CGContextRef)ctx {
+    BOOL isZ = [bt.label isEqualToString:@"Z"];
+    if (isZ && _zLocked) {
+        // Double-tap lock engaged: unmistakably "on".
+        [[UIColor colorWithRed:0.30 green:0.60 blue:1.0 alpha:0.9] setFill];
+        [[UIColor colorWithWhite:1 alpha:0.95] setStroke];
+    } else if (isZ && _zHeld) {
+        // Momentary hold: clearly active, dimmer than the lock.
+        [[UIColor colorWithRed:0.25 green:0.45 blue:0.8 alpha:0.7] setFill];
+        [[UIColor colorWithWhite:1 alpha:0.7] setStroke];
+    } else {
+        [bt.color setFill];
+        [[UIColor colorWithWhite:1 alpha:0.5] setStroke];
+    }
+    CGRect r = CGRectMake(bt.center.x - bt.radius, bt.center.y - bt.radius, bt.radius * 2, bt.radius * 2);
+    CGContextSetLineWidth(ctx, isZ && _zLocked ? 4 : 3);
+    CGContextFillEllipseInRect(ctx, r);
+    CGContextStrokeEllipseInRect(ctx, r);
+    BOOL labeled = isZ || [bt.label isEqualToString:@"L"] || [bt.label isEqualToString:@"R"] ||
+                   [bt.label isEqualToString:@"≡"];
+    if (labeled) {
+        [self drawGlyph:bt.label at:bt.center size:20 alpha:0.95];
+    }
+}
+
+- (void)sohDrawCanvasRole:(int)role inView:(UIView*)view {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
+
+    if (role == 1) {
+        // The Z button alone, in overlay coordinates (the canvas sits at an
+        // integral origin). Only in plain gameplay mode; every other mode is
+        // drawn whole by role 0.
+        if (_editMode || _popupOpen || _controlsHidden || _controllerMode || [self isButtonHidden:@"Z"]) {
+            return;
+        }
+        CGContextTranslateCTM(ctx, -view.frame.origin.x, -view.frame.origin.y);
+        SohButton zb[16];
+        int zn = 0;
+        [self buttonRects:zb count:&zn];
+        for (int i = 0; i < zn; i++) {
+            if ([zb[i].label isEqualToString:@"Z"]) {
+                [self sohDrawButton:zb[i] ctx:ctx];
+            }
+        }
+        return;
+    }
 
     if (_editMode) {
         // --- Customizer: everything visible and draggable ---
@@ -5132,54 +5627,26 @@ static NSString* SohIos_LayoutKey(NSString* label) {
         return;
     }
 
-    // Floating left stick: drawn only while a finger holds it.
-    if (_stickActive) {
-        CGContextSetLineWidth(ctx, 4);
-        [[UIColor colorWithWhite:1 alpha:0.35] setStroke];
-        CGFloat ringR = (_stickBaseR + 8) * _layoutScale;
-        CGContextStrokeEllipseInRect(ctx,
-                                     CGRectMake(_stickBase.x - ringR, _stickBase.y - ringR, ringR * 2, ringR * 2));
-        [[UIColor colorWithWhite:1 alpha:0.28] setFill];
-        CGFloat knobR = _stickKnobR * _layoutScale;
-        CGContextFillEllipseInRect(ctx,
-                                   CGRectMake(_stickKnob.x - knobR, _stickKnob.y - knobR, knobR * 2, knobR * 2));
-    }
+    // Floating left stick: _stickView's layers (syncStickLayers), not here.
 
-    // Buttons. Labels only where the glyph isn't obvious (L/R/Z + ≡).
+    // Buttons. Labels only where the glyph isn't obvious (L/R/Z + ≡). Z is
+    // drawn by its own canvas (role 1) so a press repaints only that.
     SohButton btns[16];
     int n = 0;
     [self buttonRects:btns count:&n];
     BOOL menuBtnVisible = [self menuButtonVisible];
     for (int i = 0; i < n; i++) {
         SohButton bt = btns[i];
-        BOOL isZ = [bt.label isEqualToString:@"Z"];
+        if ([bt.label isEqualToString:@"Z"]) {
+            continue; // role 1
+        }
         if ([bt.label isEqualToString:@"≡"] && !menuBtnVisible) {
             continue; // hidden during normal gameplay
         }
         if ([self isButtonHidden:bt.label]) {
             continue; // user-hidden from the touch layer (customizer)
         }
-        if (isZ && _zLocked) {
-            // Double-tap lock engaged: unmistakably "on".
-            [[UIColor colorWithRed:0.30 green:0.60 blue:1.0 alpha:0.9] setFill];
-            [[UIColor colorWithWhite:1 alpha:0.95] setStroke];
-        } else if (isZ && _zHeld) {
-            // Momentary hold: clearly active, dimmer than the lock.
-            [[UIColor colorWithRed:0.25 green:0.45 blue:0.8 alpha:0.7] setFill];
-            [[UIColor colorWithWhite:1 alpha:0.7] setStroke];
-        } else {
-            [bt.color setFill];
-            [[UIColor colorWithWhite:1 alpha:0.5] setStroke];
-        }
-        CGRect r = CGRectMake(bt.center.x - bt.radius, bt.center.y - bt.radius, bt.radius * 2, bt.radius * 2);
-        CGContextSetLineWidth(ctx, isZ && _zLocked ? 4 : 3);
-        CGContextFillEllipseInRect(ctx, r);
-        CGContextStrokeEllipseInRect(ctx, r);
-        BOOL labeled = isZ || [bt.label isEqualToString:@"L"] || [bt.label isEqualToString:@"R"] ||
-                       [bt.label isEqualToString:@"≡"];
-        if (labeled) {
-            [self drawGlyph:bt.label at:bt.center size:20 alpha:0.95];
-        }
+        [self sohDrawButton:bt ctx:ctx];
     }
 }
 
@@ -5343,7 +5810,7 @@ static NSString* SohIos_LayoutKey(NSString* label) {
         _stickBase = [self clampStickBase:p];
         _stickKnob = _stickBase;
         [self updateStickAxesFromKnob];
-        [self setNeedsDisplay];
+        [self syncStickLayers]; // D-088
         return 2;
     } else if (_lookTouch == NULL && ![self pointInStickRegion:p] && [self dragLookEnabled]) {
         // Drag-look (D-081): empty space outside the stick spawn zone. A
@@ -5406,7 +5873,7 @@ static NSString* SohIos_LayoutKey(NSString* label) {
     }
     _stickKnob = knob;
     [self updateStickAxesFromKnob];
-    [self setNeedsDisplay];
+    [self syncStickLayers]; // D-088: move the knob layer; no repaint
 }
 
 - (void)gameTouchEnded:(const void*)tid {
@@ -5429,7 +5896,7 @@ static NSString* SohIos_LayoutKey(NSString* label) {
         _lastSentLX = _lastSentLY = 0;
         SohIos_PadAxis(SDL_CONTROLLER_AXIS_LEFTX, 0);
         SohIos_PadAxis(SDL_CONTROLLER_AXIS_LEFTY, 0);
-        [self setNeedsDisplay];
+        [self syncStickLayers]; // D-088
     }
 }
 
@@ -5829,6 +6296,11 @@ static SohIosTouchOverlay* SohIos_FindTouchOverlay(void) {
         }
     }
     return nil;
+}
+
+// Bridge `overlayshot` (D-088). MAIN THREAD ONLY.
+UIView* SohIos_TouchOverlayView(void) {
+    return SohIos_FindTouchOverlay();
 }
 
 // Bridge `drag`/`tc` backend (D-081). MAIN THREAD ONLY. Drives the overlay's

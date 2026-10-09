@@ -1,0 +1,48 @@
+Overlay patch 0064: ANCHOR TEAM ID MISMATCH NOTE.
+
+A tester's Anchor room held teams "Pencil" and "default" while both players
+believed they matched, so items and flags never synced (Anchor shares them only
+within a team; STATUS 2026-10-07). AnchorMainMenu (soh/Network/Anchor/Menu.cpp)
+now draws a warning line under the Team ID field when the connected room holds
+more than one distinct client.teamId -- the same grouping AnchorRoomWindow.cpp
+uses for its team separators -- listing the team ids.
+
+Only while connected (the room's client list is empty otherwise). Not drawn in
+the soh-global room (sync is off there by design). __IOS__-gated for
+consistency with the rest of the overlay; the desktop build is unchanged.
+
+
+--- a/soh/soh/Network/Anchor/Menu.cpp
++++ b/soh/soh/Network/Anchor/Menu.cpp
+@@ -70,6 +70,31 @@
+         CVarSetString(CVAR_REMOTE_ANCHOR("TeamId"), anchorTeamId.c_str());
+         Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+     }
++#ifdef __IOS__
++    // SOH_IOS (overlay 0064): warn when the room mixes teams -- items & flags
++    // only sync within a team, and a mismatch is otherwise invisible here.
++    // Same grouping as AnchorRoomWindow's team separators.
++    if (anchor->isEnabled && anchor->isConnected && anchorRoomId != "soh-global") {
++        std::set<std::string> sohIosTeams;
++        for (auto& [clientId, client] : anchor->clients) {
++            sohIosTeams.insert(client.teamId);
++        }
++        if (sohIosTeams.size() > 1) {
++            std::string sohIosList;
++            for (auto& team : sohIosTeams) {
++                if (!sohIosList.empty()) {
++                    sohIosList += ", ";
++                }
++                sohIosList += team;
++            }
++            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
++            ImGui::TextWrapped("Players in this room are on different teams (%s). Items & flags only sync "
++                               "within a team.",
++                               sohIosList.c_str());
++            ImGui::PopStyleColor();
++        }
++    }
++#endif
+     ImGui::Spacing();
+ 
+     if (UIWidgets::Button("Restore Defaults", UIWidgets::ButtonOptions()

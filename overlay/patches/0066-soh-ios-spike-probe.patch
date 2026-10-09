@@ -1,0 +1,938 @@
+Overlay patch 0066 (D-085): SPIKE ATTRIBUTION PROBE + depth-kernel pipeline cache.
+
+WHY. Round 1 (0065) proved the tick catch-up on the user's iPhone Air: tps
+19.99-20.06 in every window, music right. What is left is the fps dips
+themselves: in bad windows SOH_PACE busy_ms p95 = 8.5-10.9 ms (max 17-58 ms)
+against ~3 ms in good windows, with the GPU idle and thermal 0. SOH_PACE can
+say THAT the game thread is busy, not WITH WHAT. This probe answers that.
+
+WHAT IT MEASURES. Every 2D engine frame is cut at the 0065 pace seams
+(drawable acquired / LUS sleep begins) plus three marks inside
+Fast3dWindow::DrawAndRunGraphicsCommands, and the record closes in
+Fast3dWindow right after Interpreter::EndFrame (post-sleep):
+
+  gap    previous frame's post-sleep -> this frame's drawable request.
+         Holds the game tick on the first frame of each tick (logic), the
+         audio hand-off wait (aud), SDL_PumpEvents = every UIKit main-thread
+         callback (ev), FrameInterpolation_Interpolate (interp).
+  wait   nextDrawable (0065).
+  busy   drawable -> LUS sleep (0065), split into
+           menu  ImGui NewFrame + DrawMenu + CalculateGameViewport
+           run   Interpreter::StartFrame + Run (the display list)
+           gui   Gui::EndDraw (DrawGame, ImGui render, floating windows)
+           end   GfxRenderingAPIMetal::EndFrame (mips, commit, present)
+  cpu    gap + busy. A frame whose cpu exceeds the frame period
+         (1000 / interpolation fps: 8.33 ms at 120) is a SPIKE.
+
+Seam categories (overlapping the split; game thread = the main thread on
+iOS, pthread_main_np):
+   0 res    resource cache MISS loaded on the game thread (archive read +
+            decompress + parse), n / ms / bytes, and the 3 largest by name
+   1 rd     the archive read + decompress part of res
+   2 bg     cache misses loaded on the resource pool threads (LoadResource
+            is LoadResourceAsync().get(): the game thread waits for them)
+   3 rwait  ResourceManager::LoadResource on the game thread (hits + waits)
+   4 tex    Interpreter::ImportTexture (decode + upload of a new texture)
+   5 up     Metal texture uploads, n / bytes (from 0019's ledger; their ms
+            is inside tex)
+   6 shd    CreateAndLoadNewShader on the game thread (compile is async)
+   7 zdep   GfxRenderingAPIMetal::GetPixelDepth: a compute dispatch that
+            COMMITS AND waitUntilCompleted()s on the game thread. Called by
+            Environment_GraphCallback (sun lens flare + light glows) once
+            per game tick in every Play scene.
+   8 zpso   the newComputePipelineState it creates on EVERY call (upstream)
+
+THE ONE FIX IN THIS PATCH (gSohIos.DepthPsoCache, default 1): the depth
+kernel's compute pipeline is built once and reused instead of per call. No
+fidelity change (same kernel, same values). Proven by this probe on the
+simulator: zpso 0.18-0.3 ms per tick, and one call took 21.8 ms (a 23 ms
+spike, all of it zpso). The bigger part of zdep -- the commit +
+waitUntilCompleted GPU drain -- is NOT changed here; see D-085 for the plan.
+   9 fbrd   ReadFramebufferToCPU (waits on the GPU too)
+  10 actor  Actor_Spawn       11 obj  Object_Spawn   12 room  room resource load
+  13 cvsave ConsoleVariables::Save (CVarSave and the Gui's deferred save)
+  14 aud    Graph_ProcessGfxCommands waiting on the audio thread
+  15 ev     wnd->HandleEvents (SDL pump: touches, timers, the 0.25 s poll)
+  16 interp FrameInterpolation_Interpolate
+plus per-frame triangles / vertices / draw calls from the interpreter, so a
+spike with more work can be told from a spike with the same work done slower
+(a clock or core change).
+
+OUTPUT.
+  SOH_SPIKE  one line per spike frame, at most 20 per 10 s window (the rest
+             are counted): the split, the content counters, every non-zero
+             category as name=n/ms[/kb], and top=<path>:<ms>:<kb> for the
+             largest loads (bg: prefix for pool-thread loads).
+  SOH_SPKWIN one line per 10 s: frames, spikes, cpu p50/p95/max, per-frame
+             average of each split over ALL frames / over SPIKE frames, each
+             category's n / total ms / ms inside spike frames (+MB), and the
+             content counters. Attribution works without a single spike line.
+
+COST. Two mach_absolute_time reads and a pthread_main_np per seam event, a
+handful of steady_clock reads per frame, no allocation in the hot path
+(fixed arrays; names copied into fixed buffers). gSohIos.SpikeProbe (default
+1) switches it off (re-read every 60 frames) for the probe-cost A/B: compare
+SOH_PACE busy_ms p50 with it on and off.
+
+Generate against a vendor tree with 0001..0065 applied and 0066 not applied.
+Every hunk keeps clear of earlier patches' hunks and 3-line contexts so the
+series stays reversible (apply-overlay.sh checks it on every run).
+
+
+--- a/libultraship/src/fast/Fast3dWindow.cpp
++++ b/libultraship/src/fast/Fast3dWindow.cpp
+@@ -125,6 +125,12 @@
+     mInterpreter->SetMaxFrameLatency(latency);
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike probe marks inside the 2D frame.
++extern "C" void SohIos_SpkMark(int which);
++extern "C" void SohIos_SpkFrameEnd(void);
++#endif
++
+ void Fast3dWindow::GetPixelDepthPrepare(float x, float y) {
+     mInterpreter->GetPixelDepthPrepare(x, y);
+ }
+@@ -376,14 +382,26 @@
+     wnd->GetMouseStateManager()->StartFrame();
+     // Setup of the backend frames and draw initial Window and GUI menus
+     gui->StartDraw();
++#ifdef __IOS__
++    SohIos_SpkMark(0); // overlay 0066
++#endif
+     // Setup game framebuffers to match available window space
+     mInterpreter->StartFrame();
+     // Execute the games gfx commands
+     mInterpreter->Run(commands, mtxReplacements);
++#ifdef __IOS__
++    SohIos_SpkMark(1);
++#endif
+     // Renders the game frame buffer to the final window and finishes the GUI
+     gui->EndDraw();
++#ifdef __IOS__
++    SohIos_SpkMark(2);
++#endif
+     // Finalize swap buffers
+     mInterpreter->EndFrame();
++#ifdef __IOS__
++    SohIos_SpkFrameEnd(); // close the frame record (after LUS's pacing sleep)
++#endif
+ 
+     return true;
+ }
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -133,11 +133,37 @@
+ 
+ // N64 prim_depth is 15-bit (0 near, 0x7FFF far).
+ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
++#ifdef __IOS__
++extern "C" unsigned int gSohIosSpkTris, gSohIosSpkVtx, gSohIosSpkDraws;
++#endif
+ 
+ void Interpreter::Flush() {
+     if (mBufVboLen > 0) {
+         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
++#ifdef __IOS__
++        gSohIosSpkDraws++; // overlay 0066
++#endif
+         mBufVboLen = 0;
+         mBufVboNumTris = 0;
+     }
+@@ -147,6 +173,9 @@
+     ShaderProgram* prg = mRapi->LookupShader(id0, id1);
+     if (prg == nullptr) {
+         mRapi->UnloadShader(mRenderingState.mShaderProgram);
++#ifdef __IOS__
++        SohIosSpkScope sohSpk(6); // overlay 0066: shd
++#endif
+         prg = mRapi->CreateAndLoadNewShader(id0, id1);
+         mRenderingState.mShaderProgram = prg;
+     }
+@@ -1263,6 +1292,9 @@
+ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+     uint8_t fmt = mRdp->texture_tile[tile].fmt;
+     uint8_t siz = mRdp->texture_tile[tile].siz;
++#ifdef __IOS__
++    SohIosSpkScope sohSpk(4); // overlay 0066: tex
++#endif
+     uint32_t texFlags = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags;
+     uint32_t tmemIdex = mRdp->texture_tile[tile].tmem_index;
+     uint8_t paletteIndex = mRdp->texture_tile[tile].palette;
+@@ -2061,6 +2093,9 @@
+ }
+ 
+ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
++#ifdef __IOS__
++    gSohIosSpkVtx += (unsigned int)n_vertices; // overlay 0066
++#endif
+     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
+         const F3DVtx_t* v = &vertices[i].v;
+         const F3DVtx_tn* vn = &vertices[i].n;
+@@ -2260,6 +2295,9 @@
+ }
+ 
+ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
++#ifdef __IOS__
++    gSohIosSpkTris++; // overlay 0066
++#endif
+     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
+     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
+     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -91,6 +91,26 @@
+     return mDevice->supportsFamily(MTL::GPUFamilyMac2);
+ #endif
+ }
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
+ 
+ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
+     mRenderer = renderer;
+@@ -1653,6 +1673,9 @@
+ 
+ std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
+ GfxRenderingAPIMetal::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
++#ifdef __IOS__
++    SohIosSpkScope sohSpk(7); // overlay 0066: zdep (commit + waitUntilCompleted below)
++#endif
+     auto framebuffer = mFramebuffers[fb_id];
+ 
+     if (coordinates.size() > mCoordBufferSize) {
+@@ -1687,7 +1710,38 @@
+     command_buffer->setLabel(NS::String::string("Depth Shader Command Buffer", NS::UTF8StringEncoding));
+ 
+     NS::Error* error = nullptr;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0066, D-085): upstream builds a NEW compute pipeline
++    // for the same depth kernel on every call -- once per game tick in every
++    // Play scene (Environment_GraphCallback). Usually ~0.2-0.3 ms, but the
++    // probe caught one at 21.8 ms on the simulator. gSohIos.DepthPsoCache
++    // (default 1) builds it once and reuses it; identical kernel, identical
++    // depth values. The cache keeps its own reference, and a reused pipeline
++    // is retained once more so upstream's release at the end stays balanced.
++    unsigned long long sohSpkPsoT0 = SohIos_SpkNow(); // zpso
++    static MTL::ComputePipelineState* sSohDepthPso = nullptr;
++    static MTL::Function* sSohDepthPsoFn = nullptr;
++    const bool sohPsoCache =
++        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gSohIos.DepthPsoCache", 1) != 0;
++    MTL::ComputePipelineState* compute_pipeline_state = nullptr;
++    if (sohPsoCache && sSohDepthPso != nullptr && sSohDepthPsoFn == mDepthComputeFunction) {
++        compute_pipeline_state = sSohDepthPso;
++        compute_pipeline_state->retain();
++    } else {
++        compute_pipeline_state = mDevice->newComputePipelineState(mDepthComputeFunction, &error);
++        if (sohPsoCache && compute_pipeline_state != nullptr) {
++            if (sSohDepthPso != nullptr) {
++                sSohDepthPso->release();
++            }
++            sSohDepthPso = compute_pipeline_state;
++            sSohDepthPso->retain();
++            sSohDepthPsoFn = mDepthComputeFunction;
++        }
++    }
++    SohIos_SpkAdd(8, sohSpkPsoT0, 0);
++#else
+     MTL::ComputePipelineState* compute_pipeline_state = mDevice->newComputePipelineState(mDepthComputeFunction, &error);
++#endif
+ 
+     MTL::ComputeCommandEncoder* compute_encoder = command_buffer->computeCommandEncoder();
+     compute_encoder->setComputePipelineState(compute_pipeline_state);
+@@ -1810,6 +1864,9 @@
+ }
+ 
+ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
++#ifdef __IOS__
++    SohIosSpkScope sohSpk(9); // overlay 0066: fbrd
++#endif
+     if (fb_id >= (int)mFramebuffers.size()) {
+         return;
+     }
+--- a/libultraship/src/ship/resource/ResourceManager.cpp
++++ b/libultraship/src/ship/resource/ResourceManager.cpp
+@@ -74,6 +74,30 @@
+     return mArchiveManager != nullptr && mArchiveManager->IsLoaded();
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
++#ifdef __IOS__
++extern "C" void SohIos_SpkRes(const char* name, unsigned long long t0, unsigned long long tRead,
++                              unsigned long long bytes);
++#endif
++
+ std::shared_ptr<File> ResourceManager::LoadFileProcess(const std::string& filePath) {
+     auto file = mArchiveManager->LoadFile(filePath);
+     if (file != nullptr) {
+@@ -152,7 +176,13 @@
+     // Get the file from the OTR. It may be null when the resource exists only as a `.meta`
+     // alias (no real file at this path); fall through so the loader can resolve the alias,
+     // but only when a `.meta` for this path actually exists.
++#ifdef __IOS__
++    unsigned long long sohSpkT0 = SohIos_SpkNow(); // overlay 0066: a cache miss
++#endif
+     auto file = LoadFileProcess(identifier.Path);
++#ifdef __IOS__
++    unsigned long long sohSpkTRead = SohIos_SpkNow();
++#endif
+     if (file == nullptr && !mArchiveManager->HasFile(identifier.Path + ".meta")) {
+         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
+         mResourceCache[identifier] = ResourceLoadError::NotFound;
+@@ -161,6 +191,10 @@
+ 
+     // Transform the raw data into a resource
+     auto resource = GetResourceLoader()->LoadResource(identifier.Path, file, initData);
++#ifdef __IOS__
++    SohIos_SpkRes(identifier.Path.c_str(), sohSpkT0, sohSpkTRead,
++                  (file != nullptr && file->Buffer != nullptr) ? file->Buffer->size() : 0);
++#endif
+ 
+     // Another thread could have loaded the resource while we were processing, so we want to check before setting to
+     // the cache.
+@@ -229,6 +263,9 @@
+ 
+ std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifier& identifier, bool loadExact,
+                                                          std::shared_ptr<ResourceInitData> initData) {
++#ifdef __IOS__
++    SohIosSpkScope sohSpk(3); // overlay 0066: rwait (the game thread blocks in .get())
++#endif
+     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+     if (resource == nullptr) {
+         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
+--- a/libultraship/src/ship/window/gui/Gui.cpp
++++ b/libultraship/src/ship/window/gui/Gui.cpp
+@@ -406,8 +406,31 @@
+ void Gui::DrawFloatingWindows() {
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
++
+ void Gui::CheckSaveCvars() {
+     if (mNeedsConsoleVariableSave) {
++#ifdef __IOS__
++        SohIosSpkScope sohSpk(13); // overlay 0066: cvsave
++#endif
+         Ship::Context::GetRawInstance()->GetConsoleVariables()->Save();
+         mNeedsConsoleVariableSave = false;
+     }
+--- a/libultraship/src/libultraship/bridge/consolevariablebridge.cpp
++++ b/libultraship/src/libultraship/bridge/consolevariablebridge.cpp
+@@ -82,7 +82,30 @@
+     Ship::Context::GetRawInstance()->GetConsoleVariables()->Load();
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
++
+ void CVarSave() {
++#ifdef __IOS__
++    SohIosSpkScope sohSpk(13); // overlay 0066: cvsave
++#endif
+     Ship::Context::GetRawInstance()->GetConsoleVariables()->Save();
+ }
+ }
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -129,6 +129,14 @@
+ 
+ const float imguiScaleOptionToValue[4] = { 0.75f, 1.0f, 1.5f, 2.0f };
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe entry points
++// (defined below Graph_ProcessGfxCommands).
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++extern "C" void SohIos_SpkMark(int which);
++#endif
++
+ bool SoH_HandleConfigDrop(char* filePath);
+ 
+ OTRGlobals* OTRGlobals::Instance;
+@@ -2150,7 +2158,14 @@
+     }
+ 
+     // Process window events for resize, mouse, keyboard events
++#ifdef __IOS__
++    SohIos_SpkMark(3); // overlay 0066: the game tick ran before this call
++    unsigned long long sohSpkEvT0 = SohIos_SpkNow();
++#endif
+     wnd->HandleEvents();
++#ifdef __IOS__
++    SohIos_SpkAdd(15, sohSpkEvT0, 0); // ev
++#endif
+ 
+     auto intp = wnd->GetInterpreterWeak().lock().get();
+     intp->mInterpolationIndex = 0;
+@@ -2360,10 +2375,17 @@
+     last_update_rate = R_UPDATE_RATE;
+ 
+     {
++#ifdef __IOS__
++        unsigned long long sohSpkAudT0 = SohIos_SpkNow(); // overlay 0066
++#endif
+         std::unique_lock<std::mutex> Lock(audio.mutex);
+         while (audio.processing) {
+             audio.cv_from_thread.wait(Lock);
+         }
++#ifdef __IOS__
++        SohIos_SpkAdd(14, sohSpkAudT0, 0); // aud
++        SohIos_SpkMark(4);
++#endif
+     }
+ 
+     bool curAltAssets = CVarGetInteger(CVAR_SETTING("AltAssets"), 1);
+@@ -2387,8 +2409,342 @@
+     // OTRTODO: FIGURE OUT END FRAME POINT
+     /* if (OTRGlobals::Instance->context->lastScancode != -1)
+          OTRGlobals::Instance->context->lastScancode = -1;*/
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): SPIKE ATTRIBUTION PROBE -- see the patch
++// header. Game-thread state (the game loop owns the main thread on iOS),
++// except the resource pool threads' ledger, which is mutex-guarded. Reads
++// 0065's pace timestamps (SohIosPace, above) for the drawable/sleep seams.
++#include <mach/mach_time.h>
++#include <pthread.h>
++#include <cstdarg>
++#include <cstring>
++extern "C" {
++volatile int gSohIosSpkOn = 1;
++unsigned int gSohIosSpkTris = 0;
++unsigned int gSohIosSpkVtx = 0;
++unsigned int gSohIosSpkDraws = 0;
++}
++namespace SohIosSpk {
++using Clock = std::chrono::steady_clock;
++enum { NCAT = 17 };
++static const char* const kName[NCAT] = { "res",   "rd",  "bg",   "rwait", "tex",    "up",  "shd", "zdep",  "zpso",
++                                         "fbrd",  "actor", "obj", "room",  "cvsave", "aud", "ev",  "interp" };
++enum { S_GAP, S_WAIT, S_BUSY, S_LOGIC, S_MENU, S_RUN, S_GUI, S_END, NSPLIT };
++static const char* const kSplit[NSPLIT] = { "gap", "wait", "busy", "logic", "menu", "run", "gui", "end" };
++struct Top {
++    char name[60];
++    float ms;
++    unsigned kb;
++};
++struct Frame {
++    unsigned long long t[NCAT];
++    unsigned n[NCAT];
++    unsigned long long b[NCAT];
++    Top top[3];
++};
++struct Win {
++    double ms[NCAT];
++    double spk[NCAT];
++    unsigned long long n[NCAT];
++    unsigned long long b[NCAT];
++    double split[NSPLIT];
++    double splitSpk[NSPLIT];
++    unsigned frames, spikes, logged;
++    unsigned long long tris, vtx, draws;
++    unsigned trisMax, drawsMax;
++    double cpu[4096];
++    unsigned ncpu;
++    Clock::time_point start;
++};
++static Frame sF{};
++static Frame sBg{}; // pool-thread loads since the last frame end (sBgMu)
++static std::mutex sBgMu;
++static Win sW{};
++static Clock::time_point sFrameStart{}, sTickExit{}, sMark[3]{};
++static double sLogicMs = 0.0;
++static int sTickFrame = 0;
++static double TickMs() {
++    static const double v = [] {
++        mach_timebase_info_data_t tb;
++        mach_timebase_info(&tb);
++        return (double)tb.numer / (double)tb.denom / 1e6;
++    }();
++    return v;
++}
++static double Ms(Clock::time_point a, Clock::time_point b) {
++    return std::chrono::duration<double, std::milli>(b - a).count();
++}
++static bool Set(Clock::time_point t) {
++    return t.time_since_epoch().count() != 0;
++}
++static void TopInsert(Top* top, const char* name, float ms, unsigned kb) {
++    int lo = 0;
++    for (int i = 1; i < 3; i++) {
++        if (top[i].ms < top[lo].ms) {
++            lo = i;
++        }
++    }
++    if (ms <= top[lo].ms) {
++        return;
++    }
++    size_t len = name ? strlen(name) : 0;
++    const char* src = (len > sizeof(top[lo].name) - 1) ? name + (len - (sizeof(top[lo].name) - 1)) : name;
++    snprintf(top[lo].name, sizeof(top[lo].name), "%s", src ? src : "?");
++    top[lo].ms = ms;
++    top[lo].kb = kb;
++}
++// Bounded append into a fixed line buffer (no allocation).
++static void Ap(char* buf, size_t cap, size_t& k, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
++static void Ap(char* buf, size_t cap, size_t& k, const char* fmt, ...) {
++    if (k >= cap - 1) {
++        return;
++    }
++    va_list ap;
++    va_start(ap, fmt);
++    int w = vsnprintf(buf + k, cap - k, fmt, ap);
++    va_end(ap);
++    if (w > 0) {
++        k = std::min(cap - 1, k + (size_t)w);
++    }
++}
++static void AppendTops(char* buf, size_t cap, size_t& k, const Top* top, const char* prefix) {
++    for (int i = 0; i < 3; i++) {
++        if (top[i].ms > 0.0f) {
++            Ap(buf, cap, k, " %s%s:%.1fms:%ukb", prefix, top[i].name, top[i].ms, top[i].kb);
++        }
++    }
++}
++static void ReportWindow(Clock::time_point now) {
++    Win& w = sW;
++    double el = Ms(w.start, now) / 1000.0;
++    if (w.frames > 0) {
++        std::sort(w.cpu, w.cpu + w.ncpu);
++        auto pct = [&](double p) { return w.ncpu ? w.cpu[(size_t)(p * (w.ncpu - 1))] : 0.0; };
++        static char buf[2048];
++        size_t k = 0;
++        Ap(buf, sizeof(buf), k, "SOH_SPKWIN el=%.1f frames=%u spikes=%u logged=%u cpu_ms p50=%.2f p95=%.2f max=%.2f |",
++           el, w.frames, w.spikes, w.logged, pct(0.5), pct(0.95), w.ncpu ? w.cpu[w.ncpu - 1] : 0.0);
++        Ap(buf, sizeof(buf), k, " avg_ms all/spike:");
++        for (int s = 0; s < NSPLIT; s++) {
++            Ap(buf, sizeof(buf), k, " %s=%.2f/%.2f", kSplit[s], w.split[s] / w.frames,
++               w.spikes ? w.splitSpk[s] / w.spikes : 0.0);
++        }
++        Ap(buf, sizeof(buf), k, " | n/ms/spk_ms:");
++        for (int c = 0; c < NCAT; c++) {
++            if (w.n[c] == 0) {
++                continue;
++            }
++            Ap(buf, sizeof(buf), k, " %s=%llu/%.1f/%.1f", kName[c], w.n[c], w.ms[c], w.spk[c]);
++            if (w.b[c] != 0) {
++                Ap(buf, sizeof(buf), k, "/%.1fMB", w.b[c] / 1048576.0);
++            }
++        }
++        Ap(buf, sizeof(buf), k, " | tris_avg=%llu tris_max=%u vtx_avg=%llu draws_avg=%llu draws_max=%u thermal=%d",
++           w.tris / w.frames, w.trisMax, w.vtx / w.frames, w.draws / w.frames, w.drawsMax, SohIos_ThermalState());
++        SPDLOG_INFO("{}", buf);
++    }
++    sW = Win{};
++    sW.start = now;
++}
++} // namespace SohIosSpk
++
++extern "C" unsigned long long SohIos_SpkNow(void) {
++    return gSohIosSpkOn ? mach_absolute_time() : 0ull;
++}
++
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes) {
++    if (t0 == 0ull || cat < 0 || cat >= SohIosSpk::NCAT || !pthread_main_np()) {
++        return;
++    }
++    SohIosSpk::sF.t[cat] += mach_absolute_time() - t0;
++    SohIosSpk::sF.n[cat]++;
++    SohIosSpk::sF.b[cat] += bytes;
++}
++
++// C callers (Actor_Spawn, Object_Spawn) use __attribute__((cleanup)) on a
++// { int cat; unsigned long long t0; } -- same layout as this.
++struct SohIosSpkC {
++    int cat;
++    unsigned long long t0;
++};
++extern "C" void SohIos_SpkScopeEnd(SohIosSpkC* s) {
++    SohIos_SpkAdd(s->cat, s->t0, 0);
+ }
+ 
++// A resource cache miss that was actually loaded (ResourceManager). Any thread.
++extern "C" void SohIos_SpkRes(const char* name, unsigned long long t0, unsigned long long tRead,
++                              unsigned long long bytes) {
++    using namespace SohIosSpk;
++    if (t0 == 0ull) {
++        return;
++    }
++    unsigned long long now = mach_absolute_time();
++    float ms = (float)((now - t0) * TickMs());
++    if (pthread_main_np()) {
++        sF.t[0] += now - t0;
++        sF.n[0]++;
++        sF.b[0] += bytes;
++        sF.t[1] += tRead - t0;
++        sF.n[1]++;
++        TopInsert(sF.top, name, ms, (unsigned)(bytes / 1024));
++    } else {
++        std::lock_guard<std::mutex> lk(sBgMu);
++        sBg.t[2] += now - t0;
++        sBg.n[2]++;
++        sBg.b[2] += bytes;
++        TopInsert(sBg.top, name, ms, (unsigned)(bytes / 1024));
++    }
++}
++
++// 0/1/2: StartDraw / Run / EndDraw returned. 3: RunCommands entry (the game
++// tick has just run). 4: Graph_ProcessGfxCommands' audio wait done (tick exit).
++extern "C" void SohIos_SpkMark(int which) {
++    using namespace SohIosSpk;
++    if (!gSohIosSpkOn) {
++        return;
++    }
++    auto now = Clock::now();
++    if (which >= 0 && which < 3) {
++        sMark[which] = now;
++    } else if (which == 3) {
++        sLogicMs = Set(sTickExit) ? Ms(sTickExit, now) : 0.0;
++        sTickFrame = 0;
++    } else if (which == 4) {
++        sTickExit = now;
++    }
++}
++
++// Closes one 2D frame record. Called by Fast3dWindow right after
++// Interpreter::EndFrame (so after LUS's pacing sleep).
++extern "C" void SohIos_SpkFrameEnd(void) {
++    using namespace SohIosSpk;
++    static unsigned sPoll = 0;
++    if ((sPoll++ % 60u) == 0u) {
++        int on = CVarGetInteger("gSohIos.SpikeProbe", 1) != 0 ? 1 : 0;
++        if (on != gSohIosSpkOn) {
++            gSohIosSpkOn = on;
++            SPDLOG_INFO("SOH_SPKWIN probe -> {}", on);
++            sF = Frame{};
++            sFrameStart = Clock::time_point{};
++            sTickExit = Clock::time_point{};
++            ReportWindow(Clock::now());
++        }
++    }
++    if (!gSohIosSpkOn) {
++        gSohIosSpkTris = gSohIosSpkVtx = gSohIosSpkDraws = 0;
++        return;
++    }
++    auto now = Clock::now();
++    if (!Set(sW.start)) {
++        sW.start = now;
++    }
++    const auto db = SohIosPace::sDrawBegin, de = SohIosPace::sDrawEnd, sb = SohIosPace::sSleepBegin;
++    bool ok = Set(sFrameStart) && db >= sFrameStart && de >= db && sb >= de && sb <= now && gSoh3DMode == 0;
++    double gap = ok ? Ms(sFrameStart, db) : 0.0;
++    if (ok && gap < 500.0) {
++        double sp[NSPLIT] = {};
++        sp[S_GAP] = gap;
++        sp[S_WAIT] = Ms(db, de);
++        sp[S_BUSY] = Ms(de, sb);
++        sp[S_LOGIC] = sLogicMs;
++        if (sMark[0] >= de && sMark[1] >= sMark[0] && sMark[2] >= sMark[1] && sb >= sMark[2]) {
++            sp[S_MENU] = Ms(de, sMark[0]);
++            sp[S_RUN] = Ms(sMark[0], sMark[1]);
++            sp[S_GUI] = Ms(sMark[1], sMark[2]);
++            sp[S_END] = Ms(sMark[2], sb);
++        }
++        {
++            // up: n / bytes from gfx_metal's upload ledger (0019), which
++            // SOH_PERF zeroes every 10 s between frames -- hence the wrap.
++            static unsigned long long sLastUpB = 0;
++            static int sLastUpN = 0;
++            unsigned long long ub = gSohIosUpWinBytes;
++            int un = gSohIosUpWinCount;
++            sF.b[5] = ub >= sLastUpB ? ub - sLastUpB : ub;
++            sF.n[5] = (unsigned)(un >= sLastUpN ? un - sLastUpN : un);
++            sLastUpB = ub;
++            sLastUpN = un;
++        }
++        Top bgTop[3] = {};
++        {
++            std::lock_guard<std::mutex> lk(sBgMu);
++            sF.t[2] = sBg.t[2];
++            sF.n[2] = sBg.n[2];
++            sF.b[2] = sBg.b[2];
++            memcpy(bgTop, sBg.top, sizeof(bgTop));
++            sBg = Frame{};
++        }
++        double cpu = sp[S_GAP] + sp[S_BUSY];
++        int fps = (int)OTRGlobals::Instance->GetInterpolationFPS();
++        double period = 1000.0 / (double)std::max(fps, 20);
++        bool spike = cpu > period;
++        Win& w = sW;
++        w.frames++;
++        if (w.ncpu < 4096) {
++            w.cpu[w.ncpu++] = cpu;
++        }
++        for (int s = 0; s < NSPLIT; s++) {
++            w.split[s] += sp[s];
++            if (spike) {
++                w.splitSpk[s] += sp[s];
++            }
++        }
++        for (int c = 0; c < NCAT; c++) {
++            double ms = sF.t[c] * TickMs();
++            w.ms[c] += ms;
++            w.n[c] += sF.n[c];
++            w.b[c] += sF.b[c];
++            if (spike) {
++                w.spk[c] += ms;
++            }
++        }
++        w.tris += gSohIosSpkTris;
++        w.vtx += gSohIosSpkVtx;
++        w.draws += gSohIosSpkDraws;
++        w.trisMax = std::max(w.trisMax, gSohIosSpkTris);
++        w.drawsMax = std::max(w.drawsMax, gSohIosSpkDraws);
++        if (spike) {
++            w.spikes++;
++            if (w.logged < 20) {
++                w.logged++;
++                static char buf[1536];
++                size_t k = 0;
++                Ap(buf, sizeof(buf), k,
++                   "SOH_SPIKE cpu=%.1f period=%.1f fi=%d gap=%.1f wait=%.1f busy=%.1f logic=%.1f menu=%.1f run=%.1f "
++                   "gui=%.1f end=%.1f tris=%u vtx=%u draws=%u |",
++                   cpu, period, sTickFrame, sp[S_GAP], sp[S_WAIT], sp[S_BUSY], sp[S_LOGIC], sp[S_MENU], sp[S_RUN],
++                   sp[S_GUI], sp[S_END], gSohIosSpkTris, gSohIosSpkVtx, gSohIosSpkDraws);
++                for (int c = 0; c < NCAT; c++) {
++                    if (sF.n[c] == 0) {
++                        continue;
++                    }
++                    Ap(buf, sizeof(buf), k, " %s=%u/%.2f", kName[c], sF.n[c], sF.t[c] * TickMs());
++                    if (sF.b[c] != 0) {
++                        Ap(buf, sizeof(buf), k, "/%llukb", sF.b[c] / 1024);
++                    }
++                }
++                Ap(buf, sizeof(buf), k, " | top:");
++                AppendTops(buf, sizeof(buf), k, sF.top, "");
++                AppendTops(buf, sizeof(buf), k, bgTop, "bg:");
++                SPDLOG_INFO("{}", buf);
++            }
++        }
++    }
++    sF = Frame{};
++    gSohIosSpkTris = gSohIosSpkVtx = gSohIosSpkDraws = 0;
++    sLogicMs = 0.0;
++    sTickFrame++;
++    // Re-read the clock: the probe's own logging is not charged to the next
++    // frame (SOH_PACE, which is independent, still sees it).
++    sFrameStart = Clock::now();
++    if (Ms(sW.start, sFrameStart) >= 10000.0) {
++        ReportWindow(sFrameStart);
++    }
++}
++#endif
++
+ extern "C" void OTRGetPixelDepthPrepare(float x, float y) {
+     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
+     if (wnd == nullptr) {
+--- a/soh/soh/frame_interpolation.cpp
++++ b/soh/soh/frame_interpolation.cpp
+@@ -441,7 +441,30 @@
+ 
+ } // anonymous namespace
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
++
+ unordered_map<Mtx*, MtxF> FrameInterpolation_Interpolate(float step) {
++#ifdef __IOS__
++    SohIosSpkScope sohSpk(16); // overlay 0066: interp
++#endif
+     InterpolateCtx ctx;
+     ctx.step = step;
+     ctx.w = 1.0f - step;
+--- a/soh/soh/z_scene_otr.cpp
++++ b/soh/soh/z_scene_otr.cpp
+@@ -492,6 +492,26 @@
+     return 1;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0066, D-085): spike attribution probe seams; the probe
++// lives in soh/soh/OTRGlobals.cpp. SohIos_SpkNow returns 0 while the probe is
++// off and SohIos_SpkAdd ignores a 0 start, so an idle seam is two calls.
++extern "C" unsigned long long SohIos_SpkNow(void);
++extern "C" void SohIos_SpkAdd(int cat, unsigned long long t0, unsigned long long bytes);
++namespace {
++struct SohIosSpkScope {
++    int cat;
++    unsigned long long t0;
++    unsigned long long bytes;
++    explicit SohIosSpkScope(int c, unsigned long long b = 0) : cat(c), t0(SohIos_SpkNow()), bytes(b) {
++    }
++    ~SohIosSpkScope() {
++        SohIos_SpkAdd(cat, t0, bytes);
++    }
++};
++} // namespace
++#endif
++
+ extern "C" s32 OTRRoom_RequestNewRoom(PlayState* play, RoomContext* roomCtx, s32 roomNum) {
+     u32 size;
+ 
+@@ -514,6 +534,9 @@
+         // DmaMgr_SendRequest2(&roomCtx->dmaRequest, roomCtx->unk_34, play->roomList[roomNum].vromStart, size, 0,
+         //&roomCtx->loadQueue, NULL, __FILE__, __LINE__);
+ 
++#ifdef __IOS__
++        SohIosSpkScope sohSpk(12); // overlay 0066: room
++#endif
+         auto roomData = std::static_pointer_cast<SOH::Scene>(
+             ResourceMgr_GetResourceByNameHandlingMQ(play->roomList[roomNum].fileName));
+         roomCtx->status = 1;
+--- a/soh/src/code/z_actor.c
++++ b/soh/src/code/z_actor.c
+@@ -3799,8 +3799,21 @@
+ //      array to spawn An example of what this fixes, is that it allows hookshot to be used as child
+ int gMapLoading = 0;
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0066, D-085): spike attribution probe (OTRGlobals.cpp). */
++typedef struct {
++    int cat;
++    unsigned long long t0;
++} SohIosSpkC;
++extern unsigned long long SohIos_SpkNow(void);
++extern void SohIos_SpkScopeEnd(SohIosSpkC* s);
++#endif
++
+ Actor* Actor_Spawn(ActorContext* actorCtx, PlayState* play, s16 actorId, f32 posX, f32 posY, f32 posZ, s16 rotX,
+                    s16 rotY, s16 rotZ, s16 params) {
++#ifdef __IOS__
++    SohIosSpkC sohSpk __attribute__((cleanup(SohIos_SpkScopeEnd))) = { 10, SohIos_SpkNow() }; /* 0066: actor */
++#endif
+     Actor* actor;
+     s32 objBankIndex;
+     u32 temp;
+--- a/soh/src/code/z_scene.c
++++ b/soh/src/code/z_scene.c
+@@ -5,7 +5,20 @@
+ 
+ RomFile sNaviMsgFiles[];
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0066, D-085): spike attribution probe (OTRGlobals.cpp). */
++typedef struct {
++    int cat;
++    unsigned long long t0;
++} SohIosSpkC;
++extern unsigned long long SohIos_SpkNow(void);
++extern void SohIos_SpkScopeEnd(SohIosSpkC* s);
++#endif
++
+ s32 Object_Spawn(ObjectContext* objectCtx, s16 objectId) {
++#ifdef __IOS__
++    SohIosSpkC sohSpk __attribute__((cleanup(SohIos_SpkScopeEnd))) = { 11, SohIos_SpkNow() }; /* 0066: obj */
++#endif
+     size_t size;
+ 
+     objectCtx->status[objectCtx->num].id = objectId;

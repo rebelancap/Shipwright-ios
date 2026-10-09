@@ -106,6 +106,9 @@ vanilla textures, that's the switch. Turn it off to compare against vanilla.
   hide/show** so you can drop the buttons you never use
 - **Touch camera** (iPhone & iPad): with Free Look on, drag on empty screen space to turn
   the camera, with its own sensitivity slider in the iOS settings
+- **Gyro aiming** (iPhone & iPad, off by default): tilt the device to aim the bow,
+  slingshot, hookshot and first-person view, with a sensitivity slider
+- **Always Show Menu Button** option: keep the ≡ menu button on screen during gameplay
 - **60 / 120 Hz** (ProMotion) and a supersampling slider for extra sharpness
 - Texture packs and other `.o2r` mods via drag-and-drop in Files
 - On-screen fps + thermal readout for tuning

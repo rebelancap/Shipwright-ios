@@ -1,0 +1,245 @@
+Overlay patch 0065 (D-084): REAL-TIME TICK CATCH-UP + the pace probe.
+
+THE SYMPTOM (the user, 2026-10-08, iPhone Air, 120 Hz): frame rate dips into
+the 90s and THE MUSIC SLOWS DOWN.
+
+THE MECHANISM. Graph_ProcessGfxCommands runs ONE game tick and then renders
+`count` interpolated frames for it, count = interpolation fps / tick rate
+(120 / 20 = 6). Every one of those frames blocks on the display. Nothing in
+the loop looks at the wall clock, so a frame that misses its vsync does not
+drop a frame -- it stretches the TICK. Audio is lock-step with the tick
+(Graph_ProcessGfxCommands hands the audio thread one tick's worth of synthesis
+and waits for it), so the sequencer's tempo IS the tick rate: six frames at
+120 Hz = 50 ms = 20 Hz; one 16.7 ms frame among them makes it 58 ms = 17 Hz =
+the music 14 % slow. The device log shows it in every bad window: sim_tps
+tracks fps / 6 exactly (fps 105 -> sim_tps 17.5; fps 67 -> 11.2).
+
+THE FIX. Keep a debt: real time elapsed minus ticks x tick period (clamped to
+[0, one tick]; a stall over 250 ms -- a load, a background, a menu hitch --
+resets it, so the game never fast-forwards through a pause). While the debt
+is at least one frame period, drop that many of THIS tick's EARLIEST
+interpolated frames (never the last one, which is the tick's real state).
+Skipping frames shortens the tick, which pays the debt back on the next
+measurement, so nothing double-counts. Game time and audio stay at 20 Hz;
+only the frame count falls, which is what a missed frame should cost.
+gSohIos.TickCatchup (default 1) is the A/B switch. VR / 3D are left alone
+(the compositor paces those). The gfx debugger path still overrides count.
+
+THE PROBE (no behaviour change): one `SOH_PACE` line per 10 s, beside
+SOH_PERF, splitting each 2D frame into
+  wait  -- time inside SetupScreenFramebuffer (nextDrawable / background park)
+  busy  -- drawable acquired -> SwapBuffersBegin (ImGui, Fast3D interpret,
+           texture loads, commit): the game thread's own CPU work
+  sleep -- LUS's SyncFramerateWithTime nanosleep pacer
+plus tick wall p50/p95/max, frames skipped, ticks that skipped, debt, and
+thermal + power state (Low Power Mode caps the panel at 60 Hz -- with 6
+frames per tick that alone would halve the game's speed -- and charging heats
+the phone before thermalState moves).
+SOH_PERF's eng_ms is wait+busy+sleep and cannot say which; this can.
+gSohIos.PaceStressMs (default 0, test instrument only) busy-waits that many
+ms inside each frame, so the catch-up can be proven on a simulator.
+
+Generate against a vendor tree with 0001..0064 applied and 0065 not applied.
+Every hunk sits outside the hunks (and 3-line contexts) of 0008/0045/0016 so
+the whole series stays reversible.
+
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -118,11 +118,23 @@
+ }
+ 
+ static void SetupScreenFramebuffer(uint32_t width, uint32_t height);
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0065, D-084): pace probe -- time spent getting the drawable.
++extern "C" void SohIos_PaceDrawableBegin(void);
++extern "C" void SohIos_PaceDrawableEnd(void);
++#endif
+ 
+ void GfxRenderingAPIMetal::NewFrame() {
+     int width, height;
+     SDL_GetRendererOutputSize(mRenderer, &width, &height);
++#ifdef __IOS__
++    SohIos_PaceDrawableBegin();
++#endif
+     SetupScreenFramebuffer(width, height);
++#ifdef __IOS__
++    SohIos_PaceDrawableEnd();
++#endif
+ 
+     MTL::RenderPassDescriptor* current_render_pass = mFramebuffers[0].mRenderPassDescriptor;
+     ImGui_ImplMetal_NewFrame(current_render_pass);
+--- a/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -750,6 +750,13 @@
+     previous_time = t;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0065, D-084): pace probe -- the frame's CPU work ends here
++// and LUS's nanosleep pacer begins.
++extern "C" void SohIos_PaceSleepBegin(void);
++extern "C" void SohIos_PaceSleepEnd(void);
++#endif
++
+ void GfxWindowBackendSDL2::SwapBuffersBegin() {
+     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
+ 
+@@ -759,7 +766,13 @@
+         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+     }
+ 
++#ifdef __IOS__
++    SohIos_PaceSleepBegin();
++#endif
+     SyncFramerateWithTime();
++#ifdef __IOS__
++    SohIos_PaceSleepEnd();
++#endif
+     SDL_GL_SwapWindow(mWnd);
+ }
+ 
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -2176,6 +2176,94 @@
+     ImGui::PopStyleColor();
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0065, D-084): the pace probe + tick catch-up state. All of
++// it is touched on the game thread only (the backends call these from
++// NewFrame / SwapBuffersBegin, Graph_ProcessGfxCommands from the tick).
++extern "C" {
++extern volatile int gSoh3DMode;
++int SohIos_PowerState(void); // shell: 1 LPM, 2 charging, 4 full, 8 unknown
++int SohIos_ThermalState(void);
++}
++namespace SohIosPace {
++using Clock = std::chrono::steady_clock;
++static Clock::time_point sDrawBegin{}, sDrawEnd{}, sSleepBegin{};
++static bool sHaveDrawEnd = false;
++static std::vector<double> sWait, sBusy, sSleep, sTick;
++static uint32_t sSkipped = 0, sSkipTicks = 0;
++static double sDebtSum = 0.0, sDebtMax = 0.0;
++static Clock::time_point sLastReport = Clock::now();
++static double Ms(Clock::time_point a, Clock::time_point b) {
++    return std::chrono::duration<double, std::milli>(b - a).count();
++}
++static double Pct(std::vector<double>& v, double p) {
++    if (v.empty()) {
++        return 0.0;
++    }
++    return v[(size_t)(p * (v.size() - 1))];
++}
++static void StressSpin() {
++    // Test instrument (gSohIos.PaceStressMs): a deliberately slow frame.
++    int ms = CVarGetInteger("gSohIos.PaceStressMs", 0);
++    if (ms > 0 && ms < 200) {
++        auto until = Clock::now() + std::chrono::milliseconds(ms);
++        while (Clock::now() < until) {
++        }
++    }
++}
++static void Report(double tickMs) {
++    sTick.push_back(tickMs);
++    auto now = Clock::now();
++    double el = Ms(sLastReport, now) / 1000.0;
++    if (el < 10.0 || sTick.size() < 8) {
++        return;
++    }
++    for (auto* v : { &sWait, &sBusy, &sSleep, &sTick }) {
++        std::sort(v->begin(), v->end());
++    }
++    size_t n = sTick.size();
++    SPDLOG_INFO("SOH_PACE tick_ms p50={:.2f} p95={:.2f} max={:.2f} ticks={} tps={:.2f} frames={} "
++                "wait_ms p50={:.2f} p95={:.2f} max={:.2f} busy_ms p50={:.2f} p95={:.2f} max={:.2f} "
++                "sleep_ms p50={:.2f} p95={:.2f} skipped={} skip_ticks={} debt_avg={:.2f} debt_max={:.2f} "
++                "catchup={} stress={} thermal={} power={}",
++                Pct(sTick, 0.5), Pct(sTick, 0.95), sTick.back(), n, n / el, sBusy.size(), Pct(sWait, 0.5),
++                Pct(sWait, 0.95), sWait.empty() ? 0.0 : sWait.back(), Pct(sBusy, 0.5), Pct(sBusy, 0.95),
++                sBusy.empty() ? 0.0 : sBusy.back(), Pct(sSleep, 0.5), Pct(sSleep, 0.95), sSkipped, sSkipTicks,
++                sDebtSum / n, sDebtMax, CVarGetInteger("gSohIos.TickCatchup", 1),
++                CVarGetInteger("gSohIos.PaceStressMs", 0), SohIos_ThermalState(), SohIos_PowerState());
++    sWait.clear();
++    sBusy.clear();
++    sSleep.clear();
++    sTick.clear();
++    sSkipped = 0;
++    sSkipTicks = 0;
++    sDebtSum = 0.0;
++    sDebtMax = 0.0;
++    sLastReport = now;
++}
++} // namespace SohIosPace
++
++extern "C" void SohIos_PaceDrawableBegin(void) {
++    SohIosPace::sDrawBegin = SohIosPace::Clock::now();
++}
++extern "C" void SohIos_PaceDrawableEnd(void) {
++    SohIosPace::sDrawEnd = SohIosPace::Clock::now();
++    SohIosPace::sHaveDrawEnd = true;
++    SohIosPace::sWait.push_back(SohIosPace::Ms(SohIosPace::sDrawBegin, SohIosPace::sDrawEnd));
++}
++extern "C" void SohIos_PaceSleepBegin(void) {
++    SohIosPace::StressSpin();
++    SohIosPace::sSleepBegin = SohIosPace::Clock::now();
++    if (SohIosPace::sHaveDrawEnd) {
++        SohIosPace::sBusy.push_back(SohIosPace::Ms(SohIosPace::sDrawEnd, SohIosPace::sSleepBegin));
++        SohIosPace::sHaveDrawEnd = false;
++    }
++}
++extern "C" void SohIos_PaceSleepEnd(void) {
++    SohIosPace::sSleep.push_back(SohIosPace::Ms(SohIosPace::sSleepBegin, SohIosPace::Clock::now()));
++}
++#endif
++
+ // C->C++ Bridge
+ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
+     {
+@@ -2212,6 +2300,45 @@
+ 
+     time -= fps;
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0065, D-084): real-time tick catch-up -- see the patch
++    // header. Drop this tick's EARLIEST interpolated frames while the game is
++    // a frame or more behind the wall clock, so a missed vsync costs a frame
++    // instead of stretching the tick (and the music with it).
++    {
++        static SohIosPace::Clock::time_point sohLastTick{};
++        static double sohDebtMs = 0.0;
++        auto sohNow = SohIosPace::Clock::now();
++        double sohTickMs = 1000.0 / original_fps;
++        double sohFrameMs = 1000.0 / fps;
++        double sohEl = 0.0;
++        if (sohLastTick.time_since_epoch().count() != 0) {
++            sohEl = SohIosPace::Ms(sohLastTick, sohNow);
++            if (sohEl > 250.0) {
++                sohDebtMs = 0.0; // a stall: never fast-forward through it
++            } else {
++                sohDebtMs = std::clamp(sohDebtMs + sohEl - sohTickMs, 0.0, sohTickMs);
++            }
++        }
++        sohLastTick = sohNow;
++        int sohSkip = 0;
++        if (count > 1 && gSohVRMode == 0 && gSoh3DMode == 0 && CVarGetInteger("gSohIos.TickCatchup", 1) != 0) {
++            sohSkip = std::min((int)(sohDebtMs / sohFrameMs), count - 1);
++            if (sohSkip > 0) {
++                start_time += sohSkip * original_fps;
++                count -= sohSkip;
++                SohIosPace::sSkipped += (uint32_t)sohSkip;
++                SohIosPace::sSkipTicks++;
++            }
++        }
++        SohIosPace::sDebtSum += sohDebtMs;
++        SohIosPace::sDebtMax = std::max(SohIosPace::sDebtMax, sohDebtMs);
++        if (sohEl > 0.0) {
++            SohIosPace::Report(sohEl);
++        }
++    }
++#endif
++
+     if (wnd != nullptr) {
+         wnd->SetTargetFps(fps);
+     }

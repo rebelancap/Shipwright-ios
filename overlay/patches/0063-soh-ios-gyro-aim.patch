@@ -1,0 +1,76 @@
+Overlay patch 0063 (D-082): GYRO AIMING FROM THE PHONE'S OWN SENSOR.
+
+Upstream SoH already aims with gyro: z_player.c's first-person control
+(func_8084ABD8: bow, slingshot, hookshot, C-up look) adds
+-gyro_x*750 / +gyro_y*750 binang per tick from the N64 pad's gyro_x/gyro_y.
+LUS fills those only from an SDL gamepad gyro mapping, which an iPhone has
+none of. The shell (app/ios/SohIosShell.m) runs CoreMotion while the iOS
+setting "Gyro Aiming" (gSohIos.Gyro) is on and hands out SDLGyroMapping-shaped
+samples (pitch/yaw rad/s x sensitivity); this patch copies them into port 1's
+pad. __IOS__-gated; the desktop build is unchanged.
+
+  1. padmgr.c PadMgr_ProcessInputs, port 1 (i == 0), just below overlay
+     0062's touch-C right-stick mask (outside 0062's hunk context): when SohIos_GyroActive() (setting on AND
+     CoreMotion running or a bridge `gyro` injection live), overwrite
+     input->cur.gyro_x/gyro_y with SohIos_GyroSample. With the setting off
+     nothing is touched, so a physical controller's own LUS gyro mapping
+     keeps working. Only the first-person aim reads these fields (Speedrun.cpp
+     zeroes them for its own reasons), so the free/third-person camera is
+     unaffected -- the user's spec.
+
+  2. padmgr.c, end of file: SohIos_PlayerFocusRot, a read-only instrument
+     for the console bridge's `gyro` command (Link's focus.rot = the aim), so
+     the sim round can prove an injected rate moved the aim.
+
+This patch applies ON TOP of 0062 (its anchor is 0062's hunk); generate it
+against a vendor tree with 0001..0062 applied and 0063 not applied.
+
+
+--- a/soh/src/code/padmgr.c
++++ b/soh/src/code/padmgr.c
+@@ -246,6 +246,22 @@
+                     input->cur.button &= ~(BTN_Z);
+                 }
+ 
++#ifdef __IOS__
++                /* SOH_IOS (overlay 0063, D-082): "Gyro Aiming" -- the phone's
++                 * CoreMotion rates (SDLGyroMapping units: pitch/yaw rad/s x
++                 * sensitivity) drive z_player's first-person gyro aim. Only
++                 * while the iOS setting is on, so a pad's LUS gyro mapping
++                 * still works when it is off. Placed past 0062's hunk AND its
++                 * 3-line context so both patches stay reversible. */
++                {
++                    extern int SohIos_GyroActive(void);
++                    extern void SohIos_GyroSample(float* x, float* y);
++                    if (i == 0 && SohIos_GyroActive()) {
++                        SohIos_GyroSample(&input->cur.gyro_x, &input->cur.gyro_y);
++                    }
++                }
++#endif
++
+                 uint32_t emulatedButtons = GameInteractor_GetEmulatedButtons();
+                 if (emulatedButtons) {
+                     input->cur.button |= emulatedButtons;
+@@ -790,3 +806,22 @@
+     osCreateThread(&padMgr->thread, id, (void (*)(void*))PadMgr_ThreadEntry, padMgr, stack, priority);
+     osStartThread(&padMgr->thread);
+ }
++
++#ifdef __IOS__
++/* SOH_IOS (overlay 0063, D-082): console `gyro` instrument -- Link's aim
++ * (focus.rot x/y). Read-only; returns 0 outside gameplay. */
++int SohIos_PlayerFocusRot(int* x, int* y) {
++    extern PlayState* gPlayState;
++    Player* player;
++    if (gPlayState == NULL) {
++        return 0;
++    }
++    player = GET_PLAYER(gPlayState);
++    if (player == NULL) {
++        return 0;
++    }
++    *x = player->actor.focus.rot.x;
++    *y = player->actor.focus.rot.y;
++    return 1;
++}
++#endif

@@ -7,7 +7,7 @@ the desktop build is unchanged.
 
 --- a/soh/soh/SohGui/SohMenuSettings.cpp
 +++ b/soh/soh/SohGui/SohMenuSettings.cpp
-@@ -436,6 +436,162 @@
+@@ -436,6 +436,190 @@
      path.sidebarName = "Controls";
      path.column = SECTION_COLUMN_1;
      AddSidebarEntry("Settings", "Controls", 2);
@@ -63,6 +63,15 @@ the desktop build is unchanged.
 +                     .ComboMap(sohIosCurveOptions)
 +                     .Tooltip("Linear: deflection maps 1:1. Precise: finer control near the center, same maximum.")
 +                     .DefaultIndex(0));
++    // D-083: keep the menu button on screen during gameplay too (the shell's
++    // menuButtonVisible reads this live).
++    AddWidget(path, "Always Show Menu Button", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.MenuAlwaysVisible")
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("Keep the menu button on screen during gameplay instead of only at the title "
++                              "screen and pause menu.")
++                     .DefaultValue(false));
 +#if !TARGET_OS_VISION
 +    // D-081 (overlay 0062): touch drag-look for SoH's Free Look camera. The
 +    // shell scales finger travel by this; 1.0 = one screen width -> 180 deg.
@@ -77,6 +86,25 @@ the desktop build is unchanged.
 +                     .Min(0.25f)
 +                     .Max(3.0f)
 +                     .Format("%.2f")
++                     .DefaultValue(1.0f));
++    // D-082 (overlay 0063): CoreMotion drives SoH's first-person gyro aim.
++    AddWidget(path, "Gyro Aiming", WIDGET_CVAR_CHECKBOX)
++        .CVar("gSohIos.Gyro")
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("Tilt the phone to aim the bow, slingshot, hookshot and first-person view. Does not "
++                              "move the free camera.")
++                     .DefaultValue(false));
++    AddWidget(path, "Gyro Sensitivity", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar("gSohIos.GyroSens")
++        .RaceDisable(false)
++        .Options(FloatSliderOptions()
++                     .Tooltip("How far the aim moves for a given tilt. 1.00 matches a gyro controller on desktop "
++                              "SoH.")
++                     .ShowButtons(true)
++                     .Min(0.25f)
++                     .Max(4.0f)
++                     .Format("%.2fx")
 +                     .DefaultValue(1.0f));
 +#endif
 +    AddWidget(path, "Customize Layout...", WIDGET_BUTTON)

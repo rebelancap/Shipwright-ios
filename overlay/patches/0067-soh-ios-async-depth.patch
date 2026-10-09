@@ -1,0 +1,462 @@
+Overlay patch 0067 (D-086): ASYNCHRONOUS DEPTH READBACK (sun lens flare + light glows).
+
+WHY. Round 2's probe (0066) on the user's iPhone Air (build 202610090020, HD
+pack, 120 Hz, thermal 0) put the game-thread spikes on one seam: zdep, the
+commit + waitUntilCompleted inside GfxRenderingAPIMetal::GetPixelDepth. It is
+called once per game tick by Environment_GraphCallback (z_kankyo.c) for the
+sun's lens-flare occlusion test and the point-light glows (z_lights.c).
+A fresh command buffer on the frame queue runs behind every frame already
+queued, so the wait is the GPU's whole backlog: 3-5 ms per tick in the better
+windows, 10-15 ms per tick in the bad ones (1.9-2.9 s of every 10 s). Every
+logged spike was a tick's first frame with logic 18-20 ms, of it zdep 16-19.
+
+HOW THE ORIGINAL DID IT. graph.c Graph_TaskSet00 runs gfxCtx->callback right
+after osRecvMesg(&gfxCtx->queue) returns, i.e. after the PREVIOUS frame's
+RDP task finished and before this frame's task is sent. On N64,
+Environment_GetPixelDepth read gZBuffer directly, so the callback read the
+z-buffer of the previous frame at the coordinates this frame's draw just
+computed, and the results (D_8011FB44, LightPoint.drawGlow) are consumed by
+the NEXT frame's draw. SoH keeps that order: the callback reads the last
+frame already submitted (tick N-1's), synchronously.
+
+WHAT THIS PATCH DOES (gSohIos.AsyncDepth, default 1; 0 = upstream sync path).
+Two phases per tick, no CPU wait anywhere:
+  1. SUBMIT, in Environment_GraphCallback (end of tick N): the depth-sample
+     compute dispatch for this tick's coordinates is encoded into its own
+     command buffer and committed, NOT waited on. Queue order puts it right
+     after tick N-1's frames and before tick N's, so it samples exactly the
+     depth the synchronous path would have read. The values returned now are
+     provisional (newest completed result) -- nothing reads them before (2).
+  2. HARVEST, at the top of Play_Main (start of tick N+1, before Play_Update
+     and Play_Draw, the only readers): the callback's body runs again. No game
+     state has changed since (1), so it asks for the same coordinates, and
+     the backend answers them from the dispatch of (1), which finished on the
+     GPU during the ~50 ms tick. D_8011FB44 and drawGlow are then the values
+     the synchronous path would have produced -- same pixels, same frame, no
+     added latency for the consumers.
+Fallbacks: if (1)'s dispatch has not finished (GPU more than one tick
+behind), the nearest coordinate of the newest finished dispatch within
+height/16 px is used (the previous tick's view of that light); farther
+than that, 0xFFFC (far: not occluded). If no dispatch has ever finished
+(first tick after launch), the harvest runs the upstream synchronous path
+once. Four result slots (own coord + output buffers each), oldest finished
+one reused; none free = skip that submit (counted). The interpreter's
+per-frame depth cache is dropped once at the start of each pass: otherwise a
+harvest could be answered with the submit pass's provisional values, and --
+found on the sim, first build -- a submit pass with unchanged coordinates
+(still camera) was answered from the harvest's cache, never reached the GPU,
+and the samples went stale.
+
+VERIFICATION MODE (gSohIos.AsyncDepthCheck, default 0): the submit pass also
+runs upstream's synchronous readback for the same coordinates; the harvest
+compares every exact answer with it (SOH_ZASYNC check_eq / check_ne). It
+costs the old GPU wait, so it is for the sim / a bench only.
+
+COUNTERS. SOH_ZASYNC every 10 s: submit, skip (no free slot), exact, near,
+far, sync (first-time fallback), inflight (slots still on the GPU at harvest).
+The 0066 zdep seam still wraps the whole call, so zdep now measures the
+encode + commit cost (both phases count, n ~= 400 per 10 s at 20 Hz).
+
+Platform: __IOS__ is defined for the iPhone and visionOS builds (overlay
+0022 re-flips visionOS to iOS for LUS), so both get it; the macOS build is
+unchanged.
+
+Generate against a vendor tree with 0001..0066 applied and 0067 not applied.
+
+
+--- a/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -17,6 +17,9 @@
+ #include <math.h>
+ #include <cmath>
+ #include <stddef.h>
++#ifdef __IOS__
++#include <chrono> // overlay 0067
++#endif
+ 
+ #ifndef _LANGUAGE_C
+ #define _LANGUAGE_C
+@@ -1671,6 +1674,248 @@
+     }
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0067, D-086): asynchronous depth readback. The game asks
++// once per tick (Environment_GraphCallback: sun lens flare + light glows).
++// Upstream commits a compute dispatch and waitUntilCompleted()s it, which on
++// the phone waits for every frame still queued (10-15 ms per tick in the bad
++// windows). Phase 1 (submit, in the callback) commits without waiting; phase 2
++// (harvest, top of the next tick, before any reader) answers the same
++// coordinates from that dispatch. See scripts/gen-patch-0067.py.
++namespace {
++constexpr int kSohZSlots = 4;
++struct SohZSlot {
++    MTL::CommandBuffer* cb = nullptr; // retained while the slot holds data
++    MTL::Buffer* coordBuf = nullptr;  // sizeof(CoordUniforms), the kernel's constant
++    MTL::Buffer* outBuf = nullptr;    // MAX_PIXEL_DEPTH_COORDS floats
++    std::vector<std::pair<float, float>> coords;
++    unsigned long long seq = 0;
++};
++SohZSlot sSohZ[kSohZSlots];
++unsigned long long sSohZSeq = 0;
++int sSohZPhase = 0; // 0 upstream sync, 1 submit, 2 harvest
++unsigned sSohZGen = 0;
++bool sSohZEverDone = false;
++MTL::ComputePipelineState* sSohZPso = nullptr;
++MTL::Function* sSohZPsoFn = nullptr;
++// newest finished dispatch, copied out so a slot can be reused
++std::vector<std::pair<float, float>> sSohZLastCoords;
++std::vector<uint16_t> sSohZLastVals;
++unsigned long long sSohZLastSeq = 0;
++unsigned sSohZStat[9]; // submit skip exact near far sync inflight check_eq check_ne
++// gSohIos.AsyncDepthCheck (default 0, verification only): the submit pass also
++// runs upstream's synchronous readback for the same coordinates and keeps its
++// answer; the harvest compares every exact answer with it (check_eq/ne).
++bool sSohZCheckOn = false;
++std::vector<std::pair<std::pair<float, float>, uint16_t>> sSohZCheck;
++unsigned long long sSohZCheckSeq = 0;
++std::chrono::steady_clock::time_point sSohZWin;
++
++void SohZRetire() {
++    for (auto& s : sSohZ) {
++        if (s.cb == nullptr) {
++            continue;
++        }
++        MTL::CommandBufferStatus st = s.cb->status();
++        if (st == MTL::CommandBufferStatusCompleted) {
++            if (s.seq > sSohZLastSeq) {
++                const float* v = (const float*)s.outBuf->contents();
++                sSohZLastCoords = s.coords;
++                sSohZLastVals.resize(s.coords.size());
++                for (size_t i = 0; i < s.coords.size(); i++) {
++                    sSohZLastVals[i] = v[i] * 65532.0f; // upstream's conversion
++                }
++                sSohZLastSeq = s.seq;
++                sSohZEverDone = true;
++            }
++        } else if (st == MTL::CommandBufferStatusError) {
++            s.cb->release();
++            s.cb = nullptr;
++        }
++    }
++}
++
++uint16_t SohZLookup(const std::pair<float, float>& c, float thr) {
++    const unsigned cnt = sSohZPhase == 2 ? 1u : 0u; // count the harvest only
++    int best = -1;
++    float bestD = thr * thr;
++    for (size_t i = 0; i < sSohZLastCoords.size(); i++) {
++        if (sSohZLastCoords[i] == c) {
++            sSohZStat[2] += cnt;
++            if (cnt && sSohZCheckOn && sSohZCheckSeq == sSohZLastSeq) {
++                for (const auto& kv : sSohZCheck) {
++                    if (kv.first == c) {
++                        sSohZStat[kv.second == sSohZLastVals[i] ? 7 : 8]++;
++                    }
++                }
++            }
++            return sSohZLastVals[i];
++        }
++        float dx = sSohZLastCoords[i].first - c.first, dy = sSohZLastCoords[i].second - c.second;
++        if (dx * dx + dy * dy <= bestD) {
++            bestD = dx * dx + dy * dy;
++            best = (int)i;
++        }
++    }
++    if (best >= 0) {
++        sSohZStat[3] += cnt;
++        return sSohZLastVals[best];
++    }
++    sSohZStat[4] += cnt;
++    return 0xFFFC; // far = not occluded
++}
++
++void SohZLog() {
++    auto now = std::chrono::steady_clock::now();
++    if (sSohZWin.time_since_epoch().count() == 0) {
++        sSohZWin = now;
++        return;
++    }
++    double el = std::chrono::duration<double>(now - sSohZWin).count();
++    if (el < 10.0) {
++        return;
++    }
++    SPDLOG_INFO("SOH_ZASYNC el={:.1f} submit={} skip={} exact={} near={} far={} sync={} inflight={} check_eq={} "
++                "check_ne={}",
++                el, sSohZStat[0], sSohZStat[1], sSohZStat[2], sSohZStat[3], sSohZStat[4], sSohZStat[5], sSohZStat[6],
++                sSohZStat[7], sSohZStat[8]);
++    memset(sSohZStat, 0, sizeof(sSohZStat));
++    sSohZWin = now;
++}
++
++// true = answered into res; false = caller runs the upstream synchronous path.
++bool SohIosAsyncDepth(MTL::Device* dev, MTL::CommandQueue* queue, MTL::Function* fn, bool nonUniform,
++                      MTL::Texture* depthTex, const std::set<std::pair<float, float>>& coordinates,
++                      std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>& res) {
++    if (sSohZPhase == 0 || coordinates.empty() || depthTex == nullptr ||
++        coordinates.size() > MAX_PIXEL_DEPTH_COORDS) {
++        return false;
++    }
++    SohZRetire();
++    SohZLog();
++    if (sSohZPhase == 2) {
++        for (auto& s : sSohZ) {
++            if (s.cb != nullptr && s.cb->status() != MTL::CommandBufferStatusCompleted) {
++                sSohZStat[6]++;
++            }
++        }
++        if (!sSohZEverDone) {
++            sSohZStat[5]++;
++            return false; // first tick ever: one synchronous answer
++        }
++    }
++    const float thr = std::max(8.0f, depthTex->height() / 16.0f);
++    for (const auto& c : coordinates) {
++        res.emplace(c, SohZLookup(c, thr));
++    }
++    if (sSohZPhase != 1) {
++        return true;
++    }
++
++    // Submit: oldest free or finished slot.
++    SohZSlot* slot = nullptr;
++    for (auto& s : sSohZ) {
++        bool sohFree = s.cb == nullptr || s.cb->status() == MTL::CommandBufferStatusCompleted;
++        if (sohFree && (slot == nullptr || s.seq < slot->seq)) {
++            slot = &s;
++        }
++    }
++    if (slot == nullptr) {
++        sSohZStat[1]++;
++        return true;
++    }
++    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
++    if (sSohZPso == nullptr || sSohZPsoFn != fn) {
++        NS::Error* error = nullptr;
++        MTL::ComputePipelineState* pso = dev->newComputePipelineState(fn, &error);
++        if (pso == nullptr) {
++            pool->release();
++            return true; // keep the provisional values; the harvest falls back
++        }
++        if (sSohZPso != nullptr) {
++            sSohZPso->release();
++        }
++        sSohZPso = pso;
++        sSohZPsoFn = fn;
++    }
++    if (slot->cb != nullptr) {
++        slot->cb->release();
++        slot->cb = nullptr;
++    }
++    if (slot->coordBuf == nullptr) {
++        slot->coordBuf = dev->newBuffer(sizeof(CoordUniforms), MTL::ResourceCPUCacheModeDefaultCache);
++        slot->outBuf = dev->newBuffer(sizeof(float) * MAX_PIXEL_DEPTH_COORDS, MTL::ResourceCPUCacheModeDefaultCache);
++    }
++    simd::uint2* cu = (simd::uint2*)slot->coordBuf->contents();
++    slot->coords.assign(coordinates.begin(), coordinates.end());
++    for (size_t i = 0; i < slot->coords.size(); i++) {
++        // identical mapping to upstream (y flipped against the depth texture)
++        cu[i].x = (uint32_t)(int32_t)slot->coords[i].first;
++        cu[i].y = (uint32_t)(int32_t)(depthTex->height() - 1 - slot->coords[i].second);
++    }
++    MTL::CommandBuffer* cb = queue->commandBuffer();
++    cb->setLabel(NS::String::string("Depth Shader Command Buffer (async)", NS::UTF8StringEncoding));
++    MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
++    enc->setComputePipelineState(sSohZPso);
++    enc->setTexture(depthTex, 0);
++    enc->setBuffer(slot->coordBuf, 0, 0);
++    enc->setBuffer(slot->outBuf, 0, 1);
++    MTL::Size tgSize = MTL::Size::Make(1, 1, 1);
++    MTL::Size tgCount = MTL::Size::Make(slot->coords.size(), 1, 1);
++    if (nonUniform) {
++        enc->dispatchThreads(tgCount, tgSize);
++    } else {
++        enc->dispatchThreadgroups(tgCount, tgSize);
++    }
++    enc->endEncoding();
++    cb->commit();
++    slot->cb = cb->retain();
++    slot->seq = ++sSohZSeq;
++    sSohZStat[0]++;
++    pool->release();
++    return true;
++}
++} // namespace
++
++// Phase control for soh (z_kankyo.c). harvest=0: the callback's submit pass;
++// harvest=1: the next tick's re-run. Returns 0 when async is off (or, for a
++// harvest, when nothing was ever submitted) -- the caller then skips the pass.
++extern "C" int SohIos_DepthAsyncBegin(int harvest) {
++    sSohZPhase = 0;
++    if (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gSohIos.AsyncDepth", 1) == 0) {
++        return 0;
++    }
++    if (harvest && sSohZSeq == 0) {
++        return 0;
++    }
++    sSohZPhase = harvest ? 2 : 1;
++    sSohZGen++;
++    sSohZCheckOn =
++        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gSohIos.AsyncDepthCheck", 0) != 0;
++    return 1;
++}
++extern "C" void SohIos_DepthAsyncEnd(void) {
++    sSohZPhase = 0;
++}
++extern "C" int SohIos_DepthAsyncPhase(void) {
++    return sSohZPhase;
++}
++extern "C" unsigned SohIos_DepthAsyncGen(void) {
++    return sSohZGen;
++}
++namespace {
++// Check mode: should the submit pass ALSO run the synchronous path, and keep
++// its answer for the harvest to compare against?
++bool SohZCheckWanted() {
++    return sSohZCheckOn && sSohZPhase == 1;
++}
++void SohZCheckRecord(const std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>& res) {
++    sSohZCheck.assign(res.begin(), res.end());
++    sSohZCheckSeq = sSohZSeq;
++}
++} // namespace
++#endif
++
+ std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
+ GfxRenderingAPIMetal::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
+ #ifdef __IOS__
+@@ -1687,7 +1932,20 @@
+         mDepthValueOutputBuffer->setLabel(NS::String::string("Depth output buffer", NS::UTF8StringEncoding));
+ 
+         mCoordBufferSize = coordinates.size();
++    }
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0067, D-086): no GPU wait while gSohIos.AsyncDepth is
++    // on -- submit / harvest phases, see SohIosAsyncDepth above.
++    {
++        std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> sohZRes;
++        if (SohIosAsyncDepth(mDevice, mCommandQueue, mDepthComputeFunction, mNonUniformThreadgroupSupported,
++                             framebuffer.mDepthTexture, coordinates, sohZRes) &&
++            !SohZCheckWanted()) {
++            return sohZRes;
++        }
+     }
++#endif
+ 
+     // zero out the buffer
+     memset(mCoordUniformBuffer->contents(), 0, sizeof(CoordUniforms));
+@@ -1778,6 +2036,11 @@
+     compute_pipeline_state->release();
+     autorelease_pool->release();
+ 
++#ifdef __IOS__
++    if (SohZCheckWanted()) { // overlay 0067: verification only (AsyncDepthCheck)
++        SohZCheckRecord(res);
++    }
++#endif
+     return res;
+ }
+ 
+--- a/libultraship/src/fast/interpreter.cpp
++++ b/libultraship/src/fast/interpreter.cpp
+@@ -6044,8 +6044,27 @@
+     mGetPixelDepthPending.emplace(x, y);
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0067, D-086): async depth phases live in gfx_metal.cpp.
++extern "C" int SohIos_DepthAsyncPhase(void);
++extern "C" unsigned SohIos_DepthAsyncGen(void);
++#endif
+ uint16_t Interpreter::GetPixelDepth(float x, float y) {
+     AdjustPixelDepthCoordinates(x, y);
++#ifdef __IOS__
++    {
++        // Neither pass may be answered from the per-frame cache: a harvest
++        // could get the submit pass's provisional values, and a submit pass
++        // with unchanged coordinates (still camera) would get the harvest's
++        // answer and never reach the GPU again -- the samples would go stale.
++        // Drop it once per pass; the pass's own batched answer is cached.
++        static unsigned sSohZGenSeen = 0;
++        if (SohIos_DepthAsyncPhase() != 0 && SohIos_DepthAsyncGen() != sSohZGenSeen) {
++            sSohZGenSeen = SohIos_DepthAsyncGen();
++            mGetPixelDepthCached.clear();
++        }
++    }
++#endif
+ 
+     if (auto it = mGetPixelDepthCached.find(std::make_pair(x, y)); it != mGetPixelDepthCached.end()) {
+         return it->second;
+--- a/soh/src/code/z_kankyo.c
++++ b/soh/src/code/z_kankyo.c
+@@ -237,15 +237,51 @@
+     return OTRGetPixelDepth(x, y);
+ }
+ 
++#ifdef __IOS__
++/* SOH_IOS (overlay 0067, D-086): asynchronous depth readback. The callback is
++ * the SUBMIT pass (the GPU samples the depth, nobody waits); the next tick's
++ * Play_Main runs Environment_SohIosDepthHarvest first, which repeats this
++ * body against unchanged state and gets the finished values before any
++ * reader (Play_Draw's lens flare and Lights_DrawGlow) runs. */
++#ifdef __cplusplus
++extern "C" {
++#endif
++int SohIos_DepthAsyncBegin(int harvest);
++void SohIos_DepthAsyncEnd(void);
++#ifdef __cplusplus
++}
++#endif
++#endif
++
+ void Environment_GraphCallback(GraphicsContext* gfxCtx, void* param) {
+     PlayState* play = (PlayState*)param;
++
++#ifdef __IOS__
++    SohIos_DepthAsyncBegin(0);
++#endif
++    OTRGetPixelDepthPrepare(D_8015FD7E, D_8015FD80);
++    Lights_GlowCheckPrepare(play);
+ 
++    D_8011FB44 = Environment_GetPixelDepth(D_8015FD7E, D_8015FD80);
++    Lights_GlowCheck(play);
++#ifdef __IOS__
++    SohIos_DepthAsyncEnd();
++#endif
++}
++
++#ifdef __IOS__
++void Environment_SohIosDepthHarvest(PlayState* play) {
++    if (play->state.gfxCtx->callback != Environment_GraphCallback || !SohIos_DepthAsyncBegin(1)) {
++        return;
++    }
+     OTRGetPixelDepthPrepare(D_8015FD7E, D_8015FD80);
+     Lights_GlowCheckPrepare(play);
+ 
+     D_8011FB44 = Environment_GetPixelDepth(D_8015FD7E, D_8015FD80);
+     Lights_GlowCheck(play);
++    SohIos_DepthAsyncEnd();
+ }
++#endif
+ 
+ void Environment_Init(PlayState* play2, EnvironmentContext* envCtx, s32 unused) {
+     u8 i;
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -1772,6 +1772,15 @@
+ 
+     D_8012D1F8 = &play->state.input[0];
+ 
++#ifdef __IOS__
++    {
++        /* SOH_IOS (overlay 0067, D-086): collect last tick's async depth
++         * samples before Play_Update / Play_Draw read them. */
++        extern void Environment_SohIosDepthHarvest(PlayState * play);
++        Environment_SohIosDepthHarvest(play);
++    }
++#endif
++
+     DebugDisplay_Init();
+ 
+     PLAY_LOG(4556);
